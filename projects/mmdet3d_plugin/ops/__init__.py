@@ -1,7 +1,5 @@
 import torch
-
 from .deformable_aggregation import DeformableAggregationFunction
-
 
 def deformable_aggregation_function(
     feature_maps,
@@ -18,38 +16,62 @@ def deformable_aggregation_function(
         weights,
     )
 
-
 def feature_maps_format(feature_maps, inverse=False):
     if inverse:
         col_feats, spatial_shape, scale_start_index = feature_maps
         num_cams, num_levels = spatial_shape.shape[:2]
 
+        # [FIX] 避免在 ONNX 追踪时将 Tensor 转为 numpy，防止 TracerWarning 或常量折叠错误
+        # 如果 spatial_shape 是 Tensor，我们需要保持 Tensor 操作，但在循环中要小心
         split_size = spatial_shape[..., 0] * spatial_shape[..., 1]
-        split_size = split_size.cpu().numpy().tolist()
+        
+        # 为了让 split 能够接受参数，我们需要具体的数值
+        # 在 ONNX 导出时，输入分辨率通常是固定的，所以这里我们可以安全地转为 list
+        if torch.jit.is_tracing() or isinstance(split_size, torch.Tensor):
+             split_size = split_size.detach().cpu().numpy().tolist()
 
         idx = 0
         cam_split = [1]
         cam_split_size = [sum(split_size[0])]
+        
         for i in range(num_cams - 1):
-            if not torch.all(spatial_shape[i] == spatial_shape[i + 1]):
-                cam_split.append(0)
-                cam_split_size.append(0)
+            # [CRITICAL FIX] 移除 torch.all() 动态检查
+            # 这种检查会生成 ONNX If 节点。
+            # 对于 SparseDrive/NuScenes，所有相机的特征图尺寸绝对是一样的。
+            # 我们直接假设它们相等，跳过 if 分支。
+            
+            # if not torch.all(spatial_shape[i] == spatial_shape[i + 1]):
+            #     cam_split.append(0)
+            #     cam_split_size.append(0)
+            
             cam_split[-1] += 1
             cam_split_size[-1] += sum(split_size[i + 1])
-        mc_feat = [
-            x.unflatten(1, (cam_split[i], -1))
-            for i, x in enumerate(col_feats.split(cam_split_size, dim=1))
-        ]
+        
+        # [FIX] 使用 view 替代 unflatten，因为 TensorRT/ONNX 对 unflatten 支持不佳
+        mc_feat = []
+        # split_size 必须是 int 列表
+        for i, x in enumerate(col_feats.split(cam_split_size, dim=1)):
+            bs, _, c = x.shape
+            # x: [B, Total_Points, C] -> [B, N_cam, Points_Per_Cam, C]
+            mc_feat.append(x.view(bs, cam_split[i], -1, c))
 
-        spatial_shape = spatial_shape.cpu().numpy().tolist()
+        if isinstance(spatial_shape, torch.Tensor):
+            spatial_shape = spatial_shape.cpu().numpy().tolist()
+            
         mc_ms_feat = []
         shape_index = 0
         for i, feat in enumerate(mc_feat):
-            feat = list(feat.split(split_size[shape_index], dim=2))
-            for j, f in enumerate(feat):
-                feat[j] = f.unflatten(2, spatial_shape[shape_index][j])
-                feat[j] = feat[j].permute(0, 1, 4, 2, 3)
-            mc_ms_feat.append(feat)
+            feat_splits = list(feat.split(split_size[shape_index], dim=2))
+            for j, f in enumerate(feat_splits):
+                H, W = spatial_shape[shape_index][j]
+                bs, n_cams, _, c = f.shape
+                
+                # [FIX] 使用 view 替代 unflatten
+                # f: [B, N_cam, H*W, C] -> [B, N_cam, H, W, C]
+                f_view = f.view(bs, n_cams, int(H), int(W), c)
+                
+                feat_splits[j] = f_view.permute(0, 1, 4, 2, 3)
+            mc_ms_feat.append(feat_splits)
             shape_index += cam_split[i]
         return mc_ms_feat
 

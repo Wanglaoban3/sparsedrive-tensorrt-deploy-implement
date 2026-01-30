@@ -37,6 +37,7 @@ def build_engine(onnx_file_path, engine_file_path, plugin_path, fp16=False, verb
     network = builder.create_network(network_flags)
     
     config = builder.create_builder_config()
+    config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
     parser = trt.OnnxParser(network, logger)
 
     # 5. 配置内存池 (Workspace)
@@ -100,8 +101,8 @@ def build_engine(onnx_file_path, engine_file_path, plugin_path, fp16=False, verb
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build TensorRT Engine from ONNX with Custom Plugin")
-    parser.add_argument("--onnx", default="work_dirs/sparsedrive_small_stage2/sparsedrive.onnx", help="Path to input ONNX model")
-    parser.add_argument("--save", default="work_dirs/sparsedrive_small_stage2/sparsedrive.engine", help="Path to output TensorRT engine")
+    parser.add_argument("--onnx", default="work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.onnx", help="Path to input ONNX model")
+    parser.add_argument("--save", default="work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.engine", help="Path to output TensorRT engine")
     parser.add_argument("--plugin", default="./projects/trt_plugin/build/libSparseDrivePlugin.so", help="Path to compiled plugin .so library")
     parser.add_argument("--fp16", action="store_true", help="Enable FP16 precision")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")

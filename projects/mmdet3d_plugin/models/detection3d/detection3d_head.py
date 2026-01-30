@@ -575,192 +575,104 @@ class Sparse4DHead(BaseModule):
             output_idx=output_idx,
         )
 
-    # === 新增：ONNX 导出专用前向函数 ===
+    # === 修正后的：ONNX 导出专用前向函数 ===
     def forward_onnx(
         self,
         feature_maps: Union[torch.Tensor, List],
         prev_instance_feature: torch.Tensor,
         prev_anchor: torch.Tensor,
-        instance_t_matrix: torch.Tensor,  # [B, 4, 4] 上一帧到当前帧的变换矩阵
-        metas: dict = None, # 仅为了兼容接口，实际可能只用到 img_metas 中的 scale 等信息
+        instance_t_matrix: torch.Tensor,
+        metas: dict = None,
     ):
-        """
-        Args:
-            feature_maps: [B, N_cam, C, H, W]
-            prev_instance_feature: [B, N_temp, C] 上一帧传递过来的特征
-            prev_anchor: [B, N_temp, 11] 上一帧传递过来的 Anchor (未变换)
-            instance_t_matrix: [B, 4, 4] 用于将 prev_anchor 变换到当前坐标系
-        Returns:
-            cls_scores, bbox_preds, instance_id, next_feature, next_anchor
-        """
-        # 1. 维度处理
         if isinstance(feature_maps, torch.Tensor):
             feature_maps = [feature_maps]
         batch_size = feature_maps[0].shape[0]
 
-        # 2. 模拟 InstanceBank.get() 的逻辑
-        # 2.1 获取固定的 learnable anchor 和 feature
-        # self.instance_bank.anchor: [N_anchor, 11] -> [B, N_anchor, 11]
-        fixed_anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1)
-        fixed_feature = self.instance_bank.instance_feature.unsqueeze(0).repeat(batch_size, 1, 1)
+        # 1. 获取固定实例 (从当前 head 的 instance_bank 动态获取)
+        fixed_anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1).to(prev_anchor.device)
+        fixed_feature = self.instance_bank.instance_feature.unsqueeze(0).repeat(batch_size, 1, 1).to(prev_instance_feature.device)
 
-        # 2.2 对上一帧传来的 Anchor 做 Ego-motion 补偿
-        # 假设 anchor 格式为 [x, y, z, w, l, h, sin, cos, vx, vy, vz] (11维)
-        # 只变换 xyz (前3维)
-        prev_anchor_xyz = prev_anchor[..., :3]
-        # 扩充为齐次坐标 [B, N_temp, 4]
-        ones = torch.ones_like(prev_anchor_xyz[..., :1])
-        prev_anchor_xyz_h = torch.cat([prev_anchor_xyz, ones], dim=-1)
-        
-        # 矩阵乘法变换: Points @ Matrix^T
-        # instance_t_matrix 应该是 global_curr @ global_prev^-1，即把前一帧坐标转到当前帧
-        prev_anchor_xyz_new = torch.matmul(prev_anchor_xyz_h, instance_t_matrix.transpose(1, 2))[..., :3]
-        
-        # 组装变换后的 history anchor
-        current_prev_anchor = torch.cat([prev_anchor_xyz_new, prev_anchor[..., 3:]], dim=-1)
+        # 2. 核心隔离：Ego-motion 补偿 (保持你之前的逻辑)
+        if self.task_prefix == 'det':
+            prev_anchor_xyz = prev_anchor[..., :3]
+            ones = torch.ones_like(prev_anchor_xyz[..., :1])
+            prev_anchor_xyz_h = torch.cat([prev_anchor_xyz, ones], dim=-1)
+            prev_anchor_xyz_new = torch.matmul(prev_anchor_xyz_h, instance_t_matrix.transpose(1, 2))[..., :3]
+            current_prev_anchor = torch.cat([prev_anchor_xyz_new, prev_anchor[..., 3:]], dim=-1)
+        elif self.task_prefix == 'map':
+            R = instance_t_matrix[:, :2, :2]
+            t = instance_t_matrix[:, :2, 3].unsqueeze(1)
+            bs, num_temp, _ = prev_anchor.shape
+            prev_anchor_pts = prev_anchor.view(bs, num_temp, -1, 2)
+            current_prev_anchor_pts = torch.matmul(prev_anchor_pts, R.transpose(1, 2)) + t
+            current_prev_anchor = current_prev_anchor_pts.view(bs, num_temp, -1)
+        else:
+            current_prev_anchor = prev_anchor
 
-        # 2.3 拼接：Input = [Fixed, History]
-        # 对应 instance_bank.get() 中的 concat
+        # 3. 拼接：[Fixed, Temp] 顺序必须与原生 update/cache 逻辑严格对齐
         instance_feature = torch.cat([fixed_feature, prev_instance_feature], dim=1)
         anchor = torch.cat([fixed_anchor, current_prev_anchor], dim=1)
         
-        # 编码 Anchor
         anchor_embed = self.anchor_encoder(anchor)
-        
-        # 这里的 temp_... 在 get() 里原本是上一帧的，但在 transformer 内部逻辑中：
-        # temp_gnn 用的 key/value 是 temp_instance_feature。
-        # 在 ONNX 模式下，我们的 instance_feature 已经包含了 history，
-        # 如果模型结构允许 self-attention 看到 history，通常直接用 instance_feature 即可。
-        # *注意*：原代码中 temp_instance_feature 来自 get() 的输出，是纯 history 部分。
         temp_instance_feature = prev_instance_feature
         temp_anchor_embed = self.anchor_encoder(current_prev_anchor)
 
-        # =================== 3. 逐层前向传播 (复制并修改自 forward) ====================
-        prediction = []
-        classification = []
-        quality = []
+        # =================== 4. Transformer 层循环 ====================
+        prediction, classification = [], []
         
         for i, op in enumerate(self.operation_order):
-            if self.layers[i] is None:
-                continue
+            if self.layers[i] is None: continue
             elif op == "temp_gnn":
-                # 使用传入的 prev_features 作为 key/value
                 instance_feature = self.graph_model(
-                    i,
-                    instance_feature,
-                    temp_instance_feature, # key
-                    temp_instance_feature, # value
-                    query_pos=anchor_embed,
-                    key_pos=temp_anchor_embed,
-                    # attn_mask=None # ONNX 推理通常不需要 mask，或者全 1
+                    i, instance_feature, temp_instance_feature, temp_instance_feature,
+                    query_pos=anchor_embed, key_pos=temp_anchor_embed
                 )
             elif op == "gnn":
                 instance_feature = self.graph_model(
-                    i,
-                    instance_feature,
-                    value=instance_feature,
-                    query_pos=anchor_embed,
+                    i, instance_feature, value=instance_feature, query_pos=anchor_embed
                 )
-            elif op == "norm" or op == "ffn":
+            elif op in ["norm", "ffn"]:
                 instance_feature = self.layers[i](instance_feature)
             elif op == "deformable":
                 instance_feature = self.layers[i](
-                    instance_feature,
-                    anchor,
-                    anchor_embed,
-                    feature_maps,
-                    metas, # 这里 metas 可能为空，需要检查 layers[i] (DAF) 内部是否强依赖 metas
+                    instance_feature, anchor, anchor_embed, feature_maps, metas
                 )
             elif op == "refine":
-                # time_interval 在 ONNX 中通常设为默认值或者作为输入传入
-                # 这里简化处理，假设为 0.5 (默认) 或者由外部传入
-                # 如果 DAF 模块不强依赖 time_interval 用于 offset，可以给个固定值
-                dummy_time_interval = torch.ones((batch_size, ), device=anchor.device) * 0.5
-                
+                # time_interval 在推理时通常用默认值
+                dummy_time = instance_feature.new_tensor([self.instance_bank.default_time_interval] * batch_size)
                 anchor, cls, qt = self.layers[i](
-                    instance_feature,
-                    anchor,
-                    anchor_embed,
-                    time_interval=dummy_time_interval, 
-                    return_cls=True,
+                    instance_feature, anchor, anchor_embed,
+                    time_interval=dummy_time, return_cls=True
                 )
                 prediction.append(anchor)
                 classification.append(cls)
-                quality.append(qt)
-                
-                # Update 逻辑 (如果 num_single_frame_decoder > 0)
-                if len(prediction) == self.num_single_frame_decoder:
-                    # 模拟 instance_bank.update
-                    # 这里的逻辑是：只保留 fixed 数量的 anchor 继续后面的层，扔掉效果差的 history
-                    # 但为了简化 ONNX，通常如果不影响维度，可以不做动态裁剪，或者必须使用 topk
-                    # 假设这里必须做：
-                    
-                    # 1. 拆分 confidence
-                    cls_score = cls.max(dim=-1).values
-                    # 2. 选取 TopK (K = num_anchor)
-                    # 注意：这里是从 [Fixed + History] 中选出最好的 [Fixed] 个
-                    # 这是一个动态索引操作
-                    topk_vals, topk_inds = torch.topk(cls_score, self.instance_bank.num_anchor, dim=1)
-                    
-                    # 3. Gather
-                    def gather_bs(data, inds):
-                        # data: [B, N, C], inds: [B, K]
-                        return torch.gather(data, 1, inds.unsqueeze(-1).expand(-1, -1, data.shape[-1]))
-                    
-                    instance_feature = gather_bs(instance_feature, topk_inds)
-                    anchor = gather_bs(anchor, topk_inds)
-                    anchor_embed = self.anchor_encoder(anchor)
-                    
-                    # Update 之后，后续层的 temp_anchor 也变了，或者不再需要 temp_gnn
-                    # 这里逻辑比较复杂，如果你的 config 里 num_single_frame_decoder 为 -1，这块直接跳过
-                    pass
 
                 anchor_embed = self.anchor_encoder(anchor)
-            else:
-                raise NotImplementedError(f"{op} is not supported.")
+                if (len(prediction) > self.num_single_frame_decoder and temp_anchor_embed is not None):
+                    temp_anchor_embed = anchor_embed[:, : self.instance_bank.num_temp_instances]
 
-        # =================== 4. 模拟 InstanceBank.cache() 生成下一帧状态 ====================
-        # 获取最后的输出
-        last_cls = classification[-1]
-        last_pred = prediction[-1]
-        last_feat = instance_feature 
+        # =================== 5. TopK 筛选 (严格复刻 InstanceBank.cache 逻辑) ====================
+        last_cls, last_pred = classification[-1], prediction[-1]
         
-        # 计算置信度
-        confidence = last_cls.max(dim=-1).values.sigmoid()
-        
-        # TopK 选择下一帧的 history (num_temp_instances)
-        # 对应 instance_bank.cache -> topk
+        # 严格对齐 InstanceBank.cache 逻辑
         num_temp = self.instance_bank.num_temp_instances
+        num_fixed = self.instance_bank.num_anchor - num_temp
         
-        # 这里需要注意：如果使用了 decay，需要把上一帧传递进来的 confidence 做 decay
-        # 为了简化，ONNX 部署有时直接取当前帧最高的 TopK，效果通常也没问题
-        # next_confidence, next_indices = torch.topk(confidence, num_temp, dim=1)
+        confidence = last_cls.max(dim=-1).values.sigmoid()
+        processed_confidence = confidence.clone()
         
-        # 更严谨的做法：复现 topk 函数
-        # 假设我们只取当前帧检测结果最好的 K 个作为下一帧的输入
-        _, (next_instance_feature, next_anchor) = topk(
-            confidence, 
-            num_temp, 
-            last_feat, 
-            last_pred
+        # 对历史部分执行衰减 (后 600 个)
+        processed_confidence[:, num_fixed:] *= self.instance_bank.confidence_decay 
+        
+        # 选出带入下一帧的状态
+        next_conf_vals, (next_instance_feature, next_anchor) = topk(
+            processed_confidence, num_temp, instance_feature, last_pred
         )
-        
-        # 获取 TopK 的 confidence 供下一次作为 prev_confidence (如果需要)
-        next_confidence_vals, _ = torch.topk(confidence, num_temp, dim=1)
 
-        # =================== 5. 后处理与输出 ====================
-        # 解码最终的 bbox
-        # 注意：BaseModule 的 post_process 可能包含 decode 逻辑
-        # 我们直接在这里调用 decoder.decode 或者返回 raw output 给后处理插件
-        
-        # 这里返回原始的 cls_scores 和 bbox_preds，后处理建议放在模型外（C++）做，
-        # 或者在这里调用 self.decoder.decode 但那会包含 NMS，可能由于动态 loop 导致 TensorRT 变慢。
-        # 建议直接返回 Raw Tensor。
-        
         return {
             "cls_scores": last_cls,
             "bbox_preds": last_pred,
             "next_instance_feature": next_instance_feature,
             "next_anchor": next_anchor,
-            "next_confidence": next_confidence_vals
+            "next_confidence": next_conf_vals # 导出衰减后的分数，方便调试
         }

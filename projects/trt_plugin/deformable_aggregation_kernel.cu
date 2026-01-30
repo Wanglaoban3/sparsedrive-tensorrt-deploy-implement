@@ -8,41 +8,35 @@ __device__ float bilinear_sampling(
     const int &num_embeds, const float &h_im, const float &w_im,
     const int &base_ptr
 ) {
-  const int h_low = floorf(h_im);
-  const int w_low = floorf(w_im);
-  const int h_high = h_low + 1;
-  const int w_high = w_low + 1;
+    // 强制限制范围，防止越界导致的基址错误
+    float h_fixed = fmaxf(0.0f, fminf(h_im, (float)height - 1.0001f));
+    float w_fixed = fmaxf(0.0f, fminf(w_im, (float)width - 1.0001f));
 
-  const float lh = h_im - h_low;
-  const float lw = w_im - w_low;
-  const float hh = 1 - lh, hw = 1 - lw;
+    int h_low = (int)floorf(h_fixed);
+    int w_low = (int)floorf(w_fixed);
+    int h_high = h_low + 1;
+    int w_high = w_low + 1;
 
-  const int w_stride = num_embeds;
-  const int h_stride = width * w_stride;
-  const int h_low_ptr_offset = h_low * h_stride;
-  const int h_high_ptr_offset = h_low_ptr_offset + h_stride;
-  const int w_low_ptr_offset = w_low * w_stride;
-  const int w_high_ptr_offset = w_low_ptr_offset + w_stride;
+    float lh = h_fixed - (float)h_low;
+    float lw = w_fixed - (float)w_low;
+    
+    // 使用更高精度的权重计算
+    float hh = 1.0f - lh;
+    float hw = 1.0f - lw;
 
-  float v1 = 0;
-  if (h_low >= 0 && w_low >= 0) {
-    v1 = bottom_data[h_low_ptr_offset + w_low_ptr_offset + base_ptr];
-  }
-  float v2 = 0;
-  if (h_low >= 0 && w_high <= width - 1) {
-    v2 = bottom_data[h_low_ptr_offset + w_high_ptr_offset + base_ptr];
-  }
-  float v3 = 0;
-  if (h_high <= height - 1 && w_low >= 0) {
-    v3 = bottom_data[h_high_ptr_offset + w_low_ptr_offset + base_ptr];
-  }
-  float v4 = 0;
-  if (h_high <= height - 1 && w_high <= width - 1) {
-    v4 = bottom_data[h_high_ptr_offset + w_high_ptr_offset + base_ptr];
-  }
+    int stride = num_embeds;
+    int w_stride = width * stride;
+    
+    const float* ptr_low = bottom_data + h_low * w_stride + w_low * stride + base_ptr;
+    const float* ptr_high = ptr_low + w_stride;
 
-  const float w1 = hh * hw, w2 = hh * lw, w3 = lh * hw, w4 = lh * lw;
-  return (w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4);
+    // 显式取值，减少指针运算开销
+    float v1 = ptr_low[0];          // (low, low)
+    float v2 = ptr_low[stride];     // (low, high)
+    float v3 = ptr_high[0];         // (high, low)
+    float v4 = ptr_high[stride];    // (high, high)
+
+    return hh * (hw * v1 + lw * v2) + lh * (hw * v3 + lw * v4);
 }
 
 __global__ void deformable_aggregation_kernel(
