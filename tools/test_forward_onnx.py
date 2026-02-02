@@ -135,6 +135,10 @@ def run_real_data_audit():
 
         cos_sim = torch.nn.functional.cosine_similarity(p_det_cls.flatten(), o_det_cls.flatten(), dim=0)
         print(f"[Det_CLS] Cos_Sim: {cos_sim.item():.8f}")
+        p_reg = py_outs[0]['prediction'][-1][0, :, :3].mean(0)
+        o_reg = onnx_det['bbox_preds'][0, :900, :3].mean(0) # 只看前900个
+        print(f"   Frame {frame_idx} Native XYZ Mean: {p_reg.cpu().numpy()}")
+        print(f"   Frame {frame_idx} ONNX   XYZ Mean: {o_reg.cpu().numpy()}")
         
         if frame_idx == 1:
             # 重点看第二帧的回归坐标均值，判断位姿补偿是否起效

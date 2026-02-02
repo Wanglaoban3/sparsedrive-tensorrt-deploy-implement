@@ -43,10 +43,10 @@ def build_engine(onnx_file_path, engine_file_path, plugin_path, fp16=False, verb
     # 5. 配置内存池 (Workspace)
     # TensorRT 8.x+ 使用 set_memory_pool_limit
     try:
-        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30) # 1GB
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 33) # 1GB
     except AttributeError:
         # 旧版本 TensorRT (7.x)
-        config.max_workspace_size = 1 << 30
+        config.max_workspace_size = 1 << 33
 
     # 6. 配置 FP16
     if fp16:
