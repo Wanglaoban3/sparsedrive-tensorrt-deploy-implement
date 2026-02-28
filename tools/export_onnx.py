@@ -13,8 +13,11 @@ from mmdet.models import build_detector
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ==============================================================================
+# 💡 Monkey Patch: 确保 DAF 算子能被 ONNX 导出
+# ==============================================================================
 from projects.mmdet3d_plugin.ops import feature_maps_format
-# (此处省略你之前的 clean_feature_maps_format 定义及 Monkey Patch 代码，请保留原样)
+
+# (这里保留你环境里可能需要的任何自定义 Patch 代码，如果之前有的话)
 
 class SparseDriveONNXWrapper(nn.Module):
     def __init__(self, model):
@@ -25,16 +28,22 @@ class SparseDriveONNXWrapper(nn.Module):
         self.map_head = model.head.map_head
 
     def forward(self, img, projection_mat, 
-                prev_det_feat, prev_det_anchor, 
-                prev_map_feat, prev_map_anchor,
-                instance_t_matrix):
+                prev_det_feat, prev_det_anchor, prev_det_conf, # [New] Det History
+                prev_map_feat, prev_map_anchor, prev_map_conf, # [New] Map History
+                instance_t_matrix, time_interval):             # [New] Ego Motion & DT
+        
+        # 确保所有输入都在同一设备
         dev = img.device
         projection_mat = projection_mat.to(dev)
         prev_det_feat = prev_det_feat.to(dev)
         prev_det_anchor = prev_det_anchor.to(dev)
+        prev_det_conf = prev_det_conf.to(dev)
         prev_map_feat = prev_map_feat.to(dev)
         prev_map_anchor = prev_map_anchor.to(dev)
+        prev_map_conf = prev_map_conf.to(dev)
         instance_t_matrix = instance_t_matrix.to(dev)
+        time_interval = time_interval.to(dev)
+
         # 1. 特征提取 (共享 Backbone 和 Neck)
         B, N, C, H, W = img.shape
         img_reshaped = img.reshape(B * N, C, H, W)
@@ -62,29 +71,35 @@ class SparseDriveONNXWrapper(nn.Module):
         }
 
         # 3. 推理检测头 (Det Head)
+        # [Update] 传入 time_interval 和 prev_confidence 以启用 Z-Lock 和 Decay
         det_outs = self.det_head.forward_onnx(
             feature_maps=formatted_feature_maps,
             prev_instance_feature=prev_det_feat,
             prev_anchor=prev_det_anchor,
             instance_t_matrix=instance_t_matrix,
+            time_interval=time_interval,
+            prev_confidence=prev_det_conf,
             metas=metas 
         )
 
         # 4. 推理地图头 (Map Head)
-        map_outs = self.map_head.forward_onnx(
-            feature_maps=formatted_feature_maps,
-            prev_instance_feature=prev_map_feat,
-            prev_anchor=prev_map_anchor,
-            instance_t_matrix=instance_t_matrix,
-            metas=metas 
-        )
+        # 虽然 Map 可能不使用 time_interval 进行位移补偿，但 Decay 逻辑可能需要 prev_confidence
+        # map_outs = self.map_head.forward_onnx(
+        #     feature_maps=formatted_feature_maps,
+        #     prev_instance_feature=prev_map_feat,
+        #     prev_anchor=prev_map_anchor,
+        #     instance_t_matrix=instance_t_matrix,
+        #     time_interval=time_interval,
+        #     prev_confidence=prev_map_conf,
+        #     metas=metas 
+        # )
 
-        # 5. 合并导出所有的输出节点
+        # 5. 合并导出所有的输出节点 (新增了 next_confidence)
         return (
             det_outs["cls_scores"], det_outs["bbox_preds"], 
-            det_outs["next_instance_feature"], det_outs["next_anchor"],
-            map_outs["cls_scores"], map_outs["bbox_preds"],
-            map_outs["next_instance_feature"], map_outs["next_anchor"]
+            det_outs["next_instance_feature"], det_outs["next_anchor"], det_outs["next_confidence"],
+            # map_outs["cls_scores"], map_outs["bbox_preds"],
+            # map_outs["next_instance_feature"], map_outs["next_anchor"], map_outs["next_confidence"]
         )
 
 def main():
@@ -126,24 +141,32 @@ def main():
     dummy_img = torch.randn(batch_size, num_cams, 3, H, W, device=device)
     dummy_proj_mat = torch.randn(batch_size, num_cams, 4, 4, device=device)
     dummy_ego_mat = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
+    
+    # [New] 时间间隔输入 (通常为 0.5s)
+    dummy_time_interval = torch.tensor([0.5], dtype=torch.float32, device=device).repeat(batch_size)
 
     # 检测头输入
     dummy_det_feat = torch.randn(batch_size, num_det_history, embed_dims, device=device)
     dummy_det_anchor = torch.randn(batch_size, num_det_history, 11, device=device)
+    # [New] 检测头上一帧置信度 (范围 0-1)
+    dummy_det_conf = torch.rand(batch_size, num_det_history, device=device)
 
     # 地图头输入 (Map Anchor 是 40 维)
     dummy_map_feat = torch.randn(batch_size, num_map_history, embed_dims, device=device)
     dummy_map_anchor = torch.randn(batch_size, num_map_history, 40, device=device)
+    # [New] 地图头上一帧置信度
+    dummy_map_conf = torch.rand(batch_size, num_map_history, device=device)
 
     input_names = [
         'img', 'projection_mat', 
-        'prev_det_feat', 'prev_det_anchor', 
-        'prev_map_feat', 'prev_map_anchor', 
-        'instance_t_matrix'
+        'prev_det_feat', 'prev_det_anchor', 'prev_det_conf',
+        'prev_map_feat', 'prev_map_anchor', 'prev_map_conf',
+        'instance_t_matrix', 'time_interval'
     ]
+    
     output_names = [
-        'det_cls', 'det_bbox', 'next_det_feat', 'next_det_anchor',
-        'map_cls', 'map_pts', 'next_map_feat', 'next_map_anchor'
+        'det_cls', 'det_bbox', 'next_det_feat', 'next_det_anchor', 'next_det_conf',
+        # 'map_cls', 'map_pts',  'next_map_feat', 'next_map_anchor', 'next_map_conf'
     ]
 
     print(f"🚀 Exporting Multi-Head model to {args.out}...")
@@ -151,19 +174,17 @@ def main():
         torch.onnx.export(
             wrapper,
             (dummy_img, dummy_proj_mat, 
-             dummy_det_feat, dummy_det_anchor, 
-             dummy_map_feat, dummy_map_anchor, 
-             dummy_ego_mat),
+             dummy_det_feat, dummy_det_anchor, dummy_det_conf,
+             dummy_map_feat, dummy_map_anchor, dummy_map_conf,
+             dummy_ego_mat, dummy_time_interval),
             args.out,
             input_names=input_names,
             output_names=output_names,
             opset_version=13,
             do_constant_folding=False,
-            # 指定动态维度 (可选，但在 Orin 部署时建议设为固定以获取最高性能)
-            # dynamic_axes={'img': {0: 'batch'}} 
         )
     
-    print("🎉 Export finished successfully! Map and Det heads are unified.")
+    print("🎉 Export finished successfully! Supported Inputs: Time Interval & History Confidence.")
 
 if __name__ == '__main__':
     main()

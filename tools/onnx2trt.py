@@ -5,17 +5,15 @@ import ctypes
 import sys
 
 def build_engine(onnx_file_path, engine_file_path, plugin_path, fp16=False, verbose=False):
-    # 1. 检查文件是否存在
+    # 1. 基础检查
     if not os.path.exists(onnx_file_path):
         print(f"Error: ONNX file not found at {onnx_file_path}")
         return
     if not os.path.exists(plugin_path):
         print(f"Error: Plugin library not found at {plugin_path}")
-        print("Please compile the plugin first.")
         return
 
-    # 2. 加载自定义插件库 (.so)
-    # 这一步非常关键！加载库会自动触发 REGISTER_TENSORRT_PLUGIN 宏
+    # 2. 加载插件
     print(f"Loading plugin from {plugin_path}...")
     try:
         ctypes.CDLL(plugin_path)
@@ -23,90 +21,110 @@ def build_engine(onnx_file_path, engine_file_path, plugin_path, fp16=False, verb
         print(f"Error loading plugin library: {e}")
         return
 
-    # 3. 初始化 TensorRT Logger
+    # 3. 初始化 Builder
     logger = trt.Logger(trt.Logger.VERBOSE if verbose else trt.Logger.INFO)
-    
-    # 初始化标准插件库 (可选，如果模型用了标准插件如 InstanceNorm 等)
     trt.init_libnvinfer_plugins(logger, "")
-
-    # 4. 创建 Builder 和 Network
     builder = trt.Builder(logger)
     
-    # EXPLICIT_BATCH 标志是解析 ONNX 必须的
+    # 显式 Batch 标志
     network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
     network = builder.create_network(network_flags)
-    
     config = builder.create_builder_config()
-    config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
-    parser = trt.OnnxParser(network, logger)
 
-    # 5. 配置内存池 (Workspace)
-    # TensorRT 8.x+ 使用 set_memory_pool_limit
+    # =========================================================================
+    # 🛡️🛡️🛡️ 核心修复：白名单策略禁用 Myelin 🛡️🛡️🛡️
+    # =========================================================================
+    print(f"Detected TensorRT Version: {trt.__version__}")
+    print("Applying Tactic Source Allow-list (Safe Mode)...")
+    
     try:
-        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 33) # 1GB
+        # 我们手动构造一个 mask，只包含我们信任的库。
+        # 只要不包含 Myelin 的位，它就不会被执行。
+        safe_sources = 0
+        
+        # 1. 启用 cuBLAS (基础矩阵运算)
+        if "CUBLAS" in trt.TacticSource.__members__:
+            print(" -> Enabling CUBLAS")
+            safe_sources |= 1 << int(trt.TacticSource.CUBLAS)
+            
+        # 2. 启用 cuBLAS_LT (高性能矩阵运算 - Ampere+ 必备)
+        if "CUBLAS_LT" in trt.TacticSource.__members__:
+            print(" -> Enabling CUBLAS_LT")
+            safe_sources |= 1 << int(trt.TacticSource.CUBLAS_LT)
+            
+        # 3. 启用 cuDNN (卷积等)
+        if "CUDNN" in trt.TacticSource.__members__:
+            print(" -> Enabling CUDNN")
+            safe_sources |= 1 << int(trt.TacticSource.CUDNN)
+
+        # 4. 启用 Edge Mask (如果存在)
+        if "EDGE_MASK_CONVOLUTIONS" in trt.TacticSource.__members__:
+             print(" -> Enabling EDGE_MASK_CONVOLUTIONS")
+             safe_sources |= 1 << int(trt.TacticSource.EDGE_MASK_CONVOLUTIONS)
+
+        # ⚠️ 关键：我们绝对**不**去获取 config.get_tactic_sources() 的默认值
+        # 因为默认值里包含所有位（也就包含了导致崩溃的 Myelin）。
+        # 我们直接用我们的 safe_sources 覆盖它。
+        
+        print(f"⚠️  Overwriting Tactic Sources to: {bin(safe_sources)}")
+        config.set_tactic_sources(safe_sources)
+        
+    except Exception as e:
+        print(f"Warning: Failed to set tactic sources: {e}")
+    # =========================================================================
+
+    # 5. 配置显存 (8GB)
+    try:
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 33) 
     except AttributeError:
-        # 旧版本 TensorRT (7.x)
         config.max_workspace_size = 1 << 33
 
-    # 6. 配置 FP16
+    # 6. FP16
     if fp16:
         if builder.platform_has_fast_fp16:
             print("Enabling FP16 precision.")
             config.set_flag(trt.BuilderFlag.FP16)
-        else:
-            print("Warning: FP16 requested but not supported by platform. Falling back to FP32.")
-
-    # 7. 解析 ONNX 模型
+    
+    # 7. 解析 ONNX
+    parser = trt.OnnxParser(network, logger)
     print(f"Parsing ONNX model from {onnx_file_path}...")
     with open(onnx_file_path, 'rb') as model:
         if not parser.parse(model.read()):
-            print("ERROR: Failed to parse the ONNX file.")
+            print("ERROR: Failed to parse ONNX file.")
             for error in range(parser.num_errors):
                 print(parser.get_error(error))
             return None
 
-    # 检查输入输出维度 (调试用)
-    print("Network inputs:")
-    for i in range(network.num_inputs):
-        tensor = network.get_input(i)
-        print(f"  Input {i}: {tensor.name}, Shape: {tensor.shape}, Dtype: {tensor.dtype}")
-    
-    print("Network outputs:")
-    for i in range(network.num_outputs):
-        tensor = network.get_output(i)
-        print(f"  Output {i}: {tensor.name}, Shape: {tensor.shape}, Dtype: {tensor.dtype}")
-
-    # 8. 构建并序列化 Engine
-    print("Building TensorRT engine... This may take a while.")
-    # create_tensorrt_engine 可能会被废弃，尝试使用 build_serialized_network
+    # 8. 构建
+    print("Building TensorRT engine... (Myelin should be inactive)")
     try:
+        # TRT 8.5+ 推荐用法
         plan = builder.build_serialized_network(network, config)
         if plan is None:
             print("Error: Build serialized network failed.")
             return
         engine_bytes = plan
     except AttributeError:
-        # 兼容旧版本
+        # 旧版兼容
         engine = builder.build_engine(network, config)
         if engine is None:
             print("Error: Build engine failed.")
             return
         engine_bytes = engine.serialize()
 
-    # 9. 保存到文件
+    # 9. 保存
     print(f"Saving engine to {engine_file_path}...")
     with open(engine_file_path, "wb") as f:
         f.write(engine_bytes)
-    print("Done!")
+    print("🎉 Done! Engine built successfully.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build TensorRT Engine from ONNX with Custom Plugin")
-    parser.add_argument("--onnx", default="work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.onnx", help="Path to input ONNX model")
-    parser.add_argument("--save", default="work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.engine", help="Path to output TensorRT engine")
-    parser.add_argument("--plugin", default="./projects/trt_plugin/build/libSparseDrivePlugin.so", help="Path to compiled plugin .so library")
-    parser.add_argument("--fp16", action="store_true", help="Enable FP16 precision")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--onnx", default="work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.onnx")
+    parser.add_argument("--save", default="work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.engine")
+    parser.add_argument("--plugin", default="./projects/trt_plugin/build/libSparseDrivePlugin.so")
+    parser.add_argument("--fp16", action="store_true", default=True) # 默认开启FP16
+    parser.add_argument("--verbose", action="store_true", default=True)
     args = parser.parse_args()
 
     build_engine(args.onnx, args.save, args.plugin, args.fp16, args.verbose)

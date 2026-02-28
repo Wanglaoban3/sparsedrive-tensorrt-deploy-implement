@@ -66,16 +66,13 @@ class FlashAttention(nn.Module):
         
         # 1. Unpack KV
         # kv shape: [B, S, 2, H, D] -> split into k and v
-        k = kv[..., 0, :, :] # [B, S, H, D]
-        v = kv[..., 1, :, :] # [B, S, H, D]
-
-        # 2. Transpose dimensions for MatMul: [B, H, Seq, D]
-        # q: [B, T, H, D] -> [B, H, T, D]
+        kv = kv.permute(2, 0, 3, 1, 4)
+        
+        # 2. 直接解包：现在第 0 维就是 k 和 v，且它们在内存中是自然连续的
+        k, v = kv[0], kv[1] 
+        
+        # 3. 处理 q (q 是单独的 [B, T, H, D] -> [B, H, T, D])
         q = q.permute(0, 2, 1, 3)
-        # k: [B, S, H, D] -> [B, H, S, D]
-        k = k.permute(0, 2, 1, 3)
-        # v: [B, S, H, D] -> [B, H, S, D]
-        v = v.permute(0, 2, 1, 3)
 
         # 3. Calculate Scale Factor
         if self.softmax_scale is None:

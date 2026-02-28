@@ -31,7 +31,8 @@ class SparseDriveONNXPathWrapper(nn.Module):
     def forward(self, img, projection_mat, 
                 prev_det_feat, prev_det_anchor, 
                 prev_map_feat, prev_map_anchor,
-                instance_t_matrix):
+                instance_t_matrix,
+                time_interval): # <--- [关键修改] 这里必须加上 time_interval
         B, N, C, H, W = img.shape
         # Backbone + Neck
         img_reshaped = img.reshape(B * N, C, H, W)
@@ -39,7 +40,7 @@ class SparseDriveONNXPathWrapper(nn.Module):
         if self.model.img_neck is not None: 
             x = self.model.img_neck(x)
         
-        # 共享特征图处理 (这是你 Wrapper 里的核心对齐逻辑)
+        # 共享特征图处理
         from projects.mmdet3d_plugin.ops import feature_maps_format
         feature_maps = [f.reshape(B, N, f.shape[1], f.shape[2], f.shape[3]) for f in x]
         formatted_feature_maps = feature_maps_format(feature_maps)
@@ -50,11 +51,19 @@ class SparseDriveONNXPathWrapper(nn.Module):
             'image_wh': img.new_tensor([W, H]).view(1, 1, 2).repeat(B, N, 1)
         }
 
-        # 运行 forward_onnx
+        # 运行 forward_onnx (传入 time_interval)
         det_outs = self.det_head.forward_onnx(
-            formatted_feature_maps, prev_det_feat, prev_det_anchor, instance_t_matrix, metas)
+            formatted_feature_maps, prev_det_feat, prev_det_anchor, 
+            instance_t_matrix, 
+            time_interval=time_interval, # [关键修改] 显式传入
+            metas=metas
+        )
         map_outs = self.map_head.forward_onnx(
-            formatted_feature_maps, prev_map_feat, prev_map_anchor, instance_t_matrix, metas)
+            formatted_feature_maps, prev_map_feat, prev_map_anchor, 
+            instance_t_matrix, 
+            time_interval=time_interval, # [关键修改] 显式传入
+            metas=metas
+        )
 
         return det_outs, map_outs
 
@@ -98,6 +107,16 @@ def run_real_data_audit():
         img_tensor = data['img'].data[0][0].cuda().unsqueeze(0)
         proj_mat = torch.stack([p.cuda() for p in data['projection_mat'].data[0]], dim=0).unsqueeze(0)
         
+        curr_time = img_metas['timestamp']
+
+        if prev_global_mat is None:
+            dt_tensor = torch.tensor([0.5], device='cuda') # 第一帧默认
+            prev_time = curr_time - 0.5
+        else:
+            dt = curr_time - prev_time # 比如 0.52s
+            dt_tensor = torch.tensor([dt], device='cuda')
+        prev_time = curr_time
+
         # 计算位姿矩阵
         curr_global = img_metas['T_global']
         curr_global_inv = img_metas['T_global_inv']
@@ -123,9 +142,10 @@ def run_real_data_audit():
             # 2. 运行 ONNX 路径 (你的 Wrapper 逻辑)
             onnx_det, onnx_map = wrapper(
                 img_tensor, proj_mat, 
-                history['prev_det_feat'], history_det_anchor := history['prev_det_anchor'],
+                history['prev_det_feat'], history['prev_det_anchor'],
                 history['prev_map_feat'], history['prev_map_anchor'],
-                instance_t_matrix
+                instance_t_matrix,
+                dt_tensor # 传入真实时间差
             )
 
         # --- 精度对账 ---

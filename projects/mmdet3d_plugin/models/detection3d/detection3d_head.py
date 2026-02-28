@@ -1,5 +1,3 @@
-# projects/mmdet3d_plugin/models/detection3d/detection3d_head.py
-
 from typing import List, Optional, Tuple, Union
 import warnings
 
@@ -26,17 +24,23 @@ from ..blocks import DeformableFeatureAggregation as DFG
 # === ONNX Friendly TopK ===
 def topk(confidence, k, *inputs):
     bs, N = confidence.shape[:2]
-    topk_conf, topk_indices = torch.topk(confidence, k, dim=1)
+    # 使用 topk 算子
+    confidence, indices = torch.topk(confidence, k, dim=1)
+    
+    # 构造 batch 索引偏移 (Safe for ONNX)
+    batch_idx = torch.arange(bs, device=confidence.device).unsqueeze(1) * N
+    flat_indices = (indices + batch_idx).reshape(-1)
     
     outputs = []
     for input in inputs:
-        C = input.shape[-1]
-        expanded_indices = topk_indices.unsqueeze(-1).expand(bs, k, C)
-        # CRITICAL FIX: .contiguous() after gather
-        selected = torch.gather(input, 1, expanded_indices).contiguous()
-        outputs.append(selected)
+        # Flatten [B, N, C] -> [B*N, C]
+        flat_input = input.flatten(end_dim=1)
+        # Gather
+        selected = flat_input.index_select(0, flat_indices) # 使用 index_select 更稳健
+        # Reshape back [B, K, C]
+        outputs.append(selected.reshape(bs, k, -1))
         
-    return topk_conf, outputs
+    return confidence, outputs
 
 __all__ = ["Sparse4DHead"]
 
@@ -190,7 +194,6 @@ class Sparse4DHead(BaseModule):
             feature_maps = [feature_maps]
         batch_size = feature_maps[0].shape[0]
 
-        # ========= get instance info ============
         if (
             self.sampler.dn_metas is not None
             and self.sampler.dn_metas["dn_anchor"].shape[0] != batch_size
@@ -206,7 +209,6 @@ class Sparse4DHead(BaseModule):
             batch_size, metas, dn_metas=self.sampler.dn_metas
         )
 
-        # ========= prepare for denosing training ============
         attn_mask = None
         dn_metas = None
         temp_dn_reg_target = None
@@ -268,7 +270,6 @@ class Sparse4DHead(BaseModule):
         else:
             temp_anchor_embed = None
 
-        # =================== forward the layers ====================
         prediction = []
         classification = []
         quality = []
@@ -565,28 +566,28 @@ class Sparse4DHead(BaseModule):
             output_idx=output_idx,
         )
 
-    # === 修正后的：ONNX 导出专用前向函数 (High Precision Version) ===
+    # === 修正后的：ONNX 导出专用前向函数 (Myelin-Safe Z-Lock) ===
+    # 核心思路：用 Mask (乘法) 代替 Slice/Concat，避免图碎片化导致 Myelin 崩溃
     def forward_onnx(
         self,
         feature_maps: Union[torch.Tensor, List],
         prev_instance_feature: torch.Tensor,
         prev_anchor: torch.Tensor,
         instance_t_matrix: torch.Tensor,
+        time_interval: torch.Tensor = None, 
+        prev_confidence: torch.Tensor = None,
         metas: dict = None,
     ):
         if isinstance(feature_maps, torch.Tensor):
             feature_maps = [feature_maps]
         batch_size = feature_maps[0].shape[0]
 
-        # 1. 准备 Query (Fixed Anchor)
+        # 1. 准备 Query
         instance_feature = self.instance_bank.instance_feature.unsqueeze(0).repeat(batch_size, 1, 1).to(prev_instance_feature.device)
         anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1).to(prev_anchor.device)
         anchor_embed = self.anchor_encoder(anchor)
 
         # 2. 准备 Key (History)
-        # Use sum() to check for zeros. This works in PyTorch. 
-        # For ONNX export, this might create an 'If' node or unroll the graph depending on the tracer.
-        # But for your current verification script, this is REQUIRED for 0.99 similarity.
         is_first_frame = (prev_instance_feature.abs().sum() == 0)
         
         if is_first_frame:
@@ -601,30 +602,74 @@ class Sparse4DHead(BaseModule):
             
             # 3. 计算 Key Pos
             if self.task_prefix == 'det':
+                # 分离 XYZ (0-2) 和 剩余部分 (3-)
+                # 使用 split 而不是切片，或者直接取
+                xyz = prev_anchor[..., :3]
+                rest = prev_anchor[..., 3:]
+                
+                # 获取 3D 速度 (位于 rest 的 5-8 位: 因为 prev_anchor 是 XYZ(3)+WHL(3)+Yaw(2)+Vel(3)=11)
+                # 注意：rest 索引 0-2=WHL, 3-4=Yaw, 5-7=Vel
+                vel = rest[..., 5:8]
+                
+                # 构造掩码 (Shape: [3])
+                # Mask XY: [1, 1, 0] 用于保留 XY 变化
+                mask_xy = torch.tensor([1.0, 1.0, 0.0], device=xyz.device, dtype=xyz.dtype)
+                # Mask Z:  [0, 0, 1] 用于锁定 Z 轴
+                mask_z  = torch.tensor([0.0, 0.0, 1.0], device=xyz.device, dtype=xyz.dtype)
+                
+                if time_interval is not None:
+                    dt = time_interval.view(batch_size, 1, 1)
+                else:
+                    dt = 0.5 
+                
+                # [Fix 1] 仅计算 XY 位移 (通过掩码，保持 3D Tensor 完整性)
+                # displacement = vel * dt * [1, 1, 0]
+                displacement = vel * dt * mask_xy
+                
+                # 预测位置
+                xyz_pred = xyz + displacement
+                
+                # [Fix 2] Ego Motion (仅 XY 平移)
                 R = instance_t_matrix[:, :3, :3]
                 t = instance_t_matrix[:, :3, 3].unsqueeze(1)
-                prev_center = prev_anchor[..., :3]
-                prev_yaw, prev_vel = prev_anchor[..., 6:8], prev_anchor[..., 8:10]
                 
-                # DT = -0.5 (Confirmed correct for Physics)
-                dt = -0.5 
+                # t_flat = t * [1, 1, 0] (消除 t_z)
+                t_flat = t * mask_xy
                 
-                displacement = prev_vel * dt
-                prev_center_pred = prev_center.clone()
-                prev_center_pred[..., 0] += displacement[..., 0]
-                prev_center_pred[..., 1] += displacement[..., 1]
-                prev_center_new = torch.matmul(prev_center_pred, R.transpose(1, 2)) + t
+                # 坐标变换 (R @ pos + t_flat)
+                xyz_new = torch.matmul(xyz_pred, R.transpose(1, 2)) + t_flat
                 
+                # [Fix 3] Z-Lock (强行写回旧 Z)
+                # xyz_final = xyz_new * [1, 1, 0] + xyz * [0, 0, 1]
+                # 这样完全避免了 tensor[..., 2] = ... 这种 inplace 操作或 concat
+                xyz_final = xyz_new * mask_xy + xyz * mask_z
+                
+                # 旋转 Yaw (2D)
+                prev_yaw = rest[..., 3:5] # Sin, Cos
                 cos_sin_vec = torch.stack([prev_yaw[..., 1], prev_yaw[..., 0]], dim=-1)
                 R_xy = R[:, :2, :2]
                 cos_sin_new = torch.matmul(cos_sin_vec, R_xy.transpose(1, 2))
                 cos_sin_new = torch.nn.functional.normalize(cos_sin_new, dim=-1)
                 prev_yaw_new = torch.cat([cos_sin_new[..., 1:2], cos_sin_new[..., 0:1]], dim=-1)
-                prev_vel_new = torch.matmul(prev_vel, R_xy.transpose(1, 2))
-
-                current_prev_anchor = torch.cat([prev_center_new, prev_anchor[..., 3:6], prev_yaw_new, prev_vel_new], dim=-1)
-                if prev_anchor.shape[-1] > 10:
-                    current_prev_anchor = torch.cat([current_prev_anchor, prev_anchor[..., 10:]], dim=-1)
+                
+                # 旋转 Velocity (2D)
+                # 同样只旋转前两维，避免污染 Z
+                prev_vel_xy = vel[..., :2]
+                prev_vel_xy_new = torch.matmul(prev_vel_xy, R_xy.transpose(1, 2))
+                
+                # 拼装 (WHL 不变, Vel_Z 保持原样)
+                # rest split: WHL(3), Yaw(2), Vel(3)
+                whl = rest[..., 0:3]
+                vel_z = rest[..., 7:8]
+                
+                # 最终拼接：XYZ(New) + WHL(Old) + Yaw(New) + VelXY(New) + VelZ(Old)
+                current_prev_anchor = torch.cat([
+                    xyz_final, 
+                    whl, 
+                    prev_yaw_new, 
+                    prev_vel_xy_new, 
+                    vel_z
+                ], dim=-1)
             
             elif self.task_prefix == 'map':
                 current_prev_anchor = prev_anchor 
@@ -640,7 +685,6 @@ class Sparse4DHead(BaseModule):
         for i, op in enumerate(self.operation_order):
             if self.layers[i] is None: continue
             elif op == "temp_gnn":
-                # Explicitly handle None for Self-Attention behavior
                 if temp_instance_feature is None:
                     instance_feature = self.graph_model(
                         i, instance_feature, None, None,
@@ -670,7 +714,6 @@ class Sparse4DHead(BaseModule):
                 prediction.append(anchor)
                 classification.append(cls)
                 
-                # === InstanceBank.update Simulation ===
                 if len(prediction) == self.num_single_frame_decoder:
                     if cached_feature is not None:
                         num_new = self.instance_bank.num_anchor - self.instance_bank.num_temp_instances
@@ -685,10 +728,15 @@ class Sparse4DHead(BaseModule):
                 else:
                     anchor_embed = self.anchor_encoder(anchor)
 
-        # 5. TopK
+        # 5. TopK & Confidence Decay
         last_cls, last_pred = classification[-1], prediction[-1]
         num_temp = self.instance_bank.num_temp_instances
-        confidence = last_cls.max(dim=-1).values.sigmoid()
+        confidence = last_cls.max(dim=-1).values.sigmoid() 
+
+        if prev_confidence is not None and not is_first_frame:
+            decayed_conf = prev_confidence * self.instance_bank.confidence_decay
+            if decayed_conf.shape[1] == num_temp: 
+                 confidence[:, :num_temp] = torch.maximum(decayed_conf, confidence[:, :num_temp])
         
         next_conf_vals, (next_instance_feature, next_anchor) = topk(
             confidence, num_temp, instance_feature, last_pred
@@ -699,4 +747,5 @@ class Sparse4DHead(BaseModule):
             "bbox_preds": last_pred,
             "next_instance_feature": next_instance_feature,
             "next_anchor": next_anchor, 
+            "next_confidence": next_conf_vals
         }

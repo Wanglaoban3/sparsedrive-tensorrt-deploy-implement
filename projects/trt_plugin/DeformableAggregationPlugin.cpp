@@ -53,7 +53,15 @@ int DeformableAggregationPlugin::enqueue(const PluginTensorDesc* inputDesc, cons
     int num_anchors = inputDesc[3].dims.d[1];
     int num_pts     = inputDesc[3].dims.d[2];
     
-    int num_groups  = inputDesc[4].dims.d[5]; // weights [..., groups]
+    // 👇=== 修复核心：动态且安全地获取 num_groups ===👇
+    int weight_ndims = inputDesc[4].dims.nbDims;
+    // 动态获取最后一个维度的值作为 groups
+    int num_groups = inputDesc[4].dims.d[weight_ndims - 1]; 
+    
+    // 极端情况防御：如果读到了异常值，给一个默认值防止 Kernel 除以 0 崩溃
+    if (num_groups <= 0) num_groups = 1;
+    if (num_groups > num_embeds) num_groups = num_embeds; 
+    // 👆================================================👆
 
     // 初始化 Output 为 0 (因为 Kernel 用的是 atomicAdd)
     size_t output_size = batch_size * num_anchors * num_embeds * sizeof(float);

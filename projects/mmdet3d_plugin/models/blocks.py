@@ -122,33 +122,38 @@ class DeformableFeatureAggregation(BaseModule):
         else:
             key_points = kps_output
             
+        # [Strategy] Break fusion pattern: Weights calculation
         weights = self._get_weights(instance_feature, anchor_embed, metas)
 
         if self.use_deformable_func:
-            points_2d = (
-                self.project_points(
-                    key_points,
-                    metas["projection_mat"],
-                    metas.get("image_wh"),
-                )
-                .permute(0, 2, 3, 1, 4)
-                .reshape(bs, num_anchor, self.num_pts, self.num_cams, 2)
+            # 1. Project points
+            points_2d_raw = self.project_points(
+                key_points,
+                metas["projection_mat"],
+                metas.get("image_wh"),
             )
-            weights = (
-                weights.permute(0, 1, 4, 2, 3, 5)
-                .contiguous()
-                .reshape(
-                    bs,
-                    num_anchor,
-                    self.num_pts,
-                    self.num_cams,
-                    self.num_levels,
-                    self.num_groups,
-                )
+            
+            # [CRITICAL FIX] Break Permute+Reshape fusion in ONNX
+            # Original: permute(0, 2, 3, 1, 4).reshape(...)
+            # New: Explicit contiguous() to force memory re-layout
+            points_2d = points_2d_raw.permute(0, 2, 3, 1, 4).contiguous()
+            points_2d = points_2d.reshape(bs, num_anchor, self.num_pts, self.num_cams, 2)
+            
+            # 2. Process Weights
+            # [CRITICAL FIX] Ensure weights are contiguous before reshape
+            weights = weights.permute(0, 1, 4, 2, 3, 5).contiguous()
+            weights = weights.reshape(
+                bs,
+                num_anchor,
+                self.num_pts,
+                self.num_cams,
+                self.num_levels,
+                self.num_groups,
             )
-            features = DAF(*feature_maps, points_2d, weights).reshape(
-                bs, num_anchor, self.embed_dims
-            )
+            
+            # 3. Call Plugin
+            features = DAF(*feature_maps, points_2d, weights)
+            features = features.reshape(bs, num_anchor, self.embed_dims)
             
             if features.dtype != instance_feature.dtype:
                 features = features.to(instance_feature.dtype)
@@ -184,19 +189,24 @@ class DeformableFeatureAggregation(BaseModule):
             feature_expanded = feature.unsqueeze(2).expand(-1, -1, self.num_cams, -1)
             feature = feature_expanded + camera_embed.unsqueeze(1)
 
-        weights = (
-            self.weights_fc(feature)
-            .reshape(bs, num_anchor, -1, self.num_groups)
-            .softmax(dim=-2)
-            .reshape(
-                bs,
-                num_anchor,
-                self.num_cams,
-                self.num_levels,
-                self.num_pts,
-                self.num_groups,
-            )
+        # [CRITICAL FIX] Break potential fusion in weight calculation
+        # Simplify the chain: Linear -> Reshape -> Softmax -> Reshape
+        raw_weights = self.weights_fc(feature)
+        
+        # Split reshape to avoid fusion
+        weights_view = raw_weights.reshape(bs, num_anchor, -1, self.num_groups)
+        weights_softmax = weights_view.softmax(dim=-2)
+        
+        # Force contiguous before final reshape to protect against Myelin fusion
+        weights = weights_softmax.contiguous().reshape(
+            bs,
+            num_anchor,
+            self.num_cams,
+            self.num_levels,
+            self.num_pts,
+            self.num_groups,
         )
+        
         if self.training and self.attn_drop > 0:
             mask = torch.rand(
                 bs, num_anchor, self.num_cams, 1, self.num_pts, 1
@@ -217,37 +227,22 @@ class DeformableFeatureAggregation(BaseModule):
             pts_extend[:, None, ..., None]
         )
 
-        # 2. [关键修复] 使用 view 替代 [..., 0] 或 squeeze
-        # 显式指定我们要把最后的 1 维去掉，变成 [B, Cam, Anc, Pts, 4]
-        # -1 会自动推导中间的维度，确保 Batch 维和数据维的绝对安全
+        # [Fix] Use view for safety
         points_2d = raw_pts.view(bs, -1, num_anchor, num_pts, 4)
         
-        # 3. 保持原版的 clamp 逻辑以确保精度
-        # 注意：不要用 + 1e-5，因为如果 depth 是负数，+1e-5 依然是负数且接近 0，
-        # 这就是你之前 mATE 飙升的原因。
+        # Clamp depth
         depth = points_2d[..., 2:3]
         points_2d = points_2d[..., 0:2] / torch.clamp(depth, min=1e-5)
         
-        # ==================================================================
-        # [修复] 健壮的 shape 广播，解决 IndexError/RuntimeError
-        # ==================================================================
+        # Robust broadcasting for image_wh
         if image_wh is not None:
-            # 无论输入是 [2], [1, 2] 还是 [B, 2]，统一 reshape 成 [B, 1, 1, 1, 2]
-            # 这样就能正确广播到 points_2d 的 [B, N_cam, N_anc, N_pts, 2]
-            
-            # 如果是 1D [W, H] -> 变成 [1, 1, 1, 1, 2]
             if image_wh.dim() == 1:
                 w_h = image_wh.view(1, 1, 1, 1, 2)
                 points_2d = points_2d / w_h
-                
-            # 如果是 2D [B, 2] -> 变成 [B, 1, 1, 1, 2]
             elif image_wh.dim() == 2:
                 w_h = image_wh.view(bs, 1, 1, 1, 2)
                 points_2d = points_2d / w_h
-            
-            # 旧逻辑保留做 fallback，或者直接删除
             else:
-                # 只有当维度 > 2 且符合旧逻辑预期时才用旧逻辑
                 points_2d = points_2d / image_wh[:, :, None, None]
                 
         return points_2d
