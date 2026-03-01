@@ -601,83 +601,51 @@ class Sparse4DHead(BaseModule):
             cached_feature = prev_instance_feature
             
             # 3. 计算 Key Pos
-            if self.task_prefix == 'det':
-                # 分离 XYZ (0-2) 和 剩余部分 (3-)
-                # 使用 split 而不是切片，或者直接取
-                xyz = prev_anchor[..., :3]
-                rest = prev_anchor[..., 3:]
-                
-                # 获取 3D 速度 (位于 rest 的 5-8 位: 因为 prev_anchor 是 XYZ(3)+WHL(3)+Yaw(2)+Vel(3)=11)
-                # 注意：rest 索引 0-2=WHL, 3-4=Yaw, 5-7=Vel
-                vel = rest[..., 5:8]
-                
-                # 构造掩码 (Shape: [3])
-                # Mask XY: [1, 1, 0] 用于保留 XY 变化
-                mask_xy = torch.tensor([1.0, 1.0, 0.0], device=xyz.device, dtype=xyz.dtype)
-                # Mask Z:  [0, 0, 1] 用于锁定 Z 轴
-                mask_z  = torch.tensor([0.0, 0.0, 1.0], device=xyz.device, dtype=xyz.dtype)
-                
-                if time_interval is not None:
-                    dt = time_interval.view(batch_size, 1, 1)
-                else:
-                    dt = 0.5 
-                
-                # [Fix 1] 仅计算 XY 位移 (通过掩码，保持 3D Tensor 完整性)
-                # displacement = vel * dt * [1, 1, 0]
-                displacement = vel * dt * mask_xy
-                
-                # 预测位置
-                xyz_pred = xyz + displacement
-                
-                # [Fix 2] Ego Motion (仅 XY 平移)
-                R = instance_t_matrix[:, :3, :3]
-                t = instance_t_matrix[:, :3, 3].unsqueeze(1)
-                
-                # t_flat = t * [1, 1, 0] (消除 t_z)
-                t_flat = t * mask_xy
-                
-                # 坐标变换 (R @ pos + t_flat)
-                xyz_new = torch.matmul(xyz_pred, R.transpose(1, 2)) + t_flat
-                
-                # [Fix 3] Z-Lock (强行写回旧 Z)
-                # xyz_final = xyz_new * [1, 1, 0] + xyz * [0, 0, 1]
-                # 这样完全避免了 tensor[..., 2] = ... 这种 inplace 操作或 concat
-                xyz_final = xyz_new * mask_xy + xyz * mask_z
-                
-                # 旋转 Yaw (2D)
-                prev_yaw = rest[..., 3:5] # Sin, Cos
-                cos_sin_vec = torch.stack([prev_yaw[..., 1], prev_yaw[..., 0]], dim=-1)
-                R_xy = R[:, :2, :2]
-                cos_sin_new = torch.matmul(cos_sin_vec, R_xy.transpose(1, 2))
-                cos_sin_new = torch.nn.functional.normalize(cos_sin_new, dim=-1)
-                prev_yaw_new = torch.cat([cos_sin_new[..., 1:2], cos_sin_new[..., 0:1]], dim=-1)
-                
-                # 旋转 Velocity (2D)
-                # 同样只旋转前两维，避免污染 Z
-                prev_vel_xy = vel[..., :2]
-                prev_vel_xy_new = torch.matmul(prev_vel_xy, R_xy.transpose(1, 2))
-                
-                # 拼装 (WHL 不变, Vel_Z 保持原样)
-                # rest split: WHL(3), Yaw(2), Vel(3)
-                whl = rest[..., 0:3]
-                vel_z = rest[..., 7:8]
-                
-                # 最终拼接：XYZ(New) + WHL(Old) + Yaw(New) + VelXY(New) + VelZ(Old)
-                current_prev_anchor = torch.cat([
-                    xyz_final, 
-                    whl, 
-                    prev_yaw_new, 
-                    prev_vel_xy_new, 
-                    vel_z
-                ], dim=-1)
+        if self.task_prefix == 'det':
+            xyz = prev_anchor[..., :3]
+            rest = prev_anchor[..., 3:] 
+            vel = rest[..., 5:8]         
             
-            elif self.task_prefix == 'map':
-                current_prev_anchor = prev_anchor 
-            else:
-                current_prev_anchor = prev_anchor
+            mask_xy = torch.tensor([1.0, 1.0, 0.0], device=xyz.device, dtype=xyz.dtype)
+            mask_z  = torch.tensor([0.0, 0.0, 1.0], device=xyz.device, dtype=xyz.dtype)
+            
+            dt = time_interval.view(batch_size, 1, 1) if time_interval is not None else 0.5 
+            
+            displacement = vel * dt * mask_xy
+            xyz_pred = xyz + displacement
+            xyz_pred_h = torch.cat([xyz_pred, torch.ones_like(xyz_pred[..., :1])], dim=-1)
+            xyz_new_all = torch.matmul(xyz_pred_h, instance_t_matrix.transpose(1, 2))[..., :3]
+            xyz_final = xyz_new_all * mask_xy + xyz * mask_z
+            
+            R_xy = instance_t_matrix[:, :2, :2]
+            
+            prev_yaw = rest[..., 3:5] 
+            swap_mat = torch.tensor([[0.0, 1.0], [1.0, 0.0]], device=prev_yaw.device, dtype=prev_yaw.dtype)
+            
+            cos_sin_vec = torch.matmul(prev_yaw, swap_mat)
+            cos_sin_new = torch.matmul(cos_sin_vec, R_xy.transpose(1, 2))
+            cos_sin_new = torch.nn.functional.normalize(cos_sin_new, dim=-1)
+            prev_yaw_new = torch.matmul(cos_sin_new, swap_mat)
+            
+            prev_vel_xy = vel[..., :2]
+            prev_vel_xy_new = torch.matmul(prev_vel_xy, R_xy.transpose(1, 2))
+            
+            import torch.nn.functional as F
+            yaw_padded = F.pad(prev_yaw_new, (3, 3)) 
+            vel_padded = F.pad(prev_vel_xy_new, (5, 1))
 
-            cached_anchor = current_prev_anchor
-            temp_anchor_embed = self.anchor_encoder(current_prev_anchor)
+            mask_keep = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], device=rest.device, dtype=rest.dtype)
+            rest_new = (rest * mask_keep) + yaw_padded + vel_padded
+            
+            current_prev_anchor = torch.cat([xyz_final, rest_new], dim=-1)
+            
+        elif self.task_prefix == 'map':
+            current_prev_anchor = prev_anchor 
+        else:
+            current_prev_anchor = prev_anchor
+
+        cached_anchor = current_prev_anchor
+        temp_anchor_embed = self.anchor_encoder(current_prev_anchor)
 
         # 4. Transformer Loop
         prediction, classification = [], []
@@ -741,6 +709,161 @@ class Sparse4DHead(BaseModule):
         next_conf_vals, (next_instance_feature, next_anchor) = topk(
             confidence, num_temp, instance_feature, last_pred
         )
+
+        return {
+            "cls_scores": last_cls,
+            "bbox_preds": last_pred,
+            "next_instance_feature": next_instance_feature,
+            "next_anchor": next_anchor, 
+            "next_confidence": next_conf_vals
+        }
+
+    def forward_onnx_test(
+        self,
+        feature_maps: Union[torch.Tensor, List],
+        prev_instance_feature: torch.Tensor,
+        prev_anchor: torch.Tensor,
+        instance_t_matrix: torch.Tensor,
+        time_interval: torch.Tensor = None, 
+        prev_confidence: torch.Tensor = None,
+        metas: dict = None,
+    ):
+        if isinstance(feature_maps, torch.Tensor):
+            feature_maps = [feature_maps]
+        batch_size = feature_maps[0].shape[0]
+
+        # =================== 1. 准备 Query ====================
+        fixed_feature = self.instance_bank.instance_feature.unsqueeze(0).repeat(batch_size, 1, 1).to(prev_instance_feature.device)
+        fixed_anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1).to(prev_anchor.device)
+        
+        temp_instance_feature = prev_instance_feature
+        cached_feature = prev_instance_feature
+
+        # =================== 2. Ego-Motion 补偿 (拯救 Myelin 的置换矩阵法) ====================
+        if self.task_prefix == 'det':
+            xyz = prev_anchor[..., :3]
+            rest = prev_anchor[..., 3:] 
+            vel = rest[..., 5:8]         
+            
+            mask_xy = torch.tensor([1.0, 1.0, 0.0], device=xyz.device, dtype=xyz.dtype)
+            mask_z  = torch.tensor([0.0, 0.0, 1.0], device=xyz.device, dtype=xyz.dtype)
+            
+            dt = time_interval.view(batch_size, 1, 1) if time_interval is not None else 0.5 
+            
+            displacement = vel * dt * mask_xy
+            xyz_pred = xyz + displacement
+            xyz_pred_h = torch.cat([xyz_pred, torch.ones_like(xyz_pred[..., :1])], dim=-1)
+            xyz_new_all = torch.matmul(xyz_pred_h, instance_t_matrix.transpose(1, 2))[..., :3]
+            xyz_final = xyz_new_all * mask_xy + xyz * mask_z
+            
+            R_xy = instance_t_matrix[:, :2, :2]
+            
+            prev_yaw = rest[..., 3:5] 
+            swap_mat = torch.tensor([[0.0, 1.0], [1.0, 0.0]], device=prev_yaw.device, dtype=prev_yaw.dtype)
+            
+            cos_sin_vec = torch.matmul(prev_yaw, swap_mat)
+            cos_sin_new = torch.matmul(cos_sin_vec, R_xy.transpose(1, 2))
+            cos_sin_new = torch.nn.functional.normalize(cos_sin_new, dim=-1)
+            prev_yaw_new = torch.matmul(cos_sin_new, swap_mat)
+            
+            prev_vel_xy = vel[..., :2]
+            prev_vel_xy_new = torch.matmul(prev_vel_xy, R_xy.transpose(1, 2))
+            
+            import torch.nn.functional as F
+            yaw_padded = F.pad(prev_yaw_new, (3, 3)) 
+            vel_padded = F.pad(prev_vel_xy_new, (5, 1))
+
+            mask_keep = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], device=rest.device, dtype=rest.dtype)
+            rest_new = (rest * mask_keep) + yaw_padded + vel_padded
+            
+            current_prev_anchor = torch.cat([xyz_final, rest_new], dim=-1)
+            
+        elif self.task_prefix == 'map':
+            current_prev_anchor = prev_anchor 
+        else:
+            current_prev_anchor = prev_anchor
+
+        cached_anchor = current_prev_anchor
+        temp_anchor_embed = self.anchor_encoder(current_prev_anchor)
+
+        # =================== 3. 初始拼接 [Fixed(900), Temp(600)] ====================
+        instance_feature = torch.cat([fixed_feature, prev_instance_feature], dim=1)
+        anchor = torch.cat([fixed_anchor, current_prev_anchor], dim=1)
+        anchor_embed = self.anchor_encoder(anchor)
+
+        # =================== 4. Transformer Loop (恢复你完美的 1500->900 截断逻辑) ====================
+        prediction, classification = [], []
+        num_temp = int(self.instance_bank.num_temp_instances)
+        
+        for i, op in enumerate(self.operation_order):
+            if self.layers[i] is None: continue
+            elif op == "temp_gnn":
+                instance_feature = self.graph_model(
+                    i, instance_feature, temp_instance_feature, temp_instance_feature,
+                    query_pos=anchor_embed, key_pos=temp_anchor_embed
+                )
+            elif op == "gnn":
+                instance_feature = self.graph_model(
+                    i, instance_feature, value=instance_feature, query_pos=anchor_embed
+                )
+            elif op in ["norm", "ffn"]:
+                instance_feature = self.layers[i](instance_feature)
+            elif op == "deformable":
+                instance_feature = self.layers[i](
+                    instance_feature, anchor, anchor_embed, feature_maps, metas
+                )
+            elif op == "refine":
+                dummy_time = instance_feature.new_tensor([self.instance_bank.default_time_interval] * batch_size)
+                anchor, cls, qt = self.layers[i](
+                    instance_feature, anchor, anchor_embed,
+                    time_interval=dummy_time, return_cls=True
+                )
+                prediction.append(anchor)
+                classification.append(cls)
+
+                # ✨ 使用静态 gather 完美还原截断逻辑 (ONNX 极其友好，没有动态 Shape 突变)
+                if len(prediction) == self.num_single_frame_decoder:
+                    num_new = int(self.instance_bank.num_anchor - self.instance_bank.num_temp_instances)
+                    curr_conf = cls.max(dim=-1).values.sigmoid()
+                    
+                    # 提取前 300 个 (静态 K)
+                    _, topk_idx_mid = torch.topk(curr_conf, k=num_new, dim=1)
+                    idx_feat_mid = topk_idx_mid.unsqueeze(-1).expand(-1, -1, instance_feature.shape[-1])
+                    idx_anchor_mid = topk_idx_mid.unsqueeze(-1).expand(-1, -1, anchor.shape[-1])
+                    selected_feature = torch.gather(instance_feature, 1, idx_feat_mid)
+                    selected_anchor = torch.gather(anchor, 1, idx_anchor_mid)
+                    
+                    # 重新拼接：注意！此时序列完美翻转成了 [Temp(600), Fixed(300)]
+                    instance_feature = torch.cat([cached_feature, selected_feature], dim=1)
+                    anchor = torch.cat([cached_anchor, selected_anchor], dim=1)
+                    anchor_embed = self.anchor_encoder(anchor)
+                else:
+                    anchor_embed = self.anchor_encoder(anchor)
+
+        # =================== 5. TopK & Confidence Decay (还原你的衰减逻辑) ====================
+        last_cls, last_pred = classification[-1], prediction[-1]
+        confidence = last_cls.max(dim=-1).values.sigmoid() 
+
+        # 还原你的完美逻辑！现在前 600 个确实是 Temp
+        # 我们用切片拼接替换原地赋值，数学结果和你一模一样，但 TRT 更友好
+        conf_temp = confidence[:, :num_temp]
+        conf_rest = confidence[:, num_temp:]
+
+        if prev_confidence is not None:
+            decayed_conf = prev_confidence * self.instance_bank.confidence_decay
+            conf_temp = torch.maximum(decayed_conf, conf_temp)
+        else:
+            conf_temp = conf_temp * self.instance_bank.confidence_decay
+            
+        processed_confidence = torch.cat([conf_temp, conf_rest], dim=1)
+
+        # 💡 神级修复：直接手写内联 topk 提取，完全规避 K initializer 报错
+        next_conf_vals, topk_idx_fin = torch.topk(processed_confidence, k=num_temp, dim=1)
+        idx_feat_fin = topk_idx_fin.unsqueeze(-1).expand(-1, -1, instance_feature.shape[-1])
+        idx_anchor_fin = topk_idx_fin.unsqueeze(-1).expand(-1, -1, last_pred.shape[-1])
+        
+        next_instance_feature = torch.gather(instance_feature, 1, idx_feat_fin)
+        next_anchor = torch.gather(last_pred, 1, idx_anchor_fin)
 
         return {
             "cls_scores": last_cls,

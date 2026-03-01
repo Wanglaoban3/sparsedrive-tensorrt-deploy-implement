@@ -45,12 +45,12 @@ __global__ void deformable_aggregation_kernel(
     const float* sample_location,
     const float* weights,
     int batch_size, int num_cams, int num_feat, int num_embeds,
-    int num_scale, int num_anchors, int num_pts, int num_groups
+    int num_scale, int num_anchors, int num_pts, int num_groups,
+    bool is_cam_shared  // <--- 新增
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_kernels) return;
 
-    // 解析索引
     const float weight = *(weights + idx / (num_embeds / num_groups));
     const int channel_index = idx % num_embeds;
     idx /= num_embeds;
@@ -66,44 +66,33 @@ __global__ void deformable_aggregation_kernel(
 
     int real_anchor_index = batch_index * num_anchors + anchor_index;
     
-    // 定位采样点
     const int loc_offset = ((real_anchor_index * num_pts + pts_index) * num_cams + cam_index) << 1;
     const float loc_w = sample_location[loc_offset];
     const float loc_h = sample_location[loc_offset + 1];
 
     if (loc_w <= 0 || loc_w >= 1 || loc_h <= 0 || loc_h >= 1) return;
     
-    // === [CRITICAL FIX] 安全性检查开始 ===
-    // 在 TensorRT Profile 阶段，spatial_shape 和 scale_start_index 可能是随机垃圾值。
-    // 必须进行边界检查以防止 Segfault。
-
-    // 1. 获取当前 scale 的起始索引
-    int cam_scale_index = cam_index * num_scale + scale_index;
-    const int current_start_index = scale_start_index[cam_scale_index];
+    // === 核心修复：处理相机合并折叠 ===
+    // 如果折叠了，直接只按 scale_index 寻址；如果没折叠，按常规的 cam * num_scale + scale 计算
+    int shape_index = is_cam_shared ? scale_index : (cam_index * num_scale + scale_index);
+    const int current_start_index = scale_start_index[shape_index];
     
-    // 2. 计算特征图总容量
+    // 因为 start_index 只是单张图像的局部偏移，我们必须手动给每张特征图加上相机的宏观步长
+    int cam_offset = is_cam_shared ? (cam_index * (num_feat / num_cams)) : 0;
+    
     const int max_feat_size = batch_size * num_feat * num_embeds;
-    const int value_offset = (batch_index * num_feat + current_start_index) * num_embeds + channel_index;
+    const int value_offset = (batch_index * num_feat + cam_offset + current_start_index) * num_embeds + channel_index;
 
-    // 如果起始偏移量已经越界，直接返回
     if (value_offset < 0 || value_offset >= max_feat_size) return;
 
-    // 3. 读取 TRT 传来的 (可能是垃圾值的) h 和 w
-    cam_scale_index = cam_scale_index << 1;
-    const int h = spatial_shape[cam_scale_index];
-    const int w = spatial_shape[cam_scale_index + 1];
+    int shape_idx_2d = shape_index << 1;
+    const int h = spatial_shape[shape_idx_2d];
+    const int w = spatial_shape[shape_idx_2d + 1];
 
-    // 4. [最优雅的动态拦截] 
-    // 任何一层的 h 或 w 绝对不可能超过所有层展平后的总像素数 (num_feat)
-    // 这样既没有硬编码，又能防止下方乘法发生 Integer Overflow
     if (h <= 0 || w <= 0 || h > num_feat || w > num_feat) return;
 
-    // 5. [防线增强] 检查当前尺度的最大访问范围是否越界
-    // 因为 h 和 w 已经被 num_feat 限制，这里的乘法绝对不会再发生 int32 溢出
     long long max_access_offset = (long long)value_offset + (long long)h * w * num_embeds;
     if (max_access_offset > max_feat_size) return;
-
-    // === 安全性检查结束 ===
 
     const float h_im = loc_h * h - 0.5;
     const float w_im = loc_w * w - 0.5;
@@ -123,9 +112,12 @@ extern "C" void DeformableAggregationLauncher(
     float* output,
     int batch_size, int num_cams, int num_feat, int num_embeds,
     int num_scale, int num_anchors, int num_pts, int num_groups,
+    bool is_cam_shared, // <--- 新增
     cudaStream_t stream
 ) {
     const int num_kernels = batch_size * num_pts * num_embeds * num_anchors * num_cams * num_scale;
+    if (num_kernels <= 0) return;
+    
     dim3 threads(128);
     dim3 blocks((num_kernels + threads.x - 1) / threads.x);
 
@@ -133,6 +125,7 @@ extern "C" void DeformableAggregationLauncher(
         num_kernels, output,
         mc_ms_feat, spatial_shape, scale_start_index, sample_location, weights,
         batch_size, num_cams, num_feat, num_embeds,
-        num_scale, num_anchors, num_pts, num_groups
+        num_scale, num_anchors, num_pts, num_groups,
+        is_cam_shared
     );
 }

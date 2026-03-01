@@ -30,45 +30,27 @@ def build_engine(onnx_file_path, engine_file_path, plugin_path, fp16=False, verb
     network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
     network = builder.create_network(network_flags)
     config = builder.create_builder_config()
+    config.clear_flag(trt.BuilderFlag.TF32)
+    if hasattr(config, 'builder_optimization_level'):
+        config.builder_optimization_level = 1
 
     # =========================================================================
     # 🛡️🛡️🛡️ 核心修复：白名单策略禁用 Myelin 🛡️🛡️🛡️
     # =========================================================================
     print(f"Detected TensorRT Version: {trt.__version__}")
     print("Applying Tactic Source Allow-list (Safe Mode)...")
-    
     try:
-        # 我们手动构造一个 mask，只包含我们信任的库。
-        # 只要不包含 Myelin 的位，它就不会被执行。
         safe_sources = 0
-        
-        # 1. 启用 cuBLAS (基础矩阵运算)
         if "CUBLAS" in trt.TacticSource.__members__:
-            print(" -> Enabling CUBLAS")
             safe_sources |= 1 << int(trt.TacticSource.CUBLAS)
-            
-        # 2. 启用 cuBLAS_LT (高性能矩阵运算 - Ampere+ 必备)
         if "CUBLAS_LT" in trt.TacticSource.__members__:
-            print(" -> Enabling CUBLAS_LT")
             safe_sources |= 1 << int(trt.TacticSource.CUBLAS_LT)
-            
-        # 3. 启用 cuDNN (卷积等)
         if "CUDNN" in trt.TacticSource.__members__:
-            print(" -> Enabling CUDNN")
             safe_sources |= 1 << int(trt.TacticSource.CUDNN)
-
-        # 4. 启用 Edge Mask (如果存在)
         if "EDGE_MASK_CONVOLUTIONS" in trt.TacticSource.__members__:
-             print(" -> Enabling EDGE_MASK_CONVOLUTIONS")
              safe_sources |= 1 << int(trt.TacticSource.EDGE_MASK_CONVOLUTIONS)
 
-        # ⚠️ 关键：我们绝对**不**去获取 config.get_tactic_sources() 的默认值
-        # 因为默认值里包含所有位（也就包含了导致崩溃的 Myelin）。
-        # 我们直接用我们的 safe_sources 覆盖它。
-        
-        print(f"⚠️  Overwriting Tactic Sources to: {bin(safe_sources)}")
         config.set_tactic_sources(safe_sources)
-        
     except Exception as e:
         print(f"Warning: Failed to set tactic sources: {e}")
     # =========================================================================
@@ -78,12 +60,6 @@ def build_engine(onnx_file_path, engine_file_path, plugin_path, fp16=False, verb
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 33) 
     except AttributeError:
         config.max_workspace_size = 1 << 33
-
-    # 6. FP16
-    if fp16:
-        if builder.platform_has_fast_fp16:
-            print("Enabling FP16 precision.")
-            config.set_flag(trt.BuilderFlag.FP16)
     
     # 7. 解析 ONNX
     parser = trt.OnnxParser(network, logger)
@@ -94,6 +70,34 @@ def build_engine(onnx_file_path, engine_file_path, plugin_path, fp16=False, verb
             for error in range(parser.num_errors):
                 print(parser.get_error(error))
             return None
+
+    # =========================================================================
+    # 🛡️ 智能混合精度防溢出：仅针对 Softmax 和 Exp 开启 FP32 Fallback
+    # ⚠️ 彻底删除了无差别的“精度擦除”代码，完美保护 Int32 形状推导逻辑！
+    # =========================================================================
+    if fp16 and builder.platform_has_fast_fp16:
+        print("Enabling FP16 with Strict Mixed Precision Fallback...")
+        config.set_flag(trt.BuilderFlag.FP16)
+        
+        # 强制 TensorRT 听从我们指定的节点精度
+        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+
+        # 仅针对导致溢出的指数爆炸核心元凶
+        dangerous_keywords = ['Softmax', 'Exp']
+
+        fallback_count = 0
+        for i in range(network.num_layers):
+            layer = network.get_layer(i)
+            layer_name = layer.name
+            
+            if any(k in layer_name for k in dangerous_keywords):
+                layer.precision = trt.DataType.FLOAT
+                for j in range(layer.num_outputs):
+                    layer.set_output_type(j, trt.DataType.FLOAT)
+                fallback_count += 1
+                
+        print(f"✅ Successfully forced {fallback_count} dangerous floating-point layers to FP32.")
+    # =========================================================================
 
     # 8. 构建
     print("Building TensorRT engine... (Myelin should be inactive)")

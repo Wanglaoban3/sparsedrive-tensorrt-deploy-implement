@@ -8,6 +8,7 @@ extern "C" void DeformableAggregationLauncher(
     const float* sample_location, const float* weights, float* output,
     int batch_size, int num_cams, int num_feat, int num_embeds,
     int num_scale, int num_anchors, int num_pts, int num_groups,
+    bool is_cam_shared, // <--- 新增标志位
     cudaStream_t stream
 );
 
@@ -42,28 +43,37 @@ void DeformableAggregationPlugin::configurePlugin(const DynamicPluginTensorDesc*
 
 int DeformableAggregationPlugin::enqueue(const PluginTensorDesc* inputDesc, const PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept {
     
-    // 解析维度
-    int batch_size = inputDesc[0].dims.d[0];
-    int num_feat   = inputDesc[0].dims.d[1];
-    int num_embeds = inputDesc[0].dims.d[2];
+    // --- 核心修复 1: 从后往前动态解析维度，彻底免疫 TRT 的 Squeeze 操作 ---
     
-    int num_cams   = inputDesc[1].dims.d[0]; // spatial_shape [cam, scale, 2]
-    int num_scale  = inputDesc[1].dims.d[1];
+    // mc_ms_feat: [B, num_feat, num_embeds] 
+    int dims0 = inputDesc[0].dims.nbDims;
+    int num_embeds = inputDesc[0].dims.d[dims0 - 1];
+    int num_feat   = inputDesc[0].dims.d[dims0 - 2];
+    int batch_size = (dims0 >= 3) ? inputDesc[0].dims.d[dims0 - 3] : 1;
+    
+    // spatial_shape: [num_scale, 2] 
+    int dims1 = inputDesc[1].dims.nbDims;
+    int num_scale = inputDesc[1].dims.d[dims1 - 2];
 
-    int num_anchors = inputDesc[3].dims.d[1];
-    int num_pts     = inputDesc[3].dims.d[2];
-    
-    // 👇=== 修复核心：动态且安全地获取 num_groups ===👇
-    int weight_ndims = inputDesc[4].dims.nbDims;
-    // 动态获取最后一个维度的值作为 groups
-    int num_groups = inputDesc[4].dims.d[weight_ndims - 1]; 
-    
-    // 极端情况防御：如果读到了异常值，给一个默认值防止 Kernel 除以 0 崩溃
+    // sample_location: [B, num_anchors, num_pts, num_cams, 2]
+    int dims3 = inputDesc[3].dims.nbDims;
+    int num_cams    = inputDesc[3].dims.d[dims3 - 2]; 
+    int num_pts     = inputDesc[3].dims.d[dims3 - 3];
+    int num_anchors = inputDesc[3].dims.d[dims3 - 4];
+
+    // weights: [B, num_anchors, num_pts, num_cams, num_scale, num_groups]
+    int dims4 = inputDesc[4].dims.nbDims;
+    int num_groups = inputDesc[4].dims.d[dims4 - 1];
     if (num_groups <= 0) num_groups = 1;
-    if (num_groups > num_embeds) num_groups = num_embeds; 
-    // 👆================================================👆
 
-    // 初始化 Output 为 0 (因为 Kernel 用的是 atomicAdd)
+    // --- 核心修复 2: 探测 spatial_shape 是否在相机维度上被常量折叠 ---
+    int start_index_vol = 1;
+    for(int i = 0; i < inputDesc[2].dims.nbDims; ++i) {
+        start_index_vol *= inputDesc[2].dims.d[i];
+    }
+    // 如果总元素个数等于 num_scale，说明6个相机合并共用了一份 offset
+    bool is_cam_shared = (start_index_vol == num_scale);
+
     size_t output_size = batch_size * num_anchors * num_embeds * sizeof(float);
     cudaMemsetAsync(outputs[0], 0, output_size, stream);
 
@@ -73,6 +83,7 @@ int DeformableAggregationPlugin::enqueue(const PluginTensorDesc* inputDesc, cons
         (float*)outputs[0],
         batch_size, num_cams, num_feat, num_embeds,
         num_scale, num_anchors, num_pts, num_groups,
+        is_cam_shared, // 传给 CUDA Kernel
         stream
     );
 
