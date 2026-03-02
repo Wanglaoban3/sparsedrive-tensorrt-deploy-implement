@@ -581,74 +581,81 @@ class Sparse4DHead(BaseModule):
         if isinstance(feature_maps, torch.Tensor):
             feature_maps = [feature_maps]
         batch_size = feature_maps[0].shape[0]
+        device = feature_maps[0].device
+        dtype = feature_maps[0].dtype
 
-        # 1. 准备 Query
-        instance_feature = self.instance_bank.instance_feature.unsqueeze(0).repeat(batch_size, 1, 1).to(prev_instance_feature.device)
-        anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1).to(prev_anchor.device)
+        # 1. 初始化当前帧 Query
+        instance_feature = self.instance_bank.instance_feature.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
+        anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
         anchor_embed = self.anchor_encoder(anchor)
 
-        # 2. 准备 Key (History)
-        is_first_frame = (prev_instance_feature.abs().sum() == 0)
+        # 2. 时间差处理与场景重置判定 (对齐 InstanceBank.py 第 85-86, 111-115 行)
+        if time_interval is not None:
+            raw_dt = time_interval.view(batch_size)
+        else:
+            raw_dt = instance_feature.new_tensor([self.instance_bank.default_time_interval] * batch_size)
         
-        if is_first_frame:
+        # 判定历史是否有效：不是第一帧且时间跨度在阈值内 (通常 2s)
+        is_valid_history = (prev_instance_feature.abs().sum() > 0) & (raw_dt.abs() <= self.instance_bank.max_time_interval)
+        
+        # 用于 Refine 层计算速度的 dt (若换场则强制为 0.5s)
+        dt_for_refine = torch.where(
+            is_valid_history, 
+            raw_dt, 
+            raw_dt.new_tensor(self.instance_bank.default_time_interval)
+        ).view(-1, 1, 1)
+
+        # 3. 历史状态投影 (移植自验证成功的 forward_onnx_debug)
+        if not is_valid_history.any():
             temp_instance_feature = None
             temp_anchor_embed = None
-            current_prev_anchor = None
             cached_feature = None
             cached_anchor = None
         else:
             temp_instance_feature = prev_instance_feature
-            cached_feature = prev_instance_feature
+            cached_feature = temp_instance_feature
             
-            # 3. 计算 Key Pos
-        if self.task_prefix == 'det':
+            # 分离状态
             xyz = prev_anchor[..., :3]
-            rest = prev_anchor[..., 3:] 
-            vel = rest[..., 5:8]         
+            rest = prev_anchor[..., 3:]
+            vel = rest[..., 5:8]
             
-            mask_xy = torch.tensor([1.0, 1.0, 0.0], device=xyz.device, dtype=xyz.dtype)
-            mask_z  = torch.tensor([0.0, 0.0, 1.0], device=xyz.device, dtype=xyz.dtype)
-            
-            dt = time_interval.view(batch_size, 1, 1) if time_interval is not None else 0.5 
-            
-            displacement = vel * dt * mask_xy
+            # 3D 线性补偿 (使用 raw_dt)
+            dt_view = raw_dt.view(-1, 1, 1)
+            displacement = vel * dt_view
             xyz_pred = xyz + displacement
             xyz_pred_h = torch.cat([xyz_pred, torch.ones_like(xyz_pred[..., :1])], dim=-1)
-            xyz_new_all = torch.matmul(xyz_pred_h, instance_t_matrix.transpose(1, 2))[..., :3]
-            xyz_final = xyz_new_all * mask_xy + xyz * mask_z
             
-            R_xy = instance_t_matrix[:, :2, :2]
+            # 空间位置变换
+            xyz_final = torch.matmul(xyz_pred_h, instance_t_matrix.transpose(1, 2))[..., :3]
             
-            prev_yaw = rest[..., 3:5] 
-            swap_mat = torch.tensor([[0.0, 1.0], [1.0, 0.0]], device=prev_yaw.device, dtype=prev_yaw.dtype)
+            # 3D 旋转变换 (对齐 R_full 以支持 Pitch/Roll)
+            R_full = instance_t_matrix[:, :3, :3]
+            R_xy = R_full[:, :2, :2]
             
+            # Yaw 旋转
+            prev_yaw = rest[..., 3:5]
+            swap_mat = torch.tensor([[0.0, 1.0], [1.0, 0.0]], device=device, dtype=dtype)
             cos_sin_vec = torch.matmul(prev_yaw, swap_mat)
             cos_sin_new = torch.matmul(cos_sin_vec, R_xy.transpose(1, 2))
-            cos_sin_new = torch.nn.functional.normalize(cos_sin_new, dim=-1)
             prev_yaw_new = torch.matmul(cos_sin_new, swap_mat)
             
-            prev_vel_xy = vel[..., :2]
-            prev_vel_xy_new = torch.matmul(prev_vel_xy, R_xy.transpose(1, 2))
+            # 速度矢量旋转
+            prev_vel_new = torch.matmul(vel, R_full.transpose(1, 2))
             
+            # 组合 rest 状态
             import torch.nn.functional as F
-            yaw_padded = F.pad(prev_yaw_new, (3, 3)) 
-            vel_padded = F.pad(prev_vel_xy_new, (5, 1))
-
-            mask_keep = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], device=rest.device, dtype=rest.dtype)
+            yaw_padded = F.pad(prev_yaw_new, (3, 3))
+            vel_padded = F.pad(prev_vel_new, (5, 0))
+            mask_keep = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device, dtype=dtype)
             rest_new = (rest * mask_keep) + yaw_padded + vel_padded
             
             current_prev_anchor = torch.cat([xyz_final, rest_new], dim=-1)
-            
-        elif self.task_prefix == 'map':
-            current_prev_anchor = prev_anchor 
-        else:
-            current_prev_anchor = prev_anchor
+            cached_anchor = current_prev_anchor
+            temp_anchor_embed = self.anchor_encoder(current_prev_anchor)
 
-        cached_anchor = current_prev_anchor
-        temp_anchor_embed = self.anchor_encoder(current_prev_anchor)
-
-        # 4. Transformer Loop
-        prediction, classification = [], []
+        # 4. Transformer 层迭代
+        prediction, classification, quality = [], [], []
         
         for i, op in enumerate(self.operation_order):
             if self.layers[i] is None: continue
@@ -674,37 +681,52 @@ class Sparse4DHead(BaseModule):
                     instance_feature, anchor, anchor_embed, feature_maps, metas
                 )
             elif op == "refine":
-                dummy_time = instance_feature.new_tensor([self.instance_bank.default_time_interval] * batch_size)
+                # 【修复】使用 dt_for_refine
                 anchor, cls, qt = self.layers[i](
                     instance_feature, anchor, anchor_embed,
-                    time_interval=dummy_time, return_cls=True
+                    time_interval=dt_for_refine, return_cls=True
                 )
                 prediction.append(anchor)
                 classification.append(cls)
+                quality.append(qt)
                 
                 if len(prediction) == self.num_single_frame_decoder:
                     if cached_feature is not None:
+                        # 【重要】原生 InstanceBank.update 选 TopK 用的是 raw logits!
+                        curr_conf = cls.max(dim=-1).values
                         num_new = self.instance_bank.num_anchor - self.instance_bank.num_temp_instances
-                        curr_conf = cls.max(dim=-1).values.sigmoid()
                         _, (selected_feature, selected_anchor) = topk(curr_conf, num_new, instance_feature, anchor)
                         
-                        instance_feature = torch.cat([cached_feature, selected_feature], dim=1)
-                        anchor = torch.cat([cached_anchor, selected_anchor], dim=1)
-                        anchor_embed = self.anchor_encoder(anchor)
-                    else:
-                        anchor_embed = self.anchor_encoder(anchor)
+                        # 只有 valid_history 时才合并历史，否则维持单帧初始化
+                        instance_feature = torch.where(
+                            is_valid_history.view(-1, 1, 1),
+                            torch.cat([cached_feature, selected_feature], dim=1),
+                            instance_feature
+                        )
+                        anchor = torch.where(
+                            is_valid_history.view(-1, 1, 1),
+                            torch.cat([cached_anchor, selected_anchor], dim=1),
+                            anchor
+                        )
+                    anchor_embed = self.anchor_encoder(anchor)
                 else:
                     anchor_embed = self.anchor_encoder(anchor)
 
-        # 5. TopK & Confidence Decay
+                # 每一层迭代后更新时序位置编码
+                if len(prediction) > self.num_single_frame_decoder and temp_anchor_embed is not None:
+                    temp_anchor_embed = anchor_embed[:, : self.instance_bank.num_temp_instances]
+
+        # 5. 生成下一帧的缓存数据
         last_cls, last_pred = classification[-1], prediction[-1]
+        last_qt = quality[-1]
         num_temp = self.instance_bank.num_temp_instances
+        
+        # 缓存输出必须用 sigmoid 排序 (对齐 InstanceBank.py 第 162 行)
         confidence = last_cls.max(dim=-1).values.sigmoid() 
 
-        if prev_confidence is not None and not is_first_frame:
+        if prev_confidence is not None and is_valid_history.any():
             decayed_conf = prev_confidence * self.instance_bank.confidence_decay
-            if decayed_conf.shape[1] == num_temp: 
-                 confidence[:, :num_temp] = torch.maximum(decayed_conf, confidence[:, :num_temp])
+            confidence[:, :num_temp] = torch.maximum(decayed_conf, confidence[:, :num_temp])
         
         next_conf_vals, (next_instance_feature, next_anchor) = topk(
             confidence, num_temp, instance_feature, last_pred
@@ -713,7 +735,133 @@ class Sparse4DHead(BaseModule):
         return {
             "cls_scores": last_cls,
             "bbox_preds": last_pred,
+            "quality": last_qt, 
             "next_instance_feature": next_instance_feature,
             "next_anchor": next_anchor, 
             "next_confidence": next_conf_vals
+        }
+    
+    def forward_debug(self, feature_maps: Union[torch.Tensor, List], metas: dict):
+        if isinstance(feature_maps, torch.Tensor):
+            feature_maps = [feature_maps]
+        batch_size = feature_maps[0].shape[0]
+
+        # 走原生的 InstanceBank 提取逻辑
+        (
+            instance_feature,
+            anchor,
+            temp_instance_feature,
+            temp_anchor,
+            time_interval,
+        ) = self.instance_bank.get(
+            batch_size, metas, dn_metas=None
+        )
+
+        anchor_embed = self.anchor_encoder(anchor)
+        if temp_anchor is not None:
+            temp_anchor_embed = self.anchor_encoder(temp_anchor)
+        else:
+            temp_anchor_embed = None
+
+        return {
+            "instance_feature": instance_feature,
+            "anchor": anchor,
+            "anchor_embed": anchor_embed,
+            "temp_instance_feature": temp_instance_feature,
+            "temp_anchor": temp_anchor,
+            "temp_anchor_embed": temp_anchor_embed,
+            "time_interval": time_interval,
+        }
+
+    # ==============================================================================
+    # 🔍 用于严格对齐输入的 Debug 函数 (ONNX 纯手工投影逻辑)
+    # ==============================================================================
+    def forward_onnx_debug(
+        self,
+        feature_maps: Union[torch.Tensor, List],
+        prev_instance_feature: torch.Tensor,
+        prev_anchor: torch.Tensor,
+        instance_t_matrix: torch.Tensor,
+        time_interval: torch.Tensor = None, 
+    ):
+        if isinstance(feature_maps, torch.Tensor):
+            feature_maps = [feature_maps]
+        batch_size = feature_maps[0].shape[0]
+        dtype = feature_maps[0].dtype
+        device = feature_maps[0].device
+
+        # 1. 初始化当前帧 Query
+        instance_feature = self.instance_bank.instance_feature.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
+        anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
+        anchor_embed = self.anchor_encoder(anchor)
+
+        # 2. 准备 dt (对齐 InstanceBank.py 第 111-115 行)
+        if time_interval is not None:
+            dt = time_interval.view(batch_size)
+        else:
+            dt = instance_feature.new_tensor([self.instance_bank.default_time_interval] * batch_size)
+
+        is_first_frame = (prev_instance_feature.abs().sum() == 0)
+
+        # 3. 历史状态（严格复现 anchor_projection 逻辑）
+        if is_first_frame:
+            temp_instance_feature = None
+            temp_anchor_embed = None
+            current_prev_anchor = None
+        else:
+            temp_instance_feature = prev_instance_feature
+            
+            # 分离状态量
+            xyz = prev_anchor[..., :3]     # X, Y, Z
+            rest = prev_anchor[..., 3:]    # W, L, H, SIN, COS, VX, VY, VZ
+            vel = rest[..., 5:8]           # VX, VY, VZ
+            
+            # 【修复 1: 符号对齐】
+            # InstanceBank 传入的是 -dt, projection 内部执行的是 anchor - (vel * -dt) = anchor + vel * dt
+            # 所以这里必须是正的 dt
+            dt_view = dt.view(-1, 1, 1)
+            
+            # 【修复 2: 3D 补偿】去掉 mask_xy，保留 Z 轴速度补偿
+            displacement = vel * dt_view
+            xyz_pred = xyz + displacement
+            xyz_pred_h = torch.cat([xyz_pred, torch.ones_like(xyz_pred[..., :1])], dim=-1)
+            
+            # 空间位置变换 (R * xyz + t)
+            xyz_final = torch.matmul(xyz_pred_h, instance_t_matrix.transpose(1, 2))[..., :3]
+            
+            # 提取 3x3 旋转矩阵
+            R_full = instance_t_matrix[:, :3, :3]
+            
+            # Yaw 旋转对齐
+            R_xy = R_full[:, :2, :2]
+            prev_yaw = rest[..., 3:5] # [sin, cos]
+            swap_mat = torch.tensor([[0.0, 1.0], [1.0, 0.0]], device=device, dtype=dtype)
+            cos_sin_vec = torch.matmul(prev_yaw, swap_mat) # -> [cos, sin]
+            cos_sin_new = torch.matmul(cos_sin_vec, R_xy.transpose(1, 2))
+            # 原生代码 anchor_projection 中没有 normalize
+            prev_yaw_new = torch.matmul(cos_sin_new, swap_mat) # -> [sin, cos]
+            
+            # 【修复 3: 3D 速度旋转】对 VX, VY, VZ 进行全 3x3 旋转
+            prev_vel_new = torch.matmul(vel, R_full.transpose(1, 2))
+            
+            # 重新拼接 rest 状态
+            import torch.nn.functional as F
+            yaw_padded = F.pad(prev_yaw_new, (3, 3)) # 在 rest 对应索引 [3, 4]
+            vel_padded = F.pad(prev_vel_new, (5, 0)) # 在 rest 对应索引 [5, 6, 7]
+            
+            # mask_keep 保留 W, L, H (索引 0, 1, 2)
+            mask_keep = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device, dtype=dtype)
+            rest_new = (rest * mask_keep) + yaw_padded + vel_padded
+            
+            current_prev_anchor = torch.cat([xyz_final, rest_new], dim=-1)
+            temp_anchor_embed = self.anchor_encoder(current_prev_anchor)
+
+        return {
+            "instance_feature": instance_feature,
+            "anchor": anchor,
+            "anchor_embed": anchor_embed,
+            "temp_instance_feature": temp_instance_feature,
+            "temp_anchor": current_prev_anchor,
+            "temp_anchor_embed": temp_anchor_embed,
+            "time_interval": dt,
         }

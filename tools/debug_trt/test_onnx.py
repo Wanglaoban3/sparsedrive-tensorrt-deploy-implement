@@ -99,7 +99,7 @@ def pytorch_forward_onnx_test(model, data_loader):
             model_outs = {
                 "classification": [outs['cls_scores']],
                 "prediction": [outs['bbox_preds']],
-                "quality": [None],    
+                "quality": [outs['quality']],   # 绝不能是 [None]
                 "instance_id": None   
             }
             
