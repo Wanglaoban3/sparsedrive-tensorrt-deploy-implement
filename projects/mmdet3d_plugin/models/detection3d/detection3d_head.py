@@ -566,8 +566,7 @@ class Sparse4DHead(BaseModule):
             output_idx=output_idx,
         )
 
-    # === 修正后的：ONNX 导出专用前向函数 (Myelin-Safe Z-Lock) ===
-    # 核心思路：用 Mask (乘法) 代替 Slice/Concat，避免图碎片化导致 Myelin 崩溃
+    # === 终极工业部署版：全手工算子、无原生依赖、兼容 Det & Map ===
     def forward_onnx(
         self,
         feature_maps: Union[torch.Tensor, List],
@@ -589,68 +588,85 @@ class Sparse4DHead(BaseModule):
         anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
         anchor_embed = self.anchor_encoder(anchor)
 
-        # 2. 时间差处理与场景重置判定 (对齐 InstanceBank.py 第 85-86, 111-115 行)
+        # 2. 时间差处理与场景重置判定 (完全使用你验证通过的版本)
         if time_interval is not None:
             raw_dt = time_interval.view(batch_size)
         else:
             raw_dt = instance_feature.new_tensor([self.instance_bank.default_time_interval] * batch_size)
         
-        # 判定历史是否有效：不是第一帧且时间跨度在阈值内 (通常 2s)
         is_valid_history = (prev_instance_feature.abs().sum() > 0) & (raw_dt.abs() <= self.instance_bank.max_time_interval)
         
-        # 用于 Refine 层计算速度的 dt (若换场则强制为 0.5s)
         dt_for_refine = torch.where(
             is_valid_history, 
             raw_dt, 
             raw_dt.new_tensor(self.instance_bank.default_time_interval)
         ).view(-1, 1, 1)
 
-        # 3. 历史状态投影 (移植自验证成功的 forward_onnx_debug)
+        # 3. 历史状态投影
         if not is_valid_history.any():
             temp_instance_feature = None
             temp_anchor_embed = None
             cached_feature = None
             cached_anchor = None
         else:
-            temp_instance_feature = prev_instance_feature
+            temp_instance_feature = prev_instance_feature.to(dtype)
             cached_feature = temp_instance_feature
             
-            # 分离状态
-            xyz = prev_anchor[..., :3]
-            rest = prev_anchor[..., 3:]
-            vel = rest[..., 5:8]
+            # ================= 分支路由：Det 头 vs Map 头 =================
+            if self.task_prefix == 'det':
+                # 完全还原你的 Det 逻辑，绝不更改一个字！
+                xyz = prev_anchor[..., :3].to(dtype)
+                rest = prev_anchor[..., 3:].to(dtype)
+                vel = rest[..., 5:8]
+                
+                dt_view = raw_dt.view(-1, 1, 1)
+                displacement = vel * dt_view
+                xyz_pred = xyz + displacement
+                xyz_pred_h = torch.cat([xyz_pred, torch.ones_like(xyz_pred[..., :1])], dim=-1)
+                
+                xyz_final = torch.matmul(xyz_pred_h, instance_t_matrix.to(dtype).transpose(1, 2))[..., :3]
+                
+                R_full = instance_t_matrix[:, :3, :3].to(dtype)
+                R_xy = R_full[:, :2, :2]
+                
+                prev_yaw = rest[..., 3:5]
+                swap_mat = torch.tensor([[0.0, 1.0], [1.0, 0.0]], device=device, dtype=dtype)
+                cos_sin_vec = torch.matmul(prev_yaw, swap_mat)
+                cos_sin_new = torch.matmul(cos_sin_vec, R_xy.transpose(1, 2))
+                prev_yaw_new = torch.matmul(cos_sin_new, swap_mat)
+                
+                prev_vel_new = torch.matmul(vel, R_full.transpose(1, 2))
+                
+                import torch.nn.functional as F
+                yaw_padded = F.pad(prev_yaw_new, (3, 3))
+                vel_padded = F.pad(prev_vel_new, (5, 0))
+                mask_keep = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device, dtype=dtype)
+                rest_new = (rest * mask_keep) + yaw_padded + vel_padded
+                
+                current_prev_anchor = torch.cat([xyz_final, rest_new], dim=-1)
+
+            elif self.task_prefix == 'map':
+                # 嵌入刚刚验证通过的纯 2D 手工投影逻辑
+                bs_map, num_anchor_map, dims_map = prev_anchor.shape
+                
+                # 使用 reshape 解决显存不连续问题
+                pts = prev_anchor.to(dtype).reshape(bs_map, -1, 2)
+                
+                # 提取 2x2 旋转矩阵和 2D 平移向量
+                R_2x2 = instance_t_matrix[:, :2, :2].to(dtype).unsqueeze(1) # [bs, 1, 2, 2]
+                t_2 = instance_t_matrix[:, :2, 3].to(dtype).unsqueeze(1)    # [bs, 1, 2]
+                
+                # 2D 矩阵相乘
+                pts_rotated = torch.matmul(R_2x2, pts.unsqueeze(-1)).squeeze(-1)
+                pts_final = pts_rotated + t_2
+                
+                # 还原形状
+                current_prev_anchor = pts_final.reshape(bs_map, num_anchor_map, dims_map)
+                
+            else:
+                current_prev_anchor = prev_anchor.to(dtype)
+            # ==============================================================
             
-            # 3D 线性补偿 (使用 raw_dt)
-            dt_view = raw_dt.view(-1, 1, 1)
-            displacement = vel * dt_view
-            xyz_pred = xyz + displacement
-            xyz_pred_h = torch.cat([xyz_pred, torch.ones_like(xyz_pred[..., :1])], dim=-1)
-            
-            # 空间位置变换
-            xyz_final = torch.matmul(xyz_pred_h, instance_t_matrix.transpose(1, 2))[..., :3]
-            
-            # 3D 旋转变换 (对齐 R_full 以支持 Pitch/Roll)
-            R_full = instance_t_matrix[:, :3, :3]
-            R_xy = R_full[:, :2, :2]
-            
-            # Yaw 旋转
-            prev_yaw = rest[..., 3:5]
-            swap_mat = torch.tensor([[0.0, 1.0], [1.0, 0.0]], device=device, dtype=dtype)
-            cos_sin_vec = torch.matmul(prev_yaw, swap_mat)
-            cos_sin_new = torch.matmul(cos_sin_vec, R_xy.transpose(1, 2))
-            prev_yaw_new = torch.matmul(cos_sin_new, swap_mat)
-            
-            # 速度矢量旋转
-            prev_vel_new = torch.matmul(vel, R_full.transpose(1, 2))
-            
-            # 组合 rest 状态
-            import torch.nn.functional as F
-            yaw_padded = F.pad(prev_yaw_new, (3, 3))
-            vel_padded = F.pad(prev_vel_new, (5, 0))
-            mask_keep = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device, dtype=dtype)
-            rest_new = (rest * mask_keep) + yaw_padded + vel_padded
-            
-            current_prev_anchor = torch.cat([xyz_final, rest_new], dim=-1)
             cached_anchor = current_prev_anchor
             temp_anchor_embed = self.anchor_encoder(current_prev_anchor)
 
@@ -681,7 +697,6 @@ class Sparse4DHead(BaseModule):
                     instance_feature, anchor, anchor_embed, feature_maps, metas
                 )
             elif op == "refine":
-                # 【修复】使用 dt_for_refine
                 anchor, cls, qt = self.layers[i](
                     instance_feature, anchor, anchor_embed,
                     time_interval=dt_for_refine, return_cls=True
@@ -692,12 +707,10 @@ class Sparse4DHead(BaseModule):
                 
                 if len(prediction) == self.num_single_frame_decoder:
                     if cached_feature is not None:
-                        # 【重要】原生 InstanceBank.update 选 TopK 用的是 raw logits!
                         curr_conf = cls.max(dim=-1).values
                         num_new = self.instance_bank.num_anchor - self.instance_bank.num_temp_instances
                         _, (selected_feature, selected_anchor) = topk(curr_conf, num_new, instance_feature, anchor)
                         
-                        # 只有 valid_history 时才合并历史，否则维持单帧初始化
                         instance_feature = torch.where(
                             is_valid_history.view(-1, 1, 1),
                             torch.cat([cached_feature, selected_feature], dim=1),
@@ -712,20 +725,18 @@ class Sparse4DHead(BaseModule):
                 else:
                     anchor_embed = self.anchor_encoder(anchor)
 
-                # 每一层迭代后更新时序位置编码
                 if len(prediction) > self.num_single_frame_decoder and temp_anchor_embed is not None:
                     temp_anchor_embed = anchor_embed[:, : self.instance_bank.num_temp_instances]
 
-        # 5. 生成下一帧的缓存数据
+        # 5. 生成下一帧缓存
         last_cls, last_pred = classification[-1], prediction[-1]
         last_qt = quality[-1]
         num_temp = self.instance_bank.num_temp_instances
         
-        # 缓存输出必须用 sigmoid 排序 (对齐 InstanceBank.py 第 162 行)
         confidence = last_cls.max(dim=-1).values.sigmoid() 
 
         if prev_confidence is not None and is_valid_history.any():
-            decayed_conf = prev_confidence * self.instance_bank.confidence_decay
+            decayed_conf = prev_confidence.to(dtype) * self.instance_bank.confidence_decay
             confidence[:, :num_temp] = torch.maximum(decayed_conf, confidence[:, :num_temp])
         
         next_conf_vals, (next_instance_feature, next_anchor) = topk(
@@ -791,69 +802,82 @@ class Sparse4DHead(BaseModule):
         device = feature_maps[0].device
 
         # 1. 初始化当前帧 Query
-        instance_feature = self.instance_bank.instance_feature.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
-        anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
+        instance_feature = self.instance_bank.instance_feature.unsqueeze(0).repeat(batch_size, 1, 1).to(device=device, dtype=dtype)
+        anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1).to(device=device, dtype=dtype)
         anchor_embed = self.anchor_encoder(anchor)
 
-        # 2. 准备 dt (对齐 InstanceBank.py 第 111-115 行)
+        # 2. 准备 dt
         if time_interval is not None:
-            dt = time_interval.view(batch_size)
+            dt = time_interval.view(batch_size).to(dtype)
         else:
-            dt = instance_feature.new_tensor([self.instance_bank.default_time_interval] * batch_size)
+            dt = instance_feature.new_tensor([self.instance_bank.default_time_interval] * batch_size).to(dtype)
 
         is_first_frame = (prev_instance_feature.abs().sum() == 0)
 
-        # 3. 历史状态（严格复现 anchor_projection 逻辑）
+        # 3. 历史状态投影
         if is_first_frame:
             temp_instance_feature = None
             temp_anchor_embed = None
             current_prev_anchor = None
         else:
-            temp_instance_feature = prev_instance_feature
+            temp_instance_feature = prev_instance_feature.to(dtype)
             
-            # 分离状态量
-            xyz = prev_anchor[..., :3]     # X, Y, Z
-            rest = prev_anchor[..., 3:]    # W, L, H, SIN, COS, VX, VY, VZ
-            vel = rest[..., 5:8]           # VX, VY, VZ
-            
-            # 【修复 1: 符号对齐】
-            # InstanceBank 传入的是 -dt, projection 内部执行的是 anchor - (vel * -dt) = anchor + vel * dt
-            # 所以这里必须是正的 dt
-            dt_view = dt.view(-1, 1, 1)
-            
-            # 【修复 2: 3D 补偿】去掉 mask_xy，保留 Z 轴速度补偿
-            displacement = vel * dt_view
-            xyz_pred = xyz + displacement
-            xyz_pred_h = torch.cat([xyz_pred, torch.ones_like(xyz_pred[..., :1])], dim=-1)
-            
-            # 空间位置变换 (R * xyz + t)
-            xyz_final = torch.matmul(xyz_pred_h, instance_t_matrix.transpose(1, 2))[..., :3]
-            
-            # 提取 3x3 旋转矩阵
-            R_full = instance_t_matrix[:, :3, :3]
-            
-            # Yaw 旋转对齐
-            R_xy = R_full[:, :2, :2]
-            prev_yaw = rest[..., 3:5] # [sin, cos]
-            swap_mat = torch.tensor([[0.0, 1.0], [1.0, 0.0]], device=device, dtype=dtype)
-            cos_sin_vec = torch.matmul(prev_yaw, swap_mat) # -> [cos, sin]
-            cos_sin_new = torch.matmul(cos_sin_vec, R_xy.transpose(1, 2))
-            # 原生代码 anchor_projection 中没有 normalize
-            prev_yaw_new = torch.matmul(cos_sin_new, swap_mat) # -> [sin, cos]
-            
-            # 【修复 3: 3D 速度旋转】对 VX, VY, VZ 进行全 3x3 旋转
-            prev_vel_new = torch.matmul(vel, R_full.transpose(1, 2))
-            
-            # 重新拼接 rest 状态
-            import torch.nn.functional as F
-            yaw_padded = F.pad(prev_yaw_new, (3, 3)) # 在 rest 对应索引 [3, 4]
-            vel_padded = F.pad(prev_vel_new, (5, 0)) # 在 rest 对应索引 [5, 6, 7]
-            
-            # mask_keep 保留 W, L, H (索引 0, 1, 2)
-            mask_keep = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device, dtype=dtype)
-            rest_new = (rest * mask_keep) + yaw_padded + vel_padded
-            
-            current_prev_anchor = torch.cat([xyz_final, rest_new], dim=-1)
+            # ============= 核心分支路由：隔离 Det 和 Map =============
+            if self.task_prefix == 'det':
+                xyz = prev_anchor[..., :3].to(dtype)
+                rest = prev_anchor[..., 3:].to(dtype)
+                vel = rest[..., 5:8]
+                
+                dt_view = dt.view(-1, 1, 1)
+                displacement = vel * dt_view
+                xyz_pred = xyz + displacement
+                xyz_pred_h = torch.cat([xyz_pred, torch.ones_like(xyz_pred[..., :1])], dim=-1)
+                
+                xyz_final = torch.matmul(xyz_pred_h, instance_t_matrix.to(dtype).transpose(1, 2))[..., :3]
+                
+                R_full = instance_t_matrix[:, :3, :3].to(dtype)
+                R_xy = R_full[:, :2, :2]
+                
+                prev_yaw = rest[..., 3:5] 
+                swap_mat = torch.tensor([[0.0, 1.0], [1.0, 0.0]], device=device, dtype=dtype)
+                cos_sin_vec = torch.matmul(prev_yaw, swap_mat)
+                cos_sin_new = torch.matmul(cos_sin_vec, R_xy.transpose(1, 2))
+                prev_yaw_new = torch.matmul(cos_sin_new, swap_mat)
+                
+                prev_vel_new = torch.matmul(vel, R_full.transpose(1, 2))
+                
+                import torch.nn.functional as F
+                yaw_padded = F.pad(prev_yaw_new, (3, 3))
+                vel_padded = F.pad(prev_vel_new, (5, 0))
+                mask_keep = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device, dtype=dtype)
+                rest_new = (rest * mask_keep) + yaw_padded + vel_padded
+                
+                current_prev_anchor = torch.cat([xyz_final, rest_new], dim=-1)
+
+            elif self.task_prefix == 'map':
+                # 【破案修复】: Map 锚点是静态的 2D 坐标 (bs, num_anchor, num_pts * 2)
+                bs_map, num_anchor_map, dims_map = prev_anchor.shape
+                
+                # 重塑为 2D 坐标 (bs, N, 2)，这里的 2 才是灵魂！
+                pts = prev_anchor.to(dtype).reshape(bs_map, -1, 2)
+                
+                # 直接提取 2x2 旋转矩阵和 2D 平移向量
+                R_2x2 = instance_t_matrix[:, :2, :2].to(dtype).unsqueeze(1) # [bs, 1, 2, 2]
+                t_2 = instance_t_matrix[:, :2, 3].to(dtype).unsqueeze(1)    # [bs, 1, 2]
+                
+                # 纯正的 2D 矩阵相乘：(bs, 1, 2, 2) @ (bs, N, 2, 1) -> (bs, N, 2, 1) -> (bs, N, 2)
+                pts_rotated = torch.matmul(R_2x2, pts.unsqueeze(-1)).squeeze(-1)
+                
+                # 加上平移向量
+                pts_final = pts_rotated + t_2
+                
+                # 还原为 (bs, 33, 40) 的原始形状
+                current_prev_anchor = pts_final.reshape(bs_map, num_anchor_map, dims_map)
+                
+            else:
+                current_prev_anchor = prev_anchor.to(dtype)
+            # =========================================================
+
             temp_anchor_embed = self.anchor_encoder(current_prev_anchor)
 
         return {

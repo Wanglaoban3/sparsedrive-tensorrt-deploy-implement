@@ -70,20 +70,31 @@ class TRTInfer:
 # ==============================================================================
 # 🔄 2. TensorRT 双引擎测试 Loop (Init Engine + Temporal Engine)
 # ==============================================================================
-def trt_dual_engine_test(model, engine_init, engine_temporal, data_loader):
+def trt_unified_dual_engine_test(model, engine_init, engine_temporal, data_loader):
     model.eval()
     results = []
     dataset = data_loader.dataset
     prog_bar = mmcv.ProgressBar(len(dataset))
 
-    nh_det = 600
+    # 获取 Det 和 Map 的独立配置
+    det_head = model.head.det_head
+    map_head = model.head.map_head
+
+    nh_det = det_head.instance_bank.num_temp_instances
+    dim_det = det_head.instance_bank.anchor.shape[-1]
     
-    # 初始化占位字典，用于给 Init Engine 填补输入的坑位（虽然 Init Engine 内部由于 Zero Hack 会忽略它们）
-    history_trt = {
-        'prev_det_feat': torch.zeros((1, nh_det, 256), dtype=torch.float32, device='cuda'),
-        'prev_det_anchor': torch.zeros((1, nh_det, 11), dtype=torch.float32, device='cuda'),
-        'prev_det_conf': torch.zeros((1, nh_det), dtype=torch.float32, device='cuda'),
-    }
+    nh_map = map_head.instance_bank.num_temp_instances
+    dim_map = map_head.instance_bank.anchor.shape[-1]
+    
+    def get_zero_history(nh, dim):
+        return {
+            'prev_instance_feature': torch.zeros((1, nh, 256), dtype=torch.float32, device='cuda'),
+            'prev_anchor': torch.zeros((1, nh, dim), dtype=torch.float32, device='cuda'),
+            'prev_confidence': torch.zeros((1, nh), dtype=torch.float32, device='cuda'),
+        }
+
+    history_det = get_zero_history(nh_det, dim_det)
+    history_map = get_zero_history(nh_map, dim_map)
 
     prev_global_mat = None
     prev_time = None
@@ -99,15 +110,20 @@ def trt_dual_engine_test(model, engine_init, engine_temporal, data_loader):
             curr_time = img_metas['timestamp']
             
             # 🛑 核心时序判断：确定是否为第一帧
-            is_first_frame = (prev_time is None)
-            
-            if is_first_frame:
-                prev_time = curr_time - 0.5 # 假设 2Hz，往前推 0.5 秒
+            if prev_time is None:
+                dt = 0.5
+                is_scene_start = True
+            else:
+                dt = curr_time - prev_time
+                is_scene_start = (dt > 2.0 or dt < 0)
 
-            dt = curr_time - prev_time
-            if dt > 2.0 or dt < 0:
-                dt = 0.5 
-                
+            # 新场景开头，彻底清空双头的历史毒药！
+            if is_scene_start:
+                dt = 0.5
+                history_det = get_zero_history(nh_det, dim_det)
+                history_map = get_zero_history(nh_map, dim_map)
+                prev_global_mat = None 
+
             dt_tensor = torch.tensor([dt], device='cuda', dtype=torch.float32)
             prev_time = curr_time
 
@@ -128,30 +144,57 @@ def trt_dual_engine_test(model, engine_init, engine_temporal, data_loader):
                 'projection_mat': proj_mat,
                 'instance_t_matrix': instance_t_matrix,
                 'time_interval': dt_tensor,
-                **history_trt
+                'prev_det_feat': history_det['prev_instance_feature'],
+                'prev_det_anchor': history_det['prev_anchor'],
+                'prev_det_conf': history_det['prev_confidence'],
+                'prev_map_feat': history_map['prev_instance_feature'],
+                'prev_map_anchor': history_map['prev_anchor'],
+                'prev_map_conf': history_map['prev_confidence'],
             }
 
             # 🚀 执行 TensorRT 推理：双引擎动态切换！
-            if is_first_frame:
+            if is_scene_start:
                 trt_outs = engine_init.infer(feed_dict)
             else:
                 trt_outs = engine_temporal.infer(feed_dict)
 
             # ♻️ 更新历史缓存，供下一帧（ Temporal Engine）使用
-            history_trt['prev_det_feat'] = trt_outs['next_det_feat']
-            history_trt['prev_det_anchor'] = trt_outs['next_det_anchor']
-            history_trt['prev_det_conf'] = trt_outs['next_det_conf']
+            history_det['prev_instance_feature'] = trt_outs['next_det_feat']
+            history_det['prev_anchor'] = trt_outs['next_det_anchor']
+            history_det['prev_confidence'] = trt_outs['next_det_conf']
 
-            # 🛠️ 桥接官方后处理
-            model_outs = {
+            history_map['prev_instance_feature'] = trt_outs['next_map_feat']
+            history_map['prev_anchor'] = trt_outs['next_map_anchor']
+            history_map['prev_confidence'] = trt_outs['next_map_conf']
+
+            # 🛠️ 桥接官方 Det 后处理
+            model_outs_det = {
                 "classification": [trt_outs['det_cls']],
                 "prediction": [trt_outs['det_bbox']],
+                # TODO: 你的导出的 ONNX 可能没有输出 det 的 quality 
+                # 请根据你的 export_onnx.py 的 output_names 确认
                 "quality": [None],    
                 "instance_id": None   
             }
+            decoded_det_res = det_head.post_process(model_outs_det)
+
+            # 🛠️ 桥接官方 Map 后处理
+            model_outs_map = {
+                "classification": [trt_outs['map_cls']],
+                "prediction": [trt_outs['map_pts']],
+                "quality": [None], 
+                "instance_id": None   
+            }
+            decoded_map_res = map_head.post_process(model_outs_map)
+
+            # 合并 Det 和 Map 的结果到一个字典中
+            merged_res = decoded_det_res[0].copy()
+            merged_res.update(decoded_map_res[0])
             
-            decoded_res = model.head.det_head.post_process(model_outs)
-            result = {'img_bbox': decoded_res[0], 'pts_bbox': decoded_res[0]}
+            result = {
+                'img_bbox': merged_res, 
+                'pts_bbox': merged_res,
+            }
             results.append(result)
 
         prog_bar.update()
@@ -162,17 +205,17 @@ def trt_dual_engine_test(model, engine_init, engine_temporal, data_loader):
 # 🎮 3. 命令行参数解析
 # ==============================================================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="TensorRT Dual-Engine Test")
+    parser = argparse.ArgumentParser(description="TensorRT Unified Dual-Engine Test")
     parser.add_argument("config", help="test config file path")
     parser.add_argument("checkpoint", help="pytorch checkpoint file (for decoding settings)")
     
-    # 修改为接收两个 Engine
-    parser.add_argument("--engine_init", required=True, help="Init TensorRT engine (First frame, Zero dummy input)")
-    parser.add_argument("--engine_temporal", required=True, help="Temporal TensorRT engine (Sequential frames, Randn dummy input)")
+    # 接收两个 Engine
+    parser.add_argument("--engine_init", default="work_dirs/sparsedrive_small_stage2/sparsedrive_multihead_first.engine", help="Init TensorRT engine (First frame, Zero dummy input)")
+    parser.add_argument("--engine_temporal", default="work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.engine", help="Temporal TensorRT engine (Sequential frames, Randn dummy input)")
     
     parser.add_argument("--plugin", default="projects/trt_plugin/build/libSparseDrivePlugin.so", help="Plugin path")
     parser.add_argument("--out", help="output result file in pickle format")
-    parser.add_argument("--eval", type=str, nargs="+", help='evaluation metrics, e.g., "bbox"')
+    parser.add_argument("--eval", type=str, nargs="+", default=['bbox', 'map'], help='evaluation metrics, e.g., "bbox"')
     parser.add_argument("--seed", type=int, default=0, help="random seed")
     args = parser.parse_args()
     return args
@@ -187,9 +230,10 @@ def main():
 
     cfg = Config.fromfile(args.config)
     
-    # 强制只测试 DET 任务
+    # 🟢 开启 Det 和 Map，关闭 Motion Plan 以免报错
     if hasattr(cfg, 'task_config'):
-        cfg.task_config['with_map'] = False
+        cfg.task_config['with_det'] = True
+        cfg.task_config['with_map'] = True
         cfg.task_config['with_motion_plan'] = False
         if 'head' in cfg.model:
             cfg.model.head.task_config = cfg.task_config
@@ -232,8 +276,8 @@ def main():
     trt_engine_temporal = TRTInfer(args.engine_temporal)
 
     # 开始推理
-    print("\n🔥 Starting TensorRT Dual-Engine Evaluation...")
-    outputs = trt_dual_engine_test(model, trt_engine_init, trt_engine_temporal, data_loader)
+    print("\n🔥 Starting TensorRT Unified Dual-Engine Evaluation...")
+    outputs = trt_unified_dual_engine_test(model, trt_engine_init, trt_engine_temporal, data_loader)
 
     # 评估与保存
     if args.out:
@@ -245,12 +289,12 @@ def main():
         for key in ["interval", "tmpdir", "start", "gpu_collect", "save_best", "rule"]:
             eval_kwargs.pop(key, None)
             
-        # 关闭无关任务评测
         if 'eval_mode' in eval_kwargs:
             eval_kwargs['eval_mode']['with_tracking'] = False
-            eval_kwargs['eval_mode']['with_map'] = False
             eval_kwargs['eval_mode']['with_motion'] = False
             eval_kwargs['eval_mode']['with_planning'] = False
+            eval_kwargs['eval_mode']['with_det'] = True
+            eval_kwargs['eval_mode']['with_map'] = True
         
         eval_kwargs.update(dict(metric=args.eval))
         print(f"\n📊 Evaluating metrics: {eval_kwargs}")
