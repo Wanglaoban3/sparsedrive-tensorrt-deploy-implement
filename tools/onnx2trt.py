@@ -127,7 +127,7 @@ if __name__ == "__main__":
     parser.add_argument("--onnx", default="work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.onnx")
     parser.add_argument("--save", default="work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.engine")
     parser.add_argument("--plugin", default="./projects/trt_plugin/build/libSparseDrivePlugin.so")
-    parser.add_argument("--fp16", action="store_true", default=True) # 默认开启FP16
+    parser.add_argument("--fp16", default=True) # 默认开启FP16
     parser.add_argument("--verbose", action="store_true", default=True)
     args = parser.parse_args()
 

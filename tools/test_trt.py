@@ -1,6 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import tensorrt as trt
-
 import argparse
 import mmcv
 import os
@@ -8,20 +7,22 @@ from os import path as osp
 import sys
 import ctypes
 from collections import OrderedDict
+
 # 将项目根目录添加到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
-import warnings
-from mmcv import Config, DictAction
+from mmcv import Config
 from mmcv.runner import load_checkpoint
-from mmdet.apis import set_random_seed
-from mmdet.datasets import replace_ImageToTensor, build_dataset
+from mmcv.parallel.scatter_gather import scatter
+from mmdet.datasets import build_dataset
 from mmdet.datasets import build_dataloader as build_dataloader_origin
 from mmdet.models import build_detector
-# 💡 核心修复：显式导入 mmdet3d 和自定义插件，激活注册表！
+
+# 💡 核心导入：激活 MMDetection3D 和 SparseDrive 注册表
 import mmdet3d
 import projects.mmdet3d_plugin
+
 # ==============================================================================
 # 🚀 1. TensorRT 推理引擎封装
 # ==============================================================================
@@ -67,9 +68,9 @@ class TRTInfer:
         return {name: mem.clone().float() for name, mem in self.outputs.items()}
 
 # ==============================================================================
-# 🔄 2. TensorRT 单卡测试 Loop (管理时序逻辑与后处理)
+# 🔄 2. TensorRT 双引擎测试 Loop (Init Engine + Temporal Engine)
 # ==============================================================================
-def trt_single_gpu_test(model, trt_engine, data_loader):
+def trt_dual_engine_test(model, engine_init, engine_temporal, data_loader):
     model.eval()
     results = []
     dataset = data_loader.dataset
@@ -77,48 +78,43 @@ def trt_single_gpu_test(model, trt_engine, data_loader):
 
     nh_det = 600
     
-    def init_history():
-        return {
-            'prev_det_feat': torch.zeros((1, nh_det, 256), device='cuda'),
-            'prev_det_anchor': torch.zeros((1, nh_det, 11), device='cuda'),
-            'prev_det_conf': torch.zeros((1, nh_det), device='cuda'),
-        }
+    # 初始化占位字典，用于给 Init Engine 填补输入的坑位（虽然 Init Engine 内部由于 Zero Hack 会忽略它们）
+    history_trt = {
+        'prev_det_feat': torch.zeros((1, nh_det, 256), dtype=torch.float32, device='cuda'),
+        'prev_det_anchor': torch.zeros((1, nh_det, 11), dtype=torch.float32, device='cuda'),
+        'prev_det_conf': torch.zeros((1, nh_det), dtype=torch.float32, device='cuda'),
+    }
 
-    history_trt = init_history()
     prev_global_mat = None
     prev_time = None
-    prev_scene_token = None
 
     for i, data in enumerate(data_loader):
         with torch.no_grad():
-            # ==========================================================
-            # 💡 核心修复：还原为你之前跑通的完美数据解包逻辑
-            # ==========================================================
-            img_metas = data['img_metas'].data[0][0]
-            
-            img_raw = data['img'].data[0][0].cuda()
-            # 确保 img 的维度是 [B, N, C, H, W] 即 [1, 6, 3, 256, 704]
-            img = img_raw.unsqueeze(0) if img_raw.dim() == 4 else img_raw
-            
-            proj_mat = torch.stack([p.cuda() for p in data['projection_mat'].data[0]], dim=0).unsqueeze(0)
-            # ==========================================================
+            # 🌟 使用原生 scatter 解包，彻底解决多维 Tensor 对齐偏差
+            scattered_data = scatter(data, [torch.cuda.current_device()])[0]
+            img = scattered_data['img']
+            proj_mat = scattered_data['projection_mat']
+            img_metas = scattered_data['img_metas'][0]
 
-            # 🛑 核心时序逻辑：检测场景切换，自动清空历史缓存！
-            curr_scene_token = img_metas.get('scene_token', None)
-            if prev_scene_token is None or curr_scene_token != prev_scene_token:
-                history_trt = init_history()
-                prev_global_mat = None
-                prev_time = img_metas['timestamp'] - 0.5
-            prev_scene_token = curr_scene_token
-
-            # 计算 Ego-Motion
             curr_time = img_metas['timestamp']
+            
+            # 🛑 核心时序判断：确定是否为第一帧
+            is_first_frame = (prev_time is None)
+            
+            if is_first_frame:
+                prev_time = curr_time - 0.5 # 假设 2Hz，往前推 0.5 秒
+
             dt = curr_time - prev_time
+            if dt > 2.0 or dt < 0:
+                dt = 0.5 
+                
             dt_tensor = torch.tensor([dt], device='cuda', dtype=torch.float32)
             prev_time = curr_time
 
+            # Ego-Motion 结算
             curr_global = img_metas['T_global']
             curr_global_inv = img_metas['T_global_inv']
+            
             if prev_global_mat is None:
                 instance_t_matrix = torch.eye(4, device='cuda').unsqueeze(0)
             else:
@@ -126,7 +122,7 @@ def trt_single_gpu_test(model, trt_engine, data_loader):
                 instance_t_matrix = torch.from_numpy(t_mat).float().cuda().unsqueeze(0)
             prev_global_mat = curr_global
 
-            # 🚀 执行 TensorRT 推理
+            # 构建输入字典
             feed_dict = {
                 'img': img,
                 'projection_mat': proj_mat,
@@ -134,30 +130,30 @@ def trt_single_gpu_test(model, trt_engine, data_loader):
                 'time_interval': dt_tensor,
                 **history_trt
             }
-            trt_outs = trt_engine.infer(feed_dict)
 
-            # 更新历史缓存
+            # 🚀 执行 TensorRT 推理：双引擎动态切换！
+            if is_first_frame:
+                trt_outs = engine_init.infer(feed_dict)
+            else:
+                trt_outs = engine_temporal.infer(feed_dict)
+
+            # ♻️ 更新历史缓存，供下一帧（ Temporal Engine）使用
             history_trt['prev_det_feat'] = trt_outs['next_det_feat']
             history_trt['prev_det_anchor'] = trt_outs['next_det_anchor']
             history_trt['prev_det_conf'] = trt_outs['next_det_conf']
 
-            # 🛠️ 桥接官方后处理 (Post Process)
-            # 构造模型输出格式，交由原生 Decoder 解析出 bbox, score, label
+            # 🛠️ 桥接官方后处理
             model_outs = {
                 "classification": [trt_outs['det_cls']],
                 "prediction": [trt_outs['det_bbox']],
-                "quality": [None],    # 💡 核心修复：伪造一个单元素的列表，防止切片报错
-                "instance_id": None   # 顺手把 instance_id 也补齐，以防万一
+                "quality": [None],    
+                "instance_id": None   
             }
             
-            # 调用 PyTorch 原生后处理 (将网络裸输出转为 3D BBox 格式)
             decoded_res = model.head.det_head.post_process(model_outs)
-            
-            # MMDetection3D 标准输出格式
-            result = {'img_bbox': decoded_res[0]}    # ✅ 正确：直接存成字典
+            result = {'img_bbox': decoded_res[0], 'pts_bbox': decoded_res[0]}
             results.append(result)
 
-        # 进度条更新
         prog_bar.update()
 
     return results
@@ -166,10 +162,14 @@ def trt_single_gpu_test(model, trt_engine, data_loader):
 # 🎮 3. 命令行参数解析
 # ==============================================================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="TensorRT Model Test")
+    parser = argparse.ArgumentParser(description="TensorRT Dual-Engine Test")
     parser.add_argument("config", help="test config file path")
     parser.add_argument("checkpoint", help="pytorch checkpoint file (for decoding settings)")
-    parser.add_argument("--engine", required=True, help="TensorRT engine file path")
+    
+    # 修改为接收两个 Engine
+    parser.add_argument("--engine_init", required=True, help="Init TensorRT engine (First frame, Zero dummy input)")
+    parser.add_argument("--engine_temporal", required=True, help="Temporal TensorRT engine (Sequential frames, Randn dummy input)")
+    
     parser.add_argument("--plugin", default="projects/trt_plugin/build/libSparseDrivePlugin.so", help="Plugin path")
     parser.add_argument("--out", help="output result file in pickle format")
     parser.add_argument("--eval", type=str, nargs="+", help='evaluation metrics, e.g., "bbox"')
@@ -204,12 +204,10 @@ def main():
     mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
     cfg.data.test.work_dir = cfg.work_dir
 
-    # 数据集准备
     samples_per_gpu = 1
     cfg.data.test.test_mode = True
     dataset = build_dataset(cfg.data.test)
     
-    # 强行给 dataset 绑定 work_dir，防止 nuScenes eval kit 找不到保存路径
     dataset.work_dir = cfg.work_dir
     data_loader = build_dataloader_origin(
         dataset,
@@ -219,20 +217,23 @@ def main():
         shuffle=False,
     )
 
-    # 模型准备 (只用于提供后处理配置参数，不参与推理)
+    # 模型准备 (用于后处理配置解析)
     cfg.model.train_cfg = None
     model = build_detector(cfg.model, test_cfg=cfg.get("test_cfg"))
     load_checkpoint(model, args.checkpoint, map_location="cpu")
     model = model.cuda()
     model.CLASSES = dataset.CLASSES
 
-    # 初始化 TRT 引擎
-    print(f"\n🚀 Loading TensorRT Engine: {args.engine}")
-    trt_model = TRTInfer(args.engine)
+    # 🔥 核心加载：初始化双引擎
+    print(f"\n🚀 Loading Init Engine: {args.engine_init}")
+    trt_engine_init = TRTInfer(args.engine_init)
+    
+    print(f"🚀 Loading Temporal Engine: {args.engine_temporal}")
+    trt_engine_temporal = TRTInfer(args.engine_temporal)
 
     # 开始推理
-    print("\n🔥 Starting TensorRT Evaluation...")
-    outputs = trt_single_gpu_test(model, trt_model, data_loader)
+    print("\n🔥 Starting TensorRT Dual-Engine Evaluation...")
+    outputs = trt_dual_engine_test(model, trt_engine_init, trt_engine_temporal, data_loader)
 
     # 评估与保存
     if args.out:
@@ -244,15 +245,12 @@ def main():
         for key in ["interval", "tmpdir", "start", "gpu_collect", "save_best", "rule"]:
             eval_kwargs.pop(key, None)
             
-        # ==========================================================
-        # 💡 核心修复：关掉不需要的 Tracking 和 Map 评测，避免 ID 报错
-        # ==========================================================
+        # 关闭无关任务评测
         if 'eval_mode' in eval_kwargs:
             eval_kwargs['eval_mode']['with_tracking'] = False
             eval_kwargs['eval_mode']['with_map'] = False
             eval_kwargs['eval_mode']['with_motion'] = False
             eval_kwargs['eval_mode']['with_planning'] = False
-        # ==========================================================
         
         eval_kwargs.update(dict(metric=args.eval))
         print(f"\n📊 Evaluating metrics: {eval_kwargs}")

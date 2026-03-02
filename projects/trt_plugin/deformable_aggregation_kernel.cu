@@ -2,38 +2,48 @@
 #include <vector>
 #include <cstdio>
 
-// 核心计算函数 (Device)
+// 🚀 核心修复 1：完全对齐 PyTorch 的 Zero-Padding 双线性插值
 __device__ float bilinear_sampling(
     const float *bottom_data, const int &height, const int &width,
     const int &num_embeds, const float &h_im, const float &w_im,
     const int &base_ptr
 ) {
-    // 强制限制范围
-    float h_fixed = fmaxf(0.0f, fminf(h_im, (float)height - 1.0001f));
-    float w_fixed = fmaxf(0.0f, fminf(w_im, (float)width - 1.0001f));
+    // 允许出现负数，使用 floorf 正确向下取整
+    const int h_low = floorf(h_im);
+    const int w_low = floorf(w_im);
+    const int h_high = h_low + 1;
+    const int w_high = w_low + 1;
 
-    int h_low = (int)floorf(h_fixed);
-    int w_low = (int)floorf(w_fixed);
-    // [修复 Warning] 删除了未使用到的 h_high 和 w_high 变量
-
-    float lh = h_fixed - (float)h_low;
-    float lw = w_fixed - (float)w_low;
-    
-    float hh = 1.0f - lh;
-    float hw = 1.0f - lw;
+    const float lh = h_im - (float)h_low;
+    const float lw = w_im - (float)w_low;
+    const float hh = 1.0f - lh;
+    const float hw = 1.0f - lw;
 
     int stride = num_embeds;
     int w_stride = width * stride;
-    
-    const float* ptr_low = bottom_data + h_low * w_stride + w_low * stride + base_ptr;
-    const float* ptr_high = ptr_low + w_stride;
 
-    float v1 = ptr_low[0];          
-    float v2 = ptr_low[stride];     
-    float v3 = ptr_high[0];         
-    float v4 = ptr_high[stride];    
+    // 默认赋值为 0，实现完美的 Zero-Padding
+    float v1 = 0.0f, v2 = 0.0f, v3 = 0.0f, v4 = 0.0f;
 
-    return hh * (hw * v1 + lw * v2) + lh * (hw * v3 + lw * v4);
+    // 只有严格在有效图像范围内的点才去读取显存，否则保持为 0
+    if (h_low >= 0 && w_low >= 0 && h_low < height && w_low < width)
+        v1 = bottom_data[base_ptr + h_low * w_stride + w_low * stride];
+        
+    if (h_low >= 0 && w_high >= 0 && h_low < height && w_high < width)
+        v2 = bottom_data[base_ptr + h_low * w_stride + w_high * stride];
+
+    if (h_high >= 0 && w_low >= 0 && h_high < height && w_low < width)
+        v3 = bottom_data[base_ptr + h_high * w_stride + w_low * stride];
+
+    if (h_high >= 0 && w_high >= 0 && h_high < height && w_high < width)
+        v4 = bottom_data[base_ptr + h_high * w_stride + w_high * stride];
+
+    float w1 = hh * hw;
+    float w2 = hh * lw;
+    float w3 = lh * hw;
+    float w4 = lh * lw;
+
+    return w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4;
 }
 
 __global__ void deformable_aggregation_kernel(
@@ -46,7 +56,7 @@ __global__ void deformable_aggregation_kernel(
     const float* weights,
     int batch_size, int num_cams, int num_feat, int num_embeds,
     int num_scale, int num_anchors, int num_pts, int num_groups,
-    bool is_cam_shared  // <--- 新增
+    bool is_cam_shared
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_kernels) return;
@@ -70,14 +80,12 @@ __global__ void deformable_aggregation_kernel(
     const float loc_w = sample_location[loc_offset];
     const float loc_h = sample_location[loc_offset + 1];
 
-    if (loc_w <= 0 || loc_w >= 1 || loc_h <= 0 || loc_h >= 1) return;
+    // 🚀 核心修复 2：放宽越界判断，不要用 <= 0 误杀合法的边缘点 (0.0)，超出 -0.5 的由插值函数里的 0 自动处理
+    if (loc_w <= -0.5f || loc_w >= 1.5f || loc_h <= -0.5f || loc_h >= 1.5f) return;
     
-    // === 核心修复：处理相机合并折叠 ===
-    // 如果折叠了，直接只按 scale_index 寻址；如果没折叠，按常规的 cam * num_scale + scale 计算
     int shape_index = is_cam_shared ? scale_index : (cam_index * num_scale + scale_index);
     const int current_start_index = scale_start_index[shape_index];
     
-    // 因为 start_index 只是单张图像的局部偏移，我们必须手动给每张特征图加上相机的宏观步长
     int cam_offset = is_cam_shared ? (cam_index * (num_feat / num_cams)) : 0;
     
     const int max_feat_size = batch_size * num_feat * num_embeds;
@@ -94,8 +102,8 @@ __global__ void deformable_aggregation_kernel(
     long long max_access_offset = (long long)value_offset + (long long)h * w * num_embeds;
     if (max_access_offset > max_feat_size) return;
 
-    const float h_im = loc_h * h - 0.5;
-    const float w_im = loc_w * w - 0.5;
+    const float h_im = loc_h * h - 0.5f;
+    const float w_im = loc_w * w - 0.5f;
 
     atomicAdd(
         output + real_anchor_index * num_embeds + channel_index,
@@ -112,7 +120,7 @@ extern "C" void DeformableAggregationLauncher(
     float* output,
     int batch_size, int num_cams, int num_feat, int num_embeds,
     int num_scale, int num_anchors, int num_pts, int num_groups,
-    bool is_cam_shared, // <--- 新增
+    bool is_cam_shared,
     cudaStream_t stream
 ) {
     const int num_kernels = batch_size * num_pts * num_embeds * num_anchors * num_cams * num_scale;

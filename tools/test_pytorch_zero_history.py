@@ -9,125 +9,66 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from mmcv import Config
-from mmcv.runner import load_checkpoint
+from mmcv.runner import load_checkpoint, wrap_fp16_model
+from mmcv.parallel import MMDataParallel
 from mmdet.datasets import build_dataset
 from mmdet.datasets import build_dataloader as build_dataloader_origin
 from mmdet.models import build_detector
-import mmdet3d
 import projects.mmdet3d_plugin
 
 # ==============================================================================
-# 🔄 纯 PyTorch 测试 Loop (强行注入全零历史)
+# 🔄 纯 PyTorch 测试 Loop (完美手工维护历史缓存 - 持续滚动版)
 # ==============================================================================
-def pytorch_zero_history_test(model, data_loader):
+def pytorch_perfect_history_test(model, data_loader):
     model.eval()
     results = []
     dataset = data_loader.dataset
     prog_bar = mmcv.ProgressBar(len(dataset))
 
-    nh_det = 600
-    
-    # 💡 提取原生模型 InstanceBank 里学到的固定 Query 作为首帧安全垫！
-    bank = model.head.det_head.instance_bank
-    default_feat = bank.instance_feature[:nh_det].unsqueeze(0).clone().detach()
-    default_anchor = bank.anchor[:nh_det].unsqueeze(0).clone().detach()
-    
-    def init_history():
-        return {
-            'prev_det_feat': default_feat.clone(),
-            'prev_det_anchor': default_anchor.clone(),
-            # 💡 尝试给一个中等置信度（比如 0.5），让模型在第一帧就“敢于”利用这些 Query
-            'prev_det_conf': torch.full((1, nh_det), 0.5, device='cuda'), 
-        }
-
-    history_cache = init_history()
-    prev_global_mat = None
-    prev_time = None
-    prev_scene_token = None
-
-    # 获取底层 InstanceBank
-    det_bank = model.head.det_head.instance_bank
+    det_bank = model.module.head.det_head.instance_bank
+    history_cache = {}
 
     for i, data in enumerate(data_loader):
         with torch.no_grad():
-            # ==========================================================
-            # 💡 核心修复：正确的数据解包 (去掉冗余的 [0])
-            # ==========================================================
-            img_metas = data['img_metas'].data[0][0]
-            img_raw = data['img'].data[0][0].cuda()
-            img = img_raw.unsqueeze(0) if img_raw.dim() == 4 else img_raw
-            proj_mat = torch.stack([p.cuda() for p in data['projection_mat'].data[0]], dim=0).unsqueeze(0)
-            # ==========================================================
+            # 🛑 1. 注入：外部干预 InstanceBank 缓存 (移除场景重置，无脑滚动)
+            if 'cached_feature' in history_cache:
+                det_bank.cached_feature = history_cache['cached_feature'].clone()
+                det_bank.cached_anchor = history_cache['cached_anchor'].clone()
+                det_bank.metas = history_cache['metas'] 
+                
+                if 'confidence' in history_cache and history_cache['confidence'] is not None:
+                    det_bank.confidence = history_cache['confidence'].clone()
+                if 'temp_confidence' in history_cache and history_cache['temp_confidence'] is not None:
+                    det_bank.temp_confidence = history_cache['temp_confidence'].clone()
+                if 'instance_id' in history_cache and history_cache['instance_id'] is not None:
+                    det_bank.instance_id = history_cache['instance_id'].clone()
+            else:
+                # 只有整个数据集的第 0 帧才会走这里，跟原生 test.py 保持完全一致
+                det_bank.reset()
 
-            # 🛑 检测场景切换，强行重置为全零历史！
-            curr_scene_token = img_metas.get('scene_token', None)
-            if prev_scene_token is None or curr_scene_token != prev_scene_token:
-                # 哪怕是 PyTorch，我们也强行给它喂 0！
-                history_cache = init_history()
-                prev_global_mat = None
-                prev_time = img_metas['timestamp'] - 0.5
-            prev_scene_token = curr_scene_token
+            # 🚀 2. 推理：使用完整的 MMDataParallel 前向传播
+            result = model(return_loss=False, rescale=True, **data)
+            results.extend(result)
 
-            curr_time = img_metas['timestamp']
-            dt = curr_time - prev_time
-            prev_time = curr_time
-
-            # 💉 【核心黑客操作】强行把全零的 history_cache 塞进 PyTorch 内部！
-            det_bank.cached_feature = history_cache['prev_det_feat'].clone()
-            det_bank.cached_anchor = history_cache['prev_det_anchor'].clone()
-            if hasattr(det_bank, 'confidence'):
-                det_bank.confidence = history_cache['prev_det_conf'].clone()
-
-            # 构造完美的 fake_metas 骗过 PyTorch 原生的位姿补偿
-            curr_global = img_metas['T_global']
-            fake_metas = {
-                "timestamp": curr_time - 0.5,
-                "img_metas": [{"T_global": curr_global}] 
-            }
-            det_bank.metas = fake_metas
-
-            # 🚀 执行 PyTorch 原生前向推理
-            native_metas = {
-                'img_metas': [img_metas],
-                'projection_mat': proj_mat,
-                'image_wh': img.new_tensor([img.shape[-1], img.shape[-2]]).view(1, 1, 2).repeat(1, 6, 1),
-                'timestamp': img.new_tensor([img_metas['timestamp']]), 
-            }
-            
-            # 提取特征并走 head
-            features = model.extract_feat(img, metas=native_metas)
-            py_outs = model.head(features, native_metas)
-
-            # ♻️ 闭环滚动更新历史
-            history_cache['prev_det_feat'] = det_bank.cached_feature.clone()
-            history_cache['prev_det_anchor'] = det_bank.cached_anchor.clone()
-            if hasattr(det_bank, 'confidence'):
-                history_cache['prev_det_conf'] = det_bank.confidence.clone()
-
-            # 🛠️ 组装结果 (严格对齐 TRT 的解码流程)
-            p_det_cls = py_outs[0]['classification'][-1]
-            p_det_reg = py_outs[0]['prediction'][-1]
-            
-            model_outs = {
-                "classification": [p_det_cls],
-                "prediction": [p_det_reg],
-                "quality": [None],    
-                "instance_id": None   
-            }
-            
-            decoded_res = model.head.det_head.post_process(model_outs)
-            result = {
-                'img_bbox': decoded_res[0],
-                'pts_bbox': decoded_res[0]
-            }
-            results.append(result)
+            # ♻️ 3. 提取：帧结束时，扣出模型内更新好的缓存状态，供下一帧注入
+            if det_bank.cached_feature is not None:
+                history_cache['cached_feature'] = det_bank.cached_feature.clone()
+                history_cache['cached_anchor'] = det_bank.cached_anchor.clone()
+                history_cache['metas'] = det_bank.metas # 直接引用保存
+                
+                if hasattr(det_bank, 'confidence') and det_bank.confidence is not None:
+                    history_cache['confidence'] = det_bank.confidence.clone()
+                if hasattr(det_bank, 'temp_confidence') and det_bank.temp_confidence is not None:
+                    history_cache['temp_confidence'] = det_bank.temp_confidence.clone()
+                if hasattr(det_bank, 'instance_id') and det_bank.instance_id is not None:
+                    history_cache['instance_id'] = det_bank.instance_id.clone()
 
         prog_bar.update()
 
     return results
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="PyTorch Zero History Test")
+    parser = argparse.ArgumentParser(description="PyTorch Perfect Manual History Test")
     parser.add_argument("config", help="test config file path")
     parser.add_argument("checkpoint", help="pytorch checkpoint file")
     parser.add_argument("--eval", type=str, nargs="+", help='evaluation metrics, e.g., "bbox"')
@@ -149,6 +90,23 @@ def main():
         from mmcv.utils import import_modules_from_strings
         import_modules_from_strings(**cfg["custom_imports"])
 
+    if hasattr(cfg, "plugin"):
+        if cfg.plugin:
+            import importlib
+            if hasattr(cfg, "plugin_dir"):
+                plugin_dir = cfg.plugin_dir
+                _module_dir = os.path.dirname(plugin_dir).split("/")
+                _module_path = _module_dir[0]
+                for m in _module_dir[1:]:
+                    _module_path = _module_path + "." + m
+                plg_lib = importlib.import_module(_module_path)
+            else:
+                _module_dir = os.path.dirname(args.config).split("/")
+                _module_path = _module_dir[0]
+                for m in _module_dir[1:]:
+                    _module_path = _module_path + "." + m
+                plg_lib = importlib.import_module(_module_path)
+
     if cfg.get('work_dir', None) is None:
         cfg.work_dir = osp.join('./work_dirs', osp.splitext(osp.basename(args.config))[0])
     mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
@@ -168,12 +126,19 @@ def main():
 
     cfg.model.train_cfg = None
     model = build_detector(cfg.model, test_cfg=cfg.get("test_cfg"))
+    
+    fp16_cfg = cfg.get("fp16", None)
+    if fp16_cfg is not None:
+        wrap_fp16_model(model)
+        
     load_checkpoint(model, args.checkpoint, map_location="cpu")
     model = model.cuda()
     model.CLASSES = dataset.CLASSES
 
-    print("\n🔥 Starting PyTorch Evaluation with FORCED ZERO HISTORY...")
-    outputs = pytorch_zero_history_test(model, data_loader)
+    model = MMDataParallel(model, device_ids=[0])
+
+    print("\n🔥 Starting PyTorch Evaluation with PERFECT MANUAL HISTORY INJECTION...")
+    outputs = pytorch_perfect_history_test(model, data_loader)
     
     if args.eval:
         eval_kwargs = cfg.get("evaluation", {}).copy()

@@ -146,10 +146,9 @@ def main():
     dummy_time_interval = torch.tensor([0.5], dtype=torch.float32, device=device).repeat(batch_size)
 
     # 检测头输入
-    dummy_det_feat = torch.randn(batch_size, num_det_history, embed_dims, device=device)
-    dummy_det_anchor = torch.randn(batch_size, num_det_history, 11, device=device)
-    # [New] 检测头上一帧置信度 (范围 0-1)
-    dummy_det_conf = torch.rand(batch_size, num_det_history, device=device)
+    dummy_det_feat = torch.zeros(batch_size, num_det_history, embed_dims, device=device)
+    dummy_det_anchor = torch.zeros(batch_size, num_det_history, 11, device=device)
+    dummy_det_conf = torch.zeros(batch_size, num_det_history, device=device)
 
     # 地图头输入 (Map Anchor 是 40 维)
     dummy_map_feat = torch.randn(batch_size, num_map_history, embed_dims, device=device)
