@@ -1,6 +1,6 @@
 # ================ base config ===================
-version = 'mini'
-# version = 'trainval'
+# version = 'mini'
+version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
 
 plugin = True

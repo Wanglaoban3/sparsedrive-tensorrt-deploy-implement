@@ -163,9 +163,17 @@ class MotionPlanningHead(BaseModule):
         return self._agent2lidar(motion_anchor, prediction)
 
     def _agent2lidar(self, trajs, boxes):
-        yaw = torch.atan2(boxes[..., SIN_YAW], boxes[..., COS_YAW])
-        cos_yaw = torch.cos(yaw)
-        sin_yaw = torch.sin(yaw)
+        # 1. 取出网络预测的原始 sin 和 cos 值
+        raw_sin = boxes[..., SIN_YAW]
+        raw_cos = boxes[..., COS_YAW]
+        
+        # 2. 计算模长 (加 1e-6 防止除以 0)
+        norm = torch.sqrt(raw_sin ** 2 + raw_cos ** 2 + 1e-6)
+        
+        # 3. 直接归一化得到最终的 sin_yaw 和 cos_yaw，彻底抛弃 atan2！
+        sin_yaw = raw_sin / norm
+        cos_yaw = raw_cos / norm
+        
         rot_mat_T = torch.stack(
             [
                 torch.stack([cos_yaw, sin_yaw]),
@@ -481,3 +489,338 @@ class MotionPlanningHead(BaseModule):
         )
 
         return motion_result, planning_result
+    
+
+   # === [Debug 版] 100% 复刻 forward 逻辑，仅加 print 和中间值返回 ===
+    def forward_debug(
+        self, 
+        det_output,
+        map_output,
+        feature_maps,
+        metas,
+        anchor_encoder,
+        mask,
+        anchor_handler,
+    ):
+        # 原逻辑开始
+        instance_feature = det_output["instance_feature"]
+        anchor_embed = det_output["anchor_embed"]
+        det_classification = det_output["classification"][-1].sigmoid()
+        det_anchors = det_output["prediction"][-1]
+        det_confidence = det_classification.max(dim=-1).values
+        _, (instance_feature_selected, anchor_embed_selected) = topk(
+            det_confidence, self.num_det, instance_feature, anchor_embed
+        )
+
+        map_instance_feature = map_output["instance_feature"]
+        map_anchor_embed = map_output["anchor_embed"]
+        map_classification = map_output["classification"][-1].sigmoid()
+        map_anchors = map_output["prediction"][-1]
+        map_confidence = map_classification.max(dim=-1).values
+        _, (map_instance_feature_selected, map_anchor_embed_selected) = topk(
+            map_confidence, self.num_map, map_instance_feature, map_anchor_embed
+        )
+
+        bs, num_anchor, dim = instance_feature.shape
+        (
+            ego_feature,
+            ego_anchor,
+            temp_instance_feature,
+            temp_anchor,
+            temp_mask,
+        ) = self.instance_queue.get(
+            det_output,
+            feature_maps,
+            metas,
+            bs,
+            mask,
+            anchor_handler,
+        )
+        
+        # 【关键】抓取张量以便 Debug 比对，因为下方会把它 flatten 掉
+        debug_temp_instance_feature = temp_instance_feature.clone()
+        debug_temp_anchor = temp_anchor.clone()
+
+        ego_anchor_embed = anchor_encoder(ego_anchor)
+        temp_anchor_embed = anchor_encoder(temp_anchor)
+        temp_instance_feature_flat = temp_instance_feature.flatten(0, 1)
+        temp_anchor_embed_flat = temp_anchor_embed.flatten(0, 1)
+        temp_mask_flat = temp_mask.flatten(0, 1)
+
+        motion_anchor = self.get_motion_anchor(det_classification, det_anchors)
+        plan_anchor = torch.tile(self.plan_anchor[None], (bs, 1, 1, 1, 1))
+
+        motion_mode_query = self.motion_anchor_encoder(gen_sineembed_for_position(motion_anchor[..., -1, :]))
+        plan_pos = gen_sineembed_for_position(plan_anchor[..., -1, :])
+        plan_mode_query = self.plan_anchor_encoder(plan_pos).flatten(1, 2).unsqueeze(1)
+
+        instance_feature_selected = torch.cat([instance_feature_selected, ego_feature], dim=1)
+        anchor_embed_selected = torch.cat([anchor_embed_selected, ego_anchor_embed], dim=1)
+
+        instance_feature = torch.cat([instance_feature, ego_feature], dim=1)
+        anchor_embed = torch.cat([anchor_embed, ego_anchor_embed], dim=1)
+
+        motion_classification, motion_prediction = [], []
+        planning_classification, planning_prediction, planning_status = [], [], []
+        
+        for i, op in enumerate(self.operation_order):
+            if self.layers[i] is None: continue
+            elif op == "temp_gnn":
+                instance_feature = self.graph_model(
+                    i,
+                    instance_feature.flatten(0, 1).unsqueeze(1),
+                    temp_instance_feature_flat,
+                    temp_instance_feature_flat,
+                    query_pos=anchor_embed.flatten(0, 1).unsqueeze(1),
+                    key_pos=temp_anchor_embed_flat,
+                    key_padding_mask=temp_mask_flat,
+                )
+                instance_feature = instance_feature.reshape(bs, num_anchor + 1, dim)
+            elif op == "gnn":
+                instance_feature = self.graph_model(
+                    i, instance_feature, instance_feature_selected, instance_feature_selected,
+                    query_pos=anchor_embed, key_pos=anchor_embed_selected,
+                )
+            elif op in ["norm", "ffn"]:
+                instance_feature = self.layers[i](instance_feature)
+            elif op == "cross_gnn":
+                instance_feature = self.layers[i](
+                    instance_feature, key=map_instance_feature_selected,
+                    query_pos=anchor_embed, key_pos=map_anchor_embed_selected,
+                )
+            elif op == "refine":
+                motion_query = motion_mode_query + (instance_feature + anchor_embed)[:, :num_anchor].unsqueeze(2)
+                plan_query = plan_mode_query + (instance_feature + anchor_embed)[:, num_anchor:].unsqueeze(2) 
+                m_cls, m_reg, p_cls, p_reg, p_status = self.layers[i](
+                    motion_query, plan_query, instance_feature[:, num_anchor:], anchor_embed[:, num_anchor:]
+                )
+                motion_classification.append(m_cls)
+                motion_prediction.append(m_reg)
+                planning_classification.append(p_cls)
+                planning_prediction.append(p_reg)
+                planning_status.append(p_status)
+        
+        self.instance_queue.cache_motion(instance_feature[:, :num_anchor], det_output, metas)
+        self.instance_queue.cache_planning(instance_feature[:, num_anchor:], planning_status[-1])
+
+        motion_output = {
+            "classification": motion_classification,
+            "prediction": motion_prediction,
+            "period": self.instance_queue.period,
+            "anchor_queue": self.instance_queue.anchor_queue,
+        }
+        planning_output = {
+            "classification": planning_classification,
+            "prediction": planning_prediction,
+            "status": planning_status,
+            "period": self.instance_queue.ego_period,
+            "anchor_queue": self.instance_queue.ego_anchor_queue,
+        }
+        return motion_output, planning_output, debug_temp_instance_feature, debug_temp_anchor
+
+    def forward_onnx(
+        self,
+        # === Det & Map 特征输入 ===
+        det_instance_feature,       # [B, num_det, dim]
+        det_anchor_embed,           # [B, num_det, dim]
+        det_classification_sigmoid, # [B, num_det, num_classes] (已过sigmoid)
+        det_anchors,                # [B, num_det, 11]
+        det_instance_id,            # [B, num_det]
+        map_instance_feature,       # [B, num_map, dim]
+        map_anchor_embed,           # [B, num_map, dim]
+        map_classification_sigmoid, # [B, num_map, num_classes] (已过sigmoid)
+        # === Ego 规划所需特征 ===
+        ego_feature_map,            # [B, C, H, W]
+        # === 工具句柄与配置 ===
+        anchor_encoder,
+        anchor_handler,
+        mask,                       # [B]
+        is_first_frame,             
+        # === 外部维护的历史张量状态 ===
+        T_temp2cur=None,            # [B, 4, 4]
+        history_instance_feature=None, 
+        history_anchor=None,           
+        history_period=None,           
+        prev_instance_id=None,         
+        prev_confidence=None,          
+        history_ego_feature=None,      
+        history_ego_anchor=None,       
+        history_ego_period=None,       
+        prev_ego_status=None           
+    ):
+        bs, num_anchor, dim = det_instance_feature.shape
+        queue_length = self.instance_queue.queue_length
+        
+        # 1. Det & Map TopK
+        det_confidence = det_classification_sigmoid.max(dim=-1).values
+        _, (instance_feature_selected, anchor_embed_selected) = topk(
+            det_confidence, self.num_det, det_instance_feature, det_anchor_embed
+        )
+        map_confidence = map_classification_sigmoid.max(dim=-1).values
+        _, (map_instance_feature_selected, map_anchor_embed_selected) = topk(
+            map_confidence, self.num_map, map_instance_feature, map_anchor_embed
+        )
+
+        # 2. Ego 特征初始化
+        ego_feature = self.instance_queue.ego_feature_encoder(ego_feature_map)
+        ego_feature = ego_feature.unsqueeze(1).squeeze(-1).squeeze(-1) # [B, 1, dim]
+        ego_anchor = self.instance_queue.ego_anchor[None].repeat(bs, 1, 1) # [B, 1, 11]
+
+        # 3. 手动实现 instance_queue.get() 逻辑
+        if is_first_frame:
+            # 🎯 修复：使用 .new_zeros / .new_ones 自动继承输入张量的设备
+            new_history_feature = det_instance_feature.new_zeros((bs, num_anchor, queue_length, dim))
+            new_history_feature[:, :, -1, :] = det_instance_feature
+            
+            new_history_anchor = det_anchors.new_zeros((bs, num_anchor, queue_length, 11))
+            new_history_anchor[:, :, -1, :] = det_anchors
+            
+            # 特别注意：Int 类型张量
+            new_period = det_instance_id.new_ones((bs, num_anchor)).to(torch.int32)
+            
+            new_history_ego_feature = ego_feature.new_zeros((bs, 1, queue_length, dim))
+            new_history_ego_feature[:, :, -1, :] = ego_feature
+            
+            new_history_ego_anchor = ego_anchor.new_zeros((bs, 1, queue_length, 11))
+            new_history_ego_anchor[:, :, -1, :] = ego_anchor
+            
+            new_ego_period = det_instance_id.new_ones((bs, 1)).to(torch.int32)
+        else:
+            # Ego status 更新
+            mask = mask.to(prev_ego_status.device)
+            prev_ego_status_masked = torch.where(mask[:, None, None], prev_ego_status, prev_ego_status.new_zeros(prev_ego_status.shape))
+            prev_ego_status_masked = torch.where(mask[:, None, None], prev_ego_status, torch.zeros_like(prev_ego_status))
+            ego_anchor[..., VY] = prev_ego_status_masked[..., 6]
+            
+            # 投影历史 Anchor
+            B, N, Q, _ = history_anchor.shape
+            flat_history_anchor = history_anchor.view(B, N * Q, 11)
+            flat_history_anchor = anchor_handler.anchor_projection(flat_history_anchor, [T_temp2cur])[0]
+            history_anchor = flat_history_anchor.view(B, N, Q, 11)
+            
+            flat_ego_anchor = history_ego_anchor.view(B, Q, 11)
+            flat_ego_anchor = anchor_handler.anchor_projection(flat_ego_anchor, [T_temp2cur])[0]
+            history_ego_anchor = flat_ego_anchor.view(B, 1, Q, 11)
+            
+            # ID 匹配与历史特征对齐
+            match = det_instance_id.unsqueeze(-1) == prev_instance_id.unsqueeze(1) # [B, N, N_prev]
+            if self.instance_queue.tracking_threshold > 0:
+                track_mask = prev_confidence > self.instance_queue.tracking_threshold
+                # 🎯 修复1: BOOL 与 BOOL 的运算必须用逻辑与 `&`
+                match = match & track_mask.unsqueeze(1) 
+                
+            # 🎯 修复2: 掩码在与数值张量相乘前，强制转换为数值类型 (规避 BOOL * FLOAT 隐式转换报错)
+            match_float = match.to(history_instance_feature.dtype)
+            match_long = match.to(history_period.dtype)
+
+            matched_history_feature = (match_float.unsqueeze(-1).unsqueeze(-1) * history_instance_feature.unsqueeze(1)).sum(dim=2) 
+            matched_history_anchor = (match_float.unsqueeze(-1).unsqueeze(-1) * history_anchor.unsqueeze(1)).sum(dim=2) 
+            matched_period = (match_long * history_period.unsqueeze(1)).sum(dim=2)
+            
+            # 队列滑动
+            new_history_feature = torch.cat([matched_history_feature[:, :, 1:, :], det_instance_feature.unsqueeze(2)], dim=2)
+            new_history_anchor = torch.cat([matched_history_anchor[:, :, 1:, :], det_anchors.unsqueeze(2)], dim=2)
+            new_period = torch.clamp(matched_period + 1, 0, queue_length)
+            
+            curr_history_ego_period = torch.where(mask[:, None], history_ego_period, torch.zeros_like(history_ego_period))
+            new_history_ego_feature = torch.cat([history_ego_feature[:, :, 1:, :], ego_feature.unsqueeze(2)], dim=2)
+            new_history_ego_anchor = torch.cat([history_ego_anchor[:, :, 1:, :], ego_anchor.unsqueeze(2)], dim=2)
+            new_ego_period = torch.clamp(curr_history_ego_period + 1, 0, queue_length)
+
+        # 拼接 det 与 ego 的历史特征
+        temp_instance_feature = torch.cat([new_history_feature, new_history_ego_feature], dim=1) 
+        temp_anchor = torch.cat([new_history_anchor, new_history_ego_anchor], dim=1) 
+        period = torch.cat([new_period, new_ego_period], dim=1) 
+        
+        num_agent = temp_anchor.shape[1]
+        # 构造一个 [1, 1, Q] 的基础序列
+        temp_mask_base = temp_anchor.new_tensor(range(queue_length, 0, -1)).view(1, 1, queue_length)
+        # period 的形状是 [B, N]，unsqueeze 后是 [B, N, 1]
+        # [1, 1, Q] 与 [B, N, 1] 比较，会自动广播成 [B, N, Q]
+        temp_mask = temp_mask_base > period.unsqueeze(-1)
+
+        # 4. 后续网络推理逻辑与原版保持一致
+        ego_anchor_embed = anchor_encoder(ego_anchor)
+        temp_anchor_embed = anchor_encoder(temp_anchor)
+        temp_instance_feature_flat = temp_instance_feature.flatten(0, 1)
+        temp_anchor_embed_flat = temp_anchor_embed.flatten(0, 1)
+        temp_mask_flat = temp_mask.flatten(0, 1)
+
+        motion_anchor = self.get_motion_anchor(det_classification_sigmoid, det_anchors)
+        # plan_anchor = torch.tile(self.plan_anchor[None], (bs, 1, 1, 1, 1))
+        plan_anchor = self.plan_anchor[None].repeat(bs, 1, 1, 1, 1)
+
+        motion_mode_query = self.motion_anchor_encoder(gen_sineembed_for_position(motion_anchor[..., -1, :]))
+        plan_pos = gen_sineembed_for_position(plan_anchor[..., -1, :])
+        plan_mode_query = self.plan_anchor_encoder(plan_pos).flatten(1, 2).unsqueeze(1)
+
+        instance_feature_selected = torch.cat([instance_feature_selected, ego_feature], dim=1)
+        anchor_embed_selected = torch.cat([anchor_embed_selected, ego_anchor_embed], dim=1)
+        instance_feature = torch.cat([det_instance_feature, ego_feature], dim=1)
+        anchor_embed = torch.cat([det_anchor_embed, ego_anchor_embed], dim=1)
+
+        motion_classification, motion_prediction = [], []
+        planning_classification, planning_prediction, planning_status = [], [], []
+        
+        for i, op in enumerate(self.operation_order):
+            if self.layers[i] is None: continue
+            elif op == "temp_gnn":
+                instance_feature = self.graph_model(
+                    i,
+                    instance_feature.flatten(0, 1).unsqueeze(1),
+                    temp_instance_feature_flat,
+                    temp_instance_feature_flat,
+                    query_pos=anchor_embed.flatten(0, 1).unsqueeze(1),
+                    key_pos=temp_anchor_embed_flat,
+                    key_padding_mask=temp_mask_flat,
+                )
+                instance_feature = instance_feature.reshape(bs, num_anchor + 1, dim)
+            elif op == "gnn":
+                instance_feature = self.graph_model(
+                    i, instance_feature, instance_feature_selected, instance_feature_selected,
+                    query_pos=anchor_embed, key_pos=anchor_embed_selected,
+                )
+            elif op in ["norm", "ffn"]:
+                instance_feature = self.layers[i](instance_feature)
+            elif op == "cross_gnn":
+                instance_feature = self.layers[i](
+                    instance_feature, key=map_instance_feature_selected,
+                    query_pos=anchor_embed, key_pos=map_anchor_embed_selected,
+                )
+            elif op == "refine":
+                motion_query = motion_mode_query + (instance_feature + anchor_embed)[:, :num_anchor].unsqueeze(2)
+                plan_query = plan_mode_query + (instance_feature + anchor_embed)[:, num_anchor:].unsqueeze(2) 
+                m_cls, m_reg, p_cls, p_reg, p_status = self.layers[i](
+                    motion_query, plan_query, instance_feature[:, num_anchor:], anchor_embed[:, num_anchor:]
+                )
+                motion_classification.append(m_cls)
+                motion_prediction.append(m_reg)
+                planning_classification.append(p_cls)
+                planning_prediction.append(p_reg)
+                planning_status.append(p_status)
+        
+        # =========================================================================
+        # 【关键修复】：复现原生 cache_planning 将 GNN 输出特征覆盖到队列末尾的行为！
+        # =========================================================================
+        new_history_ego_feature_cache = new_history_ego_feature.clone()
+        new_history_ego_feature_cache[:, :, -1, :] = instance_feature[:, num_anchor:]
+
+        # 组装外部维护所需的状态供下次输入
+        next_states = {
+            "history_instance_feature": new_history_feature,
+            "history_anchor": new_history_anchor,
+            "history_period": new_period.to(torch.int32),
+            "prev_instance_id": det_instance_id.to(torch.int32),
+            "prev_confidence": det_confidence,
+            "history_ego_feature": new_history_ego_feature_cache, # <-- 更新为Refine后的特征
+            "history_ego_anchor": new_history_ego_anchor,
+            "history_ego_period": new_ego_period.to(torch.int32),
+            "prev_ego_status": planning_status[-1] # <-- 原封不动保持 [bs, 1, 10] 避免广播出错
+        }
+
+        return (
+            motion_classification, motion_prediction,
+            planning_classification, planning_prediction, planning_status,
+            next_states,
+            temp_instance_feature, temp_anchor  
+        )

@@ -19,3 +19,6 @@ __pycache__/
 
 job_scripts/
 temp_ops/
+
+*.onnx
+*.pkl
