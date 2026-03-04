@@ -1,5 +1,5 @@
 # ================ base config ===================
-# version = 'mini'
+version = 'mini'
 version = 'trainval'
 length = {'trainval': 28130, 'mini': 323}
 

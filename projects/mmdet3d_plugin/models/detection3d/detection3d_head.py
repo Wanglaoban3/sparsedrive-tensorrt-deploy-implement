@@ -18,7 +18,7 @@ from mmdet.core.bbox.builder import BBOX_SAMPLERS
 from mmdet.core.bbox.builder import BBOX_CODERS
 from mmdet.models import HEADS, LOSSES
 from mmdet.core import reduce_mean
-
+import torch.nn.functional as F
 from ..blocks import DeformableFeatureAggregation as DFG
 
 # === ONNX Friendly TopK ===
@@ -566,7 +566,6 @@ class Sparse4DHead(BaseModule):
             output_idx=output_idx,
         )
 
-    # === 终极工业部署版：全手工算子、无原生依赖、兼容 Det & Map ===
     def forward_onnx(
         self,
         feature_maps: Union[torch.Tensor, List],
@@ -586,6 +585,10 @@ class Sparse4DHead(BaseModule):
         device = feature_maps[0].device
         dtype = feature_maps[0].dtype
 
+        # ==============================================================
+        # 1-4 步：绝对锁定，绝不修改经过验证的对齐逻辑！
+        # ==============================================================
+        
         # 1. 初始化当前帧 Query
         instance_feature = self.instance_bank.instance_feature.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
         anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
@@ -639,7 +642,6 @@ class Sparse4DHead(BaseModule):
                 
                 prev_vel_new = torch.matmul(vel, R_full.transpose(1, 2))
                 
-                import torch.nn.functional as F
                 yaw_padded = F.pad(prev_yaw_new, (3, 3))
                 vel_padded = F.pad(prev_vel_new, (5, 0))
                 mask_keep = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device, dtype=dtype)
@@ -649,11 +651,15 @@ class Sparse4DHead(BaseModule):
 
             elif self.task_prefix == 'map':
                 bs_map, num_anchor_map, dims_map = prev_anchor.shape
+                
                 pts = prev_anchor.to(dtype).reshape(bs_map, -1, 2)
+                
                 R_2x2 = instance_t_matrix[:, :2, :2].to(dtype).unsqueeze(1) # [bs, 1, 2, 2]
                 t_2 = instance_t_matrix[:, :2, 3].to(dtype).unsqueeze(1)    # [bs, 1, 2]
+                
                 pts_rotated = torch.matmul(R_2x2, pts.unsqueeze(-1)).squeeze(-1)
                 pts_final = pts_rotated + t_2
+                
                 current_prev_anchor = pts_final.reshape(bs_map, num_anchor_map, dims_map)
                 
             else:
@@ -721,7 +727,9 @@ class Sparse4DHead(BaseModule):
                 if len(prediction) > self.num_single_frame_decoder and temp_anchor_embed is not None:
                     temp_anchor_embed = anchor_embed[:, : self.instance_bank.num_temp_instances]
 
-        # 5. 生成下一帧缓存
+        # ==============================================================================
+        # 5. 生成下一帧缓存 & 外挂 ID 分配系统 (隔离修改区)
+        # ==============================================================================
         last_cls, last_pred = classification[-1], prediction[-1]
         last_qt = quality[-1]
         num_temp = self.instance_bank.num_temp_instances
@@ -731,11 +739,9 @@ class Sparse4DHead(BaseModule):
         if prev_confidence is not None and is_valid_history.any():
             decayed_conf = prev_confidence.to(dtype) * self.instance_bank.confidence_decay
             confidence[:, :num_temp] = torch.maximum(decayed_conf, confidence[:, :num_temp])
-            
-        # ==============================================================================
+
         # 🚀 极其关键的更新：TRT 友好版 Instance ID 分配逻辑
-        # ==============================================================================
-        if self.with_instance_id:
+        if getattr(self, 'with_instance_id', False):
             B, N = confidence.shape
             
             # 1. 默认置为 -1
@@ -746,15 +752,17 @@ class Sparse4DHead(BaseModule):
                 num_prev = prev_instance_id.shape[1]
                 instance_id[:, :num_prev] = prev_instance_id.to(torch.int32)
                 
-            # 3. 筛选需要分配新 ID 的框
-            score_thresh = self.decoder.score_threshold
-            new_id_mask = (instance_id < 0) & (confidence >= score_thresh)
-            
+            # 3. 🎯 修复 NoneType 报错：安全地筛选需要分配新 ID 的框
+            score_thresh = getattr(self.decoder, 'score_threshold', None) if hasattr(self, 'decoder') else None
+            if score_thresh is not None:
+                new_id_mask = (instance_id < 0) & (confidence >= score_thresh)
+            else:
+                new_id_mask = (instance_id < 0)
+                
             if prev_id_count is None:
                 prev_id_count = instance_id.new_zeros((B, 1))
                 
             # 4. TRT 魔法：利用 cumsum 无动态维度生成自增 ID！
-            # 例如: mask=[F, T, T, F, T] -> cumsum=[0, 1, 2, 2, 3] -> offsets 保证递增
             new_id_offsets = new_id_mask.to(torch.int32).cumsum(dim=1)
             new_ids = prev_id_count + new_id_offsets - 1
             
@@ -768,18 +776,20 @@ class Sparse4DHead(BaseModule):
             next_conf_vals, (next_instance_feature, next_anchor, next_instance_id) = topk(
                 confidence, num_temp, instance_feature, last_pred, instance_id.unsqueeze(-1)
             )
-            next_instance_id = next_instance_id.squeeze(-1).to(torch.int32)
+            next_instance_id = next_instance_id.view(B, num_temp).to(torch.int32)
 
             return {
                 "cls_scores": last_cls,
                 "bbox_preds": last_pred,
                 "quality": last_qt, 
                 "instance_id": instance_id,              # 给 Motion 的 det_instance_id
+                "instance_feature": instance_feature,    # 🎯 必须加上这行！Motion 需要！
+                "anchor_embed": anchor_embed,            # 🎯 必须加上这行！Motion 需要！
                 "next_instance_feature": next_instance_feature,
                 "next_anchor": next_anchor, 
                 "next_confidence": next_conf_vals,
-                "next_instance_id": next_instance_id,    # 下一帧的 prev_instance_id
-                "next_id_count": next_id_count           # 下一帧的 prev_id_count
+                "next_instance_id": next_instance_id,    
+                "next_id_count": next_id_count           
             }
         else:
             # Map 等不需要跟踪 ID 的 Head 走这里
@@ -790,6 +800,8 @@ class Sparse4DHead(BaseModule):
                 "cls_scores": last_cls,
                 "bbox_preds": last_pred,
                 "quality": last_qt, 
+                "instance_feature": instance_feature,    # 🎯 必须加上这行！Motion 需要！
+                "anchor_embed": anchor_embed,            # 🎯 必须加上这行！Motion 需要！
                 "next_instance_feature": next_instance_feature,
                 "next_anchor": next_anchor, 
                 "next_confidence": next_conf_vals

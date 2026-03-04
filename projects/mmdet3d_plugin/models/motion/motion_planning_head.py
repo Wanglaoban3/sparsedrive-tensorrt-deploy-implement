@@ -650,6 +650,7 @@ class MotionPlanningHead(BaseModule):
     ):
         bs, num_anchor, dim = det_instance_feature.shape
         queue_length = self.instance_queue.queue_length
+        VY = 6
         
         # 1. Det & Map TopK
         det_confidence = det_classification_sigmoid.max(dim=-1).values
@@ -666,16 +667,14 @@ class MotionPlanningHead(BaseModule):
         ego_feature = ego_feature.unsqueeze(1).squeeze(-1).squeeze(-1) # [B, 1, dim]
         ego_anchor = self.instance_queue.ego_anchor[None].repeat(bs, 1, 1) # [B, 1, 11]
 
-        # 3. 手动实现 instance_queue.get() 逻辑
+        # 3. 手动实现 instance_queue.get() 逻辑 (完全使用你跑通的代码2)
         if is_first_frame:
-            # 🎯 修复：使用 .new_zeros / .new_ones 自动继承输入张量的设备
             new_history_feature = det_instance_feature.new_zeros((bs, num_anchor, queue_length, dim))
             new_history_feature[:, :, -1, :] = det_instance_feature
             
             new_history_anchor = det_anchors.new_zeros((bs, num_anchor, queue_length, 11))
             new_history_anchor[:, :, -1, :] = det_anchors
             
-            # 特别注意：Int 类型张量
             new_period = det_instance_id.new_ones((bs, num_anchor)).to(torch.int32)
             
             new_history_ego_feature = ego_feature.new_zeros((bs, 1, queue_length, dim))
@@ -686,12 +685,10 @@ class MotionPlanningHead(BaseModule):
             
             new_ego_period = det_instance_id.new_ones((bs, 1)).to(torch.int32)
         else:
-            # Ego status 更新 (TRT-friendly Float multiplication)
             mask_float = mask.to(prev_ego_status.dtype)
             prev_ego_status_masked = prev_ego_status * mask_float[:, None, None]
             ego_anchor[..., VY] = prev_ego_status_masked[..., 6]
             
-            # 投影历史 Anchor
             B, N, Q, _ = history_anchor.shape
             flat_history_anchor = history_anchor.view(B, N * Q, 11)
             flat_history_anchor = anchor_handler.anchor_projection(flat_history_anchor, [T_temp2cur])[0]
@@ -701,14 +698,13 @@ class MotionPlanningHead(BaseModule):
             flat_ego_anchor = anchor_handler.anchor_projection(flat_ego_anchor, [T_temp2cur])[0]
             history_ego_anchor = flat_ego_anchor.view(B, 1, Q, 11)
             
-            # ID 匹配与历史特征对齐
-            match = det_instance_id.unsqueeze(-1) == prev_instance_id.unsqueeze(1) # [B, N, N_prev]
+            # 完全沿用你正确的匹配逻辑
+            match = det_instance_id.unsqueeze(-1) == prev_instance_id.unsqueeze(1) 
             match_float = match.to(history_instance_feature.dtype)
             
             if self.instance_queue.tracking_threshold > 0:
                 track_mask = prev_confidence > self.instance_queue.tracking_threshold
                 track_mask_float = track_mask.to(match_float.dtype)
-                # TRT-friendly: 用浮点数相乘代替 Boolean broadcast AND
                 match_float = match_float * track_mask_float.unsqueeze(1) 
                 
             match_long = match_float.to(history_period.dtype)
@@ -717,39 +713,26 @@ class MotionPlanningHead(BaseModule):
             matched_history_anchor = (match_float.unsqueeze(-1).unsqueeze(-1) * history_anchor.unsqueeze(1)).sum(dim=2) 
             matched_period = (match_long * history_period.unsqueeze(1)).sum(dim=2)
             
-            # 队列滑动
             new_history_feature = torch.cat([matched_history_feature[:, :, 1:, :], det_instance_feature.unsqueeze(2)], dim=2)
             new_history_anchor = torch.cat([matched_history_anchor[:, :, 1:, :], det_anchors.unsqueeze(2)], dim=2)
             new_period = torch.clamp(matched_period + 1, 0, queue_length)
             
-            # TRT-friendly Int multiplication
             mask_int = mask.to(history_ego_period.dtype)
             curr_history_ego_period = history_ego_period * mask_int[:, None]
             new_history_ego_feature = torch.cat([history_ego_feature[:, :, 1:, :], ego_feature.unsqueeze(2)], dim=2)
             new_history_ego_anchor = torch.cat([history_ego_anchor[:, :, 1:, :], ego_anchor.unsqueeze(2)], dim=2)
             new_ego_period = torch.clamp(curr_history_ego_period + 1, 0, queue_length)
 
-        # 拼接 det 与 ego 的历史特征
         temp_instance_feature = torch.cat([new_history_feature, new_history_ego_feature], dim=1) 
         temp_anchor = torch.cat([new_history_anchor, new_history_ego_anchor], dim=1) 
         period = torch.cat([new_period, new_ego_period], dim=1) 
         
         num_agent = temp_anchor.shape[1]
-        # 构造一个 [1, 1, Q] 的基础序列
         temp_mask_base = temp_anchor.new_tensor(range(queue_length, 0, -1)).view(1, 1, queue_length)
-        # =================================================================
-        # 🎯 核心修复：消除 Boolean Expand 报错
-        # 1. 把参与比较的张量强制转为 Float
         temp_mask_base_float = temp_mask_base.to(torch.float32)
         period_float = period.unsqueeze(-1).to(torch.float32)
-        
-        # 2. 用减法完成广播操作（Float 的 Expand 是完全合法且安全的）
-        # 此时 diff 的形状已经自动广播为对齐的 [B, N, Q]
         diff = temp_mask_base_float - period_float
-        
-        # 3. 在形状已经完全对齐的张量上做 > 0 判断，此时绝不会产生 Boolean Expand！
         temp_mask = diff > 0
-        # =================================================================
 
         # 4. 后续网络推理逻辑与原版保持一致
         ego_anchor_embed = anchor_encoder(ego_anchor)
@@ -759,7 +742,6 @@ class MotionPlanningHead(BaseModule):
         temp_mask_flat = temp_mask.flatten(0, 1)
 
         motion_anchor = self.get_motion_anchor(det_classification_sigmoid, det_anchors)
-        # plan_anchor = torch.tile(self.plan_anchor[None], (bs, 1, 1, 1, 1))
         plan_anchor = self.plan_anchor[None].repeat(bs, 1, 1, 1, 1)
 
         motion_mode_query = self.motion_anchor_encoder(gen_sineembed_for_position(motion_anchor[..., -1, :]))
@@ -811,23 +793,20 @@ class MotionPlanningHead(BaseModule):
                 planning_prediction.append(p_reg)
                 planning_status.append(p_status)
         
-        # =========================================================================
-        # 【关键修复】：复现原生 cache_planning 将 GNN 输出特征覆盖到队列末尾的行为！
-        # =========================================================================
         new_history_ego_feature_cache = new_history_ego_feature.clone()
         new_history_ego_feature_cache[:, :, -1, :] = instance_feature[:, num_anchor:]
 
-        # 组装外部维护所需的状态供下次输入
+        # 5. 组装缓存供外部流水线维持状态
         next_states = {
             "history_instance_feature": new_history_feature,
             "history_anchor": new_history_anchor,
             "history_period": new_period.to(torch.int32),
             "prev_instance_id": det_instance_id.to(torch.int32),
             "prev_confidence": det_confidence,
-            "history_ego_feature": new_history_ego_feature_cache, # <-- 更新为Refine后的特征
+            "history_ego_feature": new_history_ego_feature_cache, 
             "history_ego_anchor": new_history_ego_anchor,
             "history_ego_period": new_ego_period.to(torch.int32),
-            "prev_ego_status": planning_status[-1] # <-- 原封不动保持 [bs, 1, 10] 避免广播出错
+            "prev_ego_status": planning_status[-1] 
         }
 
         return (

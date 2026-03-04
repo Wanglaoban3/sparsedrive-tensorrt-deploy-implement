@@ -56,13 +56,13 @@ class SparseDriveONNXWrapper(nn.Module):
         for feat in x:
             _, C_feat, H_feat, W_feat = feat.shape
             feature_maps.append(feat.reshape(B, N, C_feat, H_feat, W_feat))
+
+        # 💡 提取 Ego Feature Map 供下游 Motion 模块使用
+        # 取最高分辨率的特征图，取自第一组（相机组），切片拿到自车特征
+        ego_feature_map = feature_maps[-1][:, 0].contiguous()
             
         # 2. 格式化特征图 (触发 DAF 插件优化)
         formatted_feature_maps = feature_maps_format(feature_maps)
-        
-        # 💡 提取 Ego Feature Map 供下游 Motion 模块使用
-        # 取最高分辨率的特征图，取自第一组（相机组），切片拿到自车特征
-        ego_feature_map = formatted_feature_maps[0][-1][:, 0]
         
         # 构造 Meta 信息
         img_metas = [{'lidar2img': projection_mat[i], 'img_shape': [(H, W)] * N} for i in range(B)]
