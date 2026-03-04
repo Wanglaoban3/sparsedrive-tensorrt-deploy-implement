@@ -686,10 +686,9 @@ class MotionPlanningHead(BaseModule):
             
             new_ego_period = det_instance_id.new_ones((bs, 1)).to(torch.int32)
         else:
-            # Ego status 更新
-            mask = mask.to(prev_ego_status.device)
-            prev_ego_status_masked = torch.where(mask[:, None, None], prev_ego_status, prev_ego_status.new_zeros(prev_ego_status.shape))
-            prev_ego_status_masked = torch.where(mask[:, None, None], prev_ego_status, torch.zeros_like(prev_ego_status))
+            # Ego status 更新 (TRT-friendly Float multiplication)
+            mask_float = mask.to(prev_ego_status.dtype)
+            prev_ego_status_masked = prev_ego_status * mask_float[:, None, None]
             ego_anchor[..., VY] = prev_ego_status_masked[..., 6]
             
             # 投影历史 Anchor
@@ -704,14 +703,15 @@ class MotionPlanningHead(BaseModule):
             
             # ID 匹配与历史特征对齐
             match = det_instance_id.unsqueeze(-1) == prev_instance_id.unsqueeze(1) # [B, N, N_prev]
+            match_float = match.to(history_instance_feature.dtype)
+            
             if self.instance_queue.tracking_threshold > 0:
                 track_mask = prev_confidence > self.instance_queue.tracking_threshold
-                # 🎯 修复1: BOOL 与 BOOL 的运算必须用逻辑与 `&`
-                match = match & track_mask.unsqueeze(1) 
+                track_mask_float = track_mask.to(match_float.dtype)
+                # TRT-friendly: 用浮点数相乘代替 Boolean broadcast AND
+                match_float = match_float * track_mask_float.unsqueeze(1) 
                 
-            # 🎯 修复2: 掩码在与数值张量相乘前，强制转换为数值类型 (规避 BOOL * FLOAT 隐式转换报错)
-            match_float = match.to(history_instance_feature.dtype)
-            match_long = match.to(history_period.dtype)
+            match_long = match_float.to(history_period.dtype)
 
             matched_history_feature = (match_float.unsqueeze(-1).unsqueeze(-1) * history_instance_feature.unsqueeze(1)).sum(dim=2) 
             matched_history_anchor = (match_float.unsqueeze(-1).unsqueeze(-1) * history_anchor.unsqueeze(1)).sum(dim=2) 
@@ -722,7 +722,9 @@ class MotionPlanningHead(BaseModule):
             new_history_anchor = torch.cat([matched_history_anchor[:, :, 1:, :], det_anchors.unsqueeze(2)], dim=2)
             new_period = torch.clamp(matched_period + 1, 0, queue_length)
             
-            curr_history_ego_period = torch.where(mask[:, None], history_ego_period, torch.zeros_like(history_ego_period))
+            # TRT-friendly Int multiplication
+            mask_int = mask.to(history_ego_period.dtype)
+            curr_history_ego_period = history_ego_period * mask_int[:, None]
             new_history_ego_feature = torch.cat([history_ego_feature[:, :, 1:, :], ego_feature.unsqueeze(2)], dim=2)
             new_history_ego_anchor = torch.cat([history_ego_anchor[:, :, 1:, :], ego_anchor.unsqueeze(2)], dim=2)
             new_ego_period = torch.clamp(curr_history_ego_period + 1, 0, queue_length)
@@ -735,9 +737,19 @@ class MotionPlanningHead(BaseModule):
         num_agent = temp_anchor.shape[1]
         # 构造一个 [1, 1, Q] 的基础序列
         temp_mask_base = temp_anchor.new_tensor(range(queue_length, 0, -1)).view(1, 1, queue_length)
-        # period 的形状是 [B, N]，unsqueeze 后是 [B, N, 1]
-        # [1, 1, Q] 与 [B, N, 1] 比较，会自动广播成 [B, N, Q]
-        temp_mask = temp_mask_base > period.unsqueeze(-1)
+        # =================================================================
+        # 🎯 核心修复：消除 Boolean Expand 报错
+        # 1. 把参与比较的张量强制转为 Float
+        temp_mask_base_float = temp_mask_base.to(torch.float32)
+        period_float = period.unsqueeze(-1).to(torch.float32)
+        
+        # 2. 用减法完成广播操作（Float 的 Expand 是完全合法且安全的）
+        # 此时 diff 的形状已经自动广播为对齐的 [B, N, Q]
+        diff = temp_mask_base_float - period_float
+        
+        # 3. 在形状已经完全对齐的张量上做 > 0 判断，此时绝不会产生 Boolean Expand！
+        temp_mask = diff > 0
+        # =================================================================
 
         # 4. 后续网络推理逻辑与原版保持一致
         ego_anchor_embed = anchor_encoder(ego_anchor)

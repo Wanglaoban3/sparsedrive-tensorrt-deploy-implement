@@ -428,7 +428,7 @@ model = dict(
                 ]
             ),
             temp_graph_model=dict(
-                type="MultiheadAttention",
+                type="MultiheadFlashAttention",
                 embed_dims=embed_dims if not decouple_attn_motion else embed_dims * 2,
                 num_heads=num_groups,
                 batch_first=True,

@@ -575,6 +575,9 @@ class Sparse4DHead(BaseModule):
         instance_t_matrix: torch.Tensor,
         time_interval: torch.Tensor = None, 
         prev_confidence: torch.Tensor = None,
+        # 🎯 新增 Tracking 专用历史变量
+        prev_instance_id: torch.Tensor = None,
+        prev_id_count: torch.Tensor = None,
         metas: dict = None,
     ):
         if isinstance(feature_maps, torch.Tensor):
@@ -588,7 +591,7 @@ class Sparse4DHead(BaseModule):
         anchor = self.instance_bank.anchor.unsqueeze(0).repeat(batch_size, 1, 1).to(device)
         anchor_embed = self.anchor_encoder(anchor)
 
-        # 2. 时间差处理与场景重置判定 (完全使用你验证通过的版本)
+        # 2. 时间差处理与场景重置判定
         if time_interval is not None:
             raw_dt = time_interval.view(batch_size)
         else:
@@ -614,7 +617,6 @@ class Sparse4DHead(BaseModule):
             
             # ================= 分支路由：Det 头 vs Map 头 =================
             if self.task_prefix == 'det':
-                # 完全还原你的 Det 逻辑，绝不更改一个字！
                 xyz = prev_anchor[..., :3].to(dtype)
                 rest = prev_anchor[..., 3:].to(dtype)
                 vel = rest[..., 5:8]
@@ -646,21 +648,12 @@ class Sparse4DHead(BaseModule):
                 current_prev_anchor = torch.cat([xyz_final, rest_new], dim=-1)
 
             elif self.task_prefix == 'map':
-                # 嵌入刚刚验证通过的纯 2D 手工投影逻辑
                 bs_map, num_anchor_map, dims_map = prev_anchor.shape
-                
-                # 使用 reshape 解决显存不连续问题
                 pts = prev_anchor.to(dtype).reshape(bs_map, -1, 2)
-                
-                # 提取 2x2 旋转矩阵和 2D 平移向量
                 R_2x2 = instance_t_matrix[:, :2, :2].to(dtype).unsqueeze(1) # [bs, 1, 2, 2]
                 t_2 = instance_t_matrix[:, :2, 3].to(dtype).unsqueeze(1)    # [bs, 1, 2]
-                
-                # 2D 矩阵相乘
                 pts_rotated = torch.matmul(R_2x2, pts.unsqueeze(-1)).squeeze(-1)
                 pts_final = pts_rotated + t_2
-                
-                # 还原形状
                 current_prev_anchor = pts_final.reshape(bs_map, num_anchor_map, dims_map)
                 
             else:
@@ -738,19 +731,69 @@ class Sparse4DHead(BaseModule):
         if prev_confidence is not None and is_valid_history.any():
             decayed_conf = prev_confidence.to(dtype) * self.instance_bank.confidence_decay
             confidence[:, :num_temp] = torch.maximum(decayed_conf, confidence[:, :num_temp])
-        
-        next_conf_vals, (next_instance_feature, next_anchor) = topk(
-            confidence, num_temp, instance_feature, last_pred
-        )
+            
+        # ==============================================================================
+        # 🚀 极其关键的更新：TRT 友好版 Instance ID 分配逻辑
+        # ==============================================================================
+        if self.with_instance_id:
+            B, N = confidence.shape
+            
+            # 1. 默认置为 -1
+            instance_id = torch.full((B, N), -1, dtype=torch.int32, device=device)
+            
+            # 2. 继承历史帧保留下来的有效 ID
+            if prev_instance_id is not None and is_valid_history.any():
+                num_prev = prev_instance_id.shape[1]
+                instance_id[:, :num_prev] = prev_instance_id.to(torch.int32)
+                
+            # 3. 筛选需要分配新 ID 的框
+            score_thresh = self.decoder.score_threshold
+            new_id_mask = (instance_id < 0) & (confidence >= score_thresh)
+            
+            if prev_id_count is None:
+                prev_id_count = instance_id.new_zeros((B, 1))
+                
+            # 4. TRT 魔法：利用 cumsum 无动态维度生成自增 ID！
+            # 例如: mask=[F, T, T, F, T] -> cumsum=[0, 1, 2, 2, 3] -> offsets 保证递增
+            new_id_offsets = new_id_mask.to(torch.int32).cumsum(dim=1)
+            new_ids = prev_id_count + new_id_offsets - 1
+            
+            # 5. 安全填入 (不使用 where indexing)
+            instance_id = torch.where(new_id_mask, new_ids, instance_id)
+            
+            # 6. 结算本帧一共发了多少新 ID，留给下一帧用
+            next_id_count = prev_id_count + new_id_mask.to(torch.int32).sum(dim=1, keepdim=True)
+            
+            # 7. 一并将 instance_id 加入 topk 队列滑动！
+            next_conf_vals, (next_instance_feature, next_anchor, next_instance_id) = topk(
+                confidence, num_temp, instance_feature, last_pred, instance_id.unsqueeze(-1)
+            )
+            next_instance_id = next_instance_id.squeeze(-1).to(torch.int32)
 
-        return {
-            "cls_scores": last_cls,
-            "bbox_preds": last_pred,
-            "quality": last_qt, 
-            "next_instance_feature": next_instance_feature,
-            "next_anchor": next_anchor, 
-            "next_confidence": next_conf_vals
-        }
+            return {
+                "cls_scores": last_cls,
+                "bbox_preds": last_pred,
+                "quality": last_qt, 
+                "instance_id": instance_id,              # 给 Motion 的 det_instance_id
+                "next_instance_feature": next_instance_feature,
+                "next_anchor": next_anchor, 
+                "next_confidence": next_conf_vals,
+                "next_instance_id": next_instance_id,    # 下一帧的 prev_instance_id
+                "next_id_count": next_id_count           # 下一帧的 prev_id_count
+            }
+        else:
+            # Map 等不需要跟踪 ID 的 Head 走这里
+            next_conf_vals, (next_instance_feature, next_anchor) = topk(
+                confidence, num_temp, instance_feature, last_pred
+            )
+            return {
+                "cls_scores": last_cls,
+                "bbox_preds": last_pred,
+                "quality": last_qt, 
+                "next_instance_feature": next_instance_feature,
+                "next_anchor": next_anchor, 
+                "next_confidence": next_conf_vals
+            }
     
     def forward_debug(self, feature_maps: Union[torch.Tensor, List], metas: dict):
         if isinstance(feature_maps, torch.Tensor):
