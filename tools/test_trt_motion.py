@@ -238,9 +238,8 @@ def trt_cascade_engine_test(model,
             # 🛠️ 桥接官方后处理
             # ==============================================================
             # Det 加上防崩溃噪声
-            det_cls_safe = torch.clamp(trt_outs_perc['det_cls'].float() + torch.rand_like(trt_outs_perc['det_cls'].float()) * 1e-6, 0.0, 1.0)
             model_outs_det = {
-                "classification": [det_cls_safe],
+                "classification": [trt_outs_perc['det_cls'].float()],  # 🎯 移除噪声，使用原始 Logits
                 "prediction": [trt_outs_perc['det_bbox'].float()],
                 "quality": [None],    
                 "instance_id": trt_outs_perc['det_instance_id']
@@ -255,22 +254,37 @@ def trt_cascade_engine_test(model,
             }
             decoded_map_res = map_head.post_process(model_outs_map)
 
-            model_outs_motion = {
-                "motion_classification": [trt_outs_mo['motion_cls'].float()],
-                "motion_prediction": [trt_outs_mo['motion_reg'].float()],
-                "planning_classification": [trt_outs_mo['plan_cls'].float()],
-                "planning_prediction": [trt_outs_mo['plan_reg'].float()],
-                "planning_status": [trt_outs_mo['plan_status'].float()]
+            motion_output = {
+                "classification": [trt_outs_mo['motion_cls'].float()],
+                "prediction": [trt_outs_mo['motion_reg'].float()],
+                # 照搬你的参考代码：补齐 period 和 unbind 拆解后的 anchor_queue
+                "period": trt_outs_mo['next_mo_history_period'],
+                "anchor_queue": list(trt_outs_mo['next_mo_history_anchor'].float().unbind(dim=2))
             }
             
-            try:
-                decoded_mo_res = motion_head.post_process(model_outs_motion, decoded_det_res)
-            except TypeError:
-                decoded_mo_res = motion_head.post_process(model_outs_motion)
+            planning_output = {
+                "classification": [trt_outs_mo['plan_cls'].float()],
+                "prediction": [trt_outs_mo['plan_reg'].float()],
+                "status": [trt_outs_mo['plan_status'].float()],
+                # 照搬你的参考代码：补齐 period 和 unbind 拆解后的 anchor_queue
+                "period": trt_outs_mo['next_mo_history_ego_period'],
+                "anchor_queue": list(trt_outs_mo['next_mo_history_ego_anchor'].float().unbind(dim=2))
+            }
+            
+            # 执行原生后处理
+            decoded_mo_res = motion_head.post_process(
+                model_outs_det, 
+                motion_output, 
+                planning_output, 
+                scattered_data
+            )
 
+            motion_res_list, planning_res_list = decoded_mo_res
+            
             merged_res = decoded_det_res[0].copy()
             merged_res.update(decoded_map_res[0])
-            merged_res.update(decoded_mo_res[0])
+            merged_res.update(motion_res_list[0])
+            merged_res.update(planning_res_list[0])
             
             result = {
                 'img_bbox': merged_res, 

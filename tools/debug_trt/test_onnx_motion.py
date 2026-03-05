@@ -183,8 +183,8 @@ def main():
 
     # 强制所有任务开启
     if hasattr(cfg, 'task_config'):
-        cfg.task_config['with_det'] = True
-        cfg.task_config['with_map'] = True
+        cfg.task_config['with_det'] = False
+        cfg.task_config['with_map'] = False
         cfg.task_config['with_motion_plan'] = True
         if 'head' in cfg.model:
             cfg.model.head.task_config = cfg.task_config
@@ -245,8 +245,8 @@ def main():
     
     # 正常调用 single_gpu_test，它内部会自动调用我们绑定的 custom_simple_test
     print("\n🚀 [Start ONNX-Forward Evaluation]...\n")
-    # outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
-    outputs = mmcv.load("results.pkl")
+    outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
+    # outputs = mmcv.load("results.pkl")
     # 评估与结果输出
     if args.out and not args.out.endswith(".pkl_only_eval"):
         print(f"\nwriting results to {args.out}")

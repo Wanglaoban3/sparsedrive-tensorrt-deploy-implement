@@ -45,24 +45,14 @@ class SparseDriveONNXWrapper(nn.Module):
         instance_t_matrix = instance_t_matrix.to(dev)
         time_interval = time_interval.to(dev)
 
-        # 1. 特征提取 (共享 Backbone 和 Neck)
         B, N, C, H, W = img.shape
-        img_reshaped = img.reshape(B * N, C, H, W)
-        x = self.model.img_backbone(img_reshaped)
-        if self.model.img_neck is not None:
-            x = self.model.img_neck(x)
-            
-        feature_maps = []
-        for feat in x:
-            _, C_feat, H_feat, W_feat = feat.shape
-            feature_maps.append(feat.reshape(B, N, C_feat, H_feat, W_feat))
-
-        # 💡 提取 Ego Feature Map 供下游 Motion 模块使用
-        # 取最高分辨率的特征图，取自第一组（相机组），切片拿到自车特征
-        ego_feature_map = feature_maps[-1][:, 0].contiguous()
-            
-        # 2. 格式化特征图 (触发 DAF 插件优化)
-        formatted_feature_maps = feature_maps_format(feature_maps)
+        
+        # 1. 提取特征图 (直接调用原生方法，绝不漏掉任何内部的 Embedding 逻辑！)
+        formatted_feature_maps = self.model.extract_feat(img)
+        
+        # 2. 提取完美的 Ego Feature (使用你优化过的 inverse=True 拆解)
+        feature_maps_inv = feature_maps_format(formatted_feature_maps, inverse=True)
+        ego_feature_map = feature_maps_inv[0][-1][:, 0].contiguous()
         
         # 构造 Meta 信息
         img_metas = [{'lidar2img': projection_mat[i], 'img_shape': [(H, W)] * N} for i in range(B)]

@@ -650,7 +650,6 @@ class MotionPlanningHead(BaseModule):
     ):
         bs, num_anchor, dim = det_instance_feature.shape
         queue_length = self.instance_queue.queue_length
-        VY = 6
         
         # 1. Det & Map TopK
         det_confidence = det_classification_sigmoid.max(dim=-1).values

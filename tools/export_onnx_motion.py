@@ -136,7 +136,7 @@ def main():
     device = 'cuda'
     dim = 256
     Q = model.head.motion_plan_head.instance_queue.queue_length
-    num_det_queue = model.head.motion_plan_head.num_det # 600
+    num_det_queue = 900
 
     # =========================================================================
     # 🎯 准备输入张量 (对齐 900, 100, 8x22 金标准)
