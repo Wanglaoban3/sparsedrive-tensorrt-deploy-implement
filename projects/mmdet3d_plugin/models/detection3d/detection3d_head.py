@@ -270,6 +270,18 @@ class Sparse4DHead(BaseModule):
         else:
             temp_anchor_embed = None
 
+        if getattr(self, 'debug_mode', False):
+            self.debug_native_inputs = {
+                "instance_feature": instance_feature.clone() if instance_feature is not None else None,
+                "anchor": anchor.clone() if anchor is not None else None,
+                "anchor_embed": anchor_embed.clone() if anchor_embed is not None else None,
+                "temp_instance_feature": temp_instance_feature.clone() if temp_instance_feature is not None else None,
+                "temp_anchor": temp_anchor.clone() if temp_anchor is not None else None,
+                "temp_anchor_embed": temp_anchor_embed.clone() if temp_anchor_embed is not None else None,
+                "time_interval": time_interval.clone() if time_interval is not None else None,
+            }
+        # ============================
+
         prediction = []
         classification = []
         quality = []
@@ -668,6 +680,18 @@ class Sparse4DHead(BaseModule):
             
             cached_anchor = current_prev_anchor
             temp_anchor_embed = self.anchor_encoder(current_prev_anchor)
+        
+        if getattr(self, 'debug_mode', False):
+            self.debug_onnx_inputs = {
+                "instance_feature": instance_feature.clone() if instance_feature is not None else None,
+                "anchor": anchor.clone() if anchor is not None else None,
+                "anchor_embed": anchor_embed.clone() if anchor_embed is not None else None,
+                "temp_instance_feature": temp_instance_feature.clone() if temp_instance_feature is not None else None,
+                "temp_anchor": cached_anchor.clone() if 'cached_anchor' in locals() and cached_anchor is not None else None,
+                "temp_anchor_embed": temp_anchor_embed.clone() if temp_anchor_embed is not None else None,
+                "time_interval": dt_for_refine.clone() if 'dt_for_refine' in locals() else None,
+            }
+        # ============================
 
         # 4. Transformer 层迭代
         prediction, classification, quality = [], [], []

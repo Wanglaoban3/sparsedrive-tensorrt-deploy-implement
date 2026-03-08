@@ -34,26 +34,21 @@ def build_engine(onnx_file_path, engine_file_path, plugin_path, fp16=False, verb
     if hasattr(config, 'builder_optimization_level'):
         config.builder_optimization_level = 1
 
-    # =========================================================================
-    # 🛡️🛡️🛡️ 核心修复：白名单策略禁用 Myelin 🛡️🛡️🛡️
-    # =========================================================================
     print(f"Detected TensorRT Version: {trt.__version__}")
-    print("Applying Tactic Source Allow-list (Safe Mode)...")
+    print("Enabling tactic sources and allowing Myelin for graph fusion...")
     try:
-        safe_sources = 0
-        if "CUBLAS" in trt.TacticSource.__members__:
-            safe_sources |= 1 << int(trt.TacticSource.CUBLAS)
-        if "CUBLAS_LT" in trt.TacticSource.__members__:
-            safe_sources |= 1 << int(trt.TacticSource.CUBLAS_LT)
-        if "CUDNN" in trt.TacticSource.__members__:
-            safe_sources |= 1 << int(trt.TacticSource.CUDNN)
-        if "EDGE_MASK_CONVOLUTIONS" in trt.TacticSource.__members__:
-             safe_sources |= 1 << int(trt.TacticSource.EDGE_MASK_CONVOLUTIONS)
-
-        config.set_tactic_sources(safe_sources)
+        # 获取 TensorRT 默认开启的所有 Tactic（默认包含 Myelin, CUBLAS, CUDNN 等）
+        tactic_sources = config.get_tactic_sources()
+        
+        # 如果你之前遇到过特定引擎崩溃（比如 JIT_CONVOLUTIONS），仅在这里使用黑名单剔除
+        # 对应你之前 onnx2trt.sh 里的 --tacticSources=-JIT_CONVOLUTIONS
+        if "JIT_CONVOLUTIONS" in trt.TacticSource.__members__:
+            tactic_sources &= ~(1 << int(trt.TacticSource.JIT_CONVOLUTIONS))
+            print("Disabled JIT_CONVOLUTIONS via blocklist.")
+            
+        config.set_tactic_sources(tactic_sources)
     except Exception as e:
         print(f"Warning: Failed to set tactic sources: {e}")
-    # =========================================================================
 
     # 5. 配置显存 (8GB)
     try:

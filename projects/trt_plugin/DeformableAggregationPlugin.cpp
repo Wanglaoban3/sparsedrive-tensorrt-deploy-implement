@@ -4,11 +4,12 @@
 
 // 声明 CUDA Kernel 启动函数
 extern "C" void DeformableAggregationLauncher(
-    const float* mc_ms_feat, const int* spatial_shape, const int* scale_start_index,
-    const float* sample_location, const float* weights, float* output,
+    const void* mc_ms_feat, const int* spatial_shape, const int* scale_start_index,
+    const void* sample_location, const void* weights, void* output,
     int batch_size, int num_cams, int num_feat, int num_embeds,
     int num_scale, int num_anchors, int num_pts, int num_groups,
-    bool is_cam_shared, // <--- 新增标志位
+    bool is_cam_shared, 
+    bool is_fp16,
     cudaStream_t stream
 );
 
@@ -31,19 +32,21 @@ DimsExprs DeformableAggregationPlugin::getOutputDimensions(int outputIndex, cons
     return output;
 }
 
+// ⬇️ 修复：这里应该是 supportsFormatCombination，你之前写成了 enqueue
 bool DeformableAggregationPlugin::supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept {
-    // 0: feat(float), 1: shape(int), 2: start(int), 3: loc(float), 4: weight(float), 5: output(float)
     if (pos == 1 || pos == 2) {
         return inOut[pos].type == DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
     }
-    return inOut[pos].type == DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
+    // 允许 FLOAT 和 HALF (FP16)，并要求所有浮点张量精度一致
+    return (inOut[pos].type == DataType::kFLOAT || inOut[pos].type == DataType::kHALF) && 
+           inOut[pos].format == TensorFormat::kLINEAR &&
+           inOut[pos].type == inOut[0].type;
 }
 
 void DeformableAggregationPlugin::configurePlugin(const DynamicPluginTensorDesc* in, int nbInputs, const DynamicPluginTensorDesc* out, int nbOutputs) noexcept {}
 
+// 真正的 enqueue 方法
 int DeformableAggregationPlugin::enqueue(const PluginTensorDesc* inputDesc, const PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept {
-    
-    // --- 核心修复 1: 从后往前动态解析维度，彻底免疫 TRT 的 Squeeze 操作 ---
     
     // mc_ms_feat: [B, num_feat, num_embeds] 
     int dims0 = inputDesc[0].dims.nbDims;
@@ -66,24 +69,27 @@ int DeformableAggregationPlugin::enqueue(const PluginTensorDesc* inputDesc, cons
     int num_groups = inputDesc[4].dims.d[dims4 - 1];
     if (num_groups <= 0) num_groups = 1;
 
-    // --- 核心修复 2: 探测 spatial_shape 是否在相机维度上被常量折叠 ---
     int start_index_vol = 1;
     for(int i = 0; i < inputDesc[2].dims.nbDims; ++i) {
         start_index_vol *= inputDesc[2].dims.d[i];
     }
-    // 如果总元素个数等于 num_scale，说明6个相机合并共用了一份 offset
     bool is_cam_shared = (start_index_vol == num_scale);
 
-    size_t output_size = batch_size * num_anchors * num_embeds * sizeof(float);
+    // 探测当前处于 FP16 还是 FP32 模式
+    bool is_fp16 = (inputDesc[0].type == DataType::kHALF);
+    size_t type_size = is_fp16 ? 2 : 4; 
+    size_t output_size = batch_size * num_anchors * num_embeds * type_size;
+    
     cudaMemsetAsync(outputs[0], 0, output_size, stream);
 
     DeformableAggregationLauncher(
-        (const float*)inputs[0], (const int*)inputs[1], (const int*)inputs[2],
-        (const float*)inputs[3], (const float*)inputs[4],
-        (float*)outputs[0],
+        inputs[0], (const int*)inputs[1], (const int*)inputs[2],
+        inputs[3], inputs[4],
+        outputs[0],
         batch_size, num_cams, num_feat, num_embeds,
         num_scale, num_anchors, num_pts, num_groups,
-        is_cam_shared, // 传给 CUDA Kernel
+        is_cam_shared, 
+        is_fp16,
         stream
     );
 
@@ -94,7 +100,6 @@ int DeformableAggregationPlugin::enqueue(const PluginTensorDesc* inputDesc, cons
 DeformableAggregationPluginCreator::DeformableAggregationPluginCreator() {
     mFC.nbFields = 0;
     mFC.fields = nullptr;
-    // [修改点] 将 "SparseDrive" 改为 ""
     mNamespace = ""; 
 }
 

@@ -13,9 +13,13 @@ public:
     // IPluginV2DynamicExt 方法
     int getNbOutputs() const noexcept override { return 1; }
     DimsExprs getOutputDimensions(int outputIndex, const DimsExprs* inputs, int nbInputs, IExprBuilder& exprBuilder) noexcept override;
+    
+    // ⬇️ 修复：删除了这里的 DeformableAggregationPlugin:: 前缀
     bool supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept override;
     void configurePlugin(const DynamicPluginTensorDesc* in, int nbInputs, const DynamicPluginTensorDesc* out, int nbOutputs) noexcept override;
     size_t getWorkspaceSize(const PluginTensorDesc* inputs, int nbInputs, const PluginTensorDesc* outputs, int nbOutputs) const noexcept override { return 0; }
+    
+    // ⬇️ 修复：删除了这里的 DeformableAggregationPlugin:: 前缀
     int enqueue(const PluginTensorDesc* inputDesc, const PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
 
     // IPluginV2 方法
