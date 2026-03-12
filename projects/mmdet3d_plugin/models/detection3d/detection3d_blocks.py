@@ -86,28 +86,72 @@ class SparseBox3DKeyPointsGenerator(BaseModule):
         super(SparseBox3DKeyPointsGenerator, self).__init__()
         self.embed_dims, self.num_learnable_pts = embed_dims, num_learnable_pts
         if fix_scale is None: fix_scale = ((0.0, 0.0, 0.0),)
-        self.fix_scale = nn.Parameter(torch.tensor(fix_scale), requires_grad=False)
+        
+        # 🎯 [核心修复]：把 Parameter(requires_grad=False) 改为 register_buffer
+        # 这样能保证它跟着模型一起老老实实呆在 CUDA 上，且能被 ONNX 正确识别为常数
+        self.register_buffer('fix_scale', torch.tensor(fix_scale, dtype=torch.float32))
+        
         self.num_pts = len(self.fix_scale) + num_learnable_pts
         if num_learnable_pts > 0:
             self.learnable_fc = Linear(self.embed_dims, num_learnable_pts * 3)
 
+    # def forward(self, anchor, instance_feature=None, **kwargs):
+    #     bs, num_anchor = anchor.shape[:2]
+    #     size = anchor[..., None, [W, L, H]].exp()
+    #     key_points = self.fix_scale * size
+    #     if self.num_learnable_pts > 0 and instance_feature is not None:
+    #         learnable_scale = (self.learnable_fc(instance_feature).reshape(bs, num_anchor, self.num_learnable_pts, 3).sigmoid() - 0.5)
+    #         key_points = torch.cat([key_points, learnable_scale * size], dim=-2)
+    #     cos_y, sin_y = anchor[:, :, COS_YAW], anchor[:, :, SIN_YAW]
+    #     zeros, ones = torch.zeros_like(cos_y), torch.ones_like(cos_y)
+    #     row1 = torch.stack([cos_y, -sin_y, zeros], dim=-1)
+    #     row2 = torch.stack([sin_y, cos_y, zeros], dim=-1)
+    #     row3 = torch.stack([zeros, zeros, ones], dim=-1)
+    #     rotation_mat = torch.stack([row1, row2, row3], dim=-2)
+    #     rotated_point = torch.matmul(rotation_mat[:, :, None], key_points[..., None])
+    #     center = anchor[..., [X, Y, Z]][:, :, None, :, None]
+    #     key_points = rotated_point + center
+    #     return key_points[..., 0]
     def forward(self, anchor, instance_feature=None, **kwargs):
         bs, num_anchor = anchor.shape[:2]
+        
+        # 1. 保持基础的缩放生成逻辑
         size = anchor[..., None, [W, L, H]].exp()
         key_points = self.fix_scale * size
+        
         if self.num_learnable_pts > 0 and instance_feature is not None:
             learnable_scale = (self.learnable_fc(instance_feature).reshape(bs, num_anchor, self.num_learnable_pts, 3).sigmoid() - 0.5)
             key_points = torch.cat([key_points, learnable_scale * size], dim=-2)
-        cos_y, sin_y = anchor[:, :, COS_YAW], anchor[:, :, SIN_YAW]
-        zeros, ones = torch.zeros_like(cos_y), torch.ones_like(cos_y)
-        row1 = torch.stack([cos_y, -sin_y, zeros], dim=-1)
-        row2 = torch.stack([sin_y, cos_y, zeros], dim=-1)
-        row3 = torch.stack([zeros, zeros, ones], dim=-1)
-        rotation_mat = torch.stack([row1, row2, row3], dim=-2)
-        rotated_point = torch.matmul(rotation_mat[:, :, None], key_points[..., None])
-        center = anchor[..., [X, Y, Z]][:, :, None, :, None]
+            
+        # =================================================================
+        # 🔥 核心优化：代数展开，消灭 torch.stack 拼接和矩阵乘法
+        # =================================================================
+        # 提取偏航角的 cos 和 sin，并增加一个维度以适配广播 [B, Q, 1]
+        cos_y = anchor[..., COS_YAW].unsqueeze(-1)
+        sin_y = anchor[..., SIN_YAW].unsqueeze(-1)
+        
+        # 提取关键点的 x, y, z 坐标，形状为 [B, Q, Pt]
+        x = key_points[..., 0]
+        y = key_points[..., 1]
+        z = key_points[..., 2]
+        
+        # 纯逐元素算术运算，TensorRT 会 100% 将它们融合成一个极其快速的单 Kernel！
+        x_rot = x * cos_y - y * sin_y
+        y_rot = x * sin_y + y * cos_y
+        z_rot = z
+        
+        # 仅在最后一步打包回 [B, Q, Pt, 3]
+        rotated_point = torch.stack([x_rot, y_rot, z_rot], dim=-1)
+        
+        # 提取中心点并调整形状为 [B, Q, 1, 3]
+        center = anchor[..., [X, Y, Z]].unsqueeze(-2)
+        
+        # 加上中心点坐标
         key_points = rotated_point + center
-        return key_points[..., 0]
+        
+        # 注意：原代码因为使用了 matmul 并在末尾加了 [..., None]，所以最后有一步 key_points[..., 0] 的降维。
+        # 我们这里用纯代数算完直接就是天然的 [B, Q, Pt, 3]，不需要再切片降维了，直接 return 即可。
+        return key_points
 
     @staticmethod
     def anchor_projection(anchor, T_src2dst_list, time_intervals=None, **kwargs):

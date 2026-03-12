@@ -1,141 +1,198 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <vector>
-#include <cstdio>
+#include <cstdint>
+#include <type_traits>
 
-template <typename T>
-__device__ float bilinear_sampling_fp32(
-    const T *bottom_data, const int &height, const int &width,
-    const int &num_embeds, const float &h_im, const float &w_im,
-    const int &base_ptr
-) {
-    const int h_low = floorf(h_im);
-    const int w_low = floorf(w_im);
-    const int h_high = h_low + 1;
-    const int w_high = w_low + 1;
+#define DIVUP(m, n) ((m + n - 1) / n)
 
-    const float lh = h_im - (float)h_low;
-    const float lw = w_im - (float)w_low;
-    const float hh = 1.0f - lh;
-    const float hw = 1.0f - lw;
+// =========================================================================
+// 🎯 原子加万能补丁 (支持 float 和 __half)
+// =========================================================================
+__device__ __forceinline__ void dfa_atomicAdd(float* addr, float val) { atomicAdd(addr, val); }
 
-    int stride = num_embeds;
-    int w_stride = width * stride;
-
-    float v1 = 0.0f, v2 = 0.0f, v3 = 0.0f, v4 = 0.0f;
-
-    if (h_low >= 0 && w_low >= 0 && h_low < height && w_low < width)
-        v1 = static_cast<float>(bottom_data[base_ptr + h_low * w_stride + w_low * stride]);
-        
-    if (h_low >= 0 && w_high >= 0 && h_low < height && w_high < width)
-        v2 = static_cast<float>(bottom_data[base_ptr + h_low * w_stride + w_high * stride]);
-
-    if (h_high >= 0 && w_low >= 0 && h_high < height && w_low < width)
-        v3 = static_cast<float>(bottom_data[base_ptr + h_high * w_stride + w_low * stride]);
-
-    if (h_high >= 0 && w_high >= 0 && h_high < height && w_high < width)
-        v4 = static_cast<float>(bottom_data[base_ptr + h_high * w_stride + w_high * stride]);
-
-    return (hh * hw) * v1 + (hh * lw) * v2 + (lh * hw) * v3 + (lh * lw) * v4;
+__device__ __forceinline__ void dfa_atomicAdd(__half* addr, __half val) {
+#if __CUDA_ARCH__ >= 700
+    atomicAdd(addr, val);
+#else
+    unsigned int *addr_as_ui = (unsigned int *)((char *)addr - ((size_t)addr & 2));
+    unsigned int old = *addr_as_ui;
+    unsigned int assumed;
+    do {
+        assumed = old;
+        unsigned short h_raw = (size_t)addr & 2 ? (old >> 16) : (old & 0xFFFF);
+        __half h_val = *reinterpret_cast<__half*>(&h_raw);
+        __half h_sum = __hadd(h_val, val);
+        unsigned short res_raw = *reinterpret_cast<unsigned short*>(&h_sum);
+        unsigned int new_val = (size_t)addr & 2 ? (old & 0xFFFF) | (res_raw << 16) : (old & 0xFFFF0000) | res_raw;
+        old = atomicCAS(addr_as_ui, assumed, new_val);
+    } while (assumed != old);
+#endif
 }
 
-template <typename T>
-__global__ void deformable_aggregation_forward_kernel(
-    const int num_outputs,
-    const T* mc_ms_feat,
-    const int* spatial_shape,
-    const int* scale_start_index,
-    const T* sample_location,
-    const T* weights,
-    T* output,
+// =========================================================================
+// 1. Map 专用：点并行 + 原子加 (解决 300 点不对齐问题)
+// =========================================================================
+template<typename T>
+__global__ void dfa_atomic_kernel(
+    const T* __restrict__ mc_ms_feat, const int* __restrict__ spatial_shape,
+    const int* __restrict__ scale_start_index, const T* __restrict__ sample_location,
+    const T* __restrict__ weights, T* __restrict__ output,
     int batch_size, int num_cams, int num_feat, int num_embeds,
-    int num_scale, int num_anchors, int num_pts, int num_groups,
-    bool is_cam_shared
-) {
-    // 采用 Thread-per-Output，彻底消灭 atomicAdd
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_outputs) return;
+    int num_scale, int num_anchors, int num_pts, int num_groups, bool is_cam_shared) {
+    
+    // 一个线程处理一个向量 (8个通道)，并行在所有点上
+    int num_vec = num_embeds / 8;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= batch_size * num_anchors * num_pts * num_vec) return;
 
-    int channel_index = idx % num_embeds;
-    int anchor_index = (idx / num_embeds) % num_anchors;
-    int batch_index = idx / (num_embeds * num_anchors);
+    // 索引映射
+    int v_idx = tid % num_vec;
+    int p_idx = (tid / num_vec) % num_pts;
+    int a_idx = (tid / (num_vec * num_pts)) % num_anchors;
+    int b_idx = tid / (num_vec * num_pts * num_anchors);
+    
+    int c_start = v_idx * 8;
+    int g_idx = c_start / (num_embeds / num_groups);
+    int real_a_idx = b_idx * num_anchors + a_idx;
 
-    int real_anchor_index = batch_index * num_anchors + anchor_index;
-    int group_index = channel_index / (num_embeds / num_groups);
+    float fres[8] = {0.0f};
 
-    float out_val = 0.0f;
+    for (int cam = 0; cam < num_cams; ++cam) {
+        int loc_ptr = ((real_a_idx * num_pts + p_idx) * num_cams + cam) << 1;
+        float lw = (float)sample_location[loc_ptr], lh = (float)sample_location[loc_ptr + 1];
+        if (lw <= -0.5f || lw >= 1.5f || lh <= -0.5f || lh >= 1.5f) continue;
 
-    for (int pts_index = 0; pts_index < num_pts; ++pts_index) {
-        for (int cam_index = 0; cam_index < num_cams; ++cam_index) {
-            
-            int loc_offset = ((real_anchor_index * num_pts + pts_index) * num_cams + cam_index) << 1;
-            float loc_w = static_cast<float>(sample_location[loc_offset]);
-            float loc_h = static_cast<float>(sample_location[loc_offset + 1]);
+        int cam_off = is_cam_shared ? (cam * (num_feat / num_cams)) : 0;
+        int w_base = (((real_a_idx * num_pts + p_idx) * num_cams + cam) * num_scale) * num_groups;
 
-            if (loc_w <= -0.5f || loc_w >= 1.5f || loc_h <= -0.5f || loc_h >= 1.5f) continue;
+        for (int s = 0; s < num_scale; ++s) {
+            int s_idx = is_cam_shared ? s : (cam * num_scale + s);
+            int h = spatial_shape[s_idx << 1], w = spatial_shape[(s_idx << 1) + 1];
+            float weight = (float)weights[w_base + s * num_groups + g_idx];
+            const T* f_ptr = mc_ms_feat + (static_cast<size_t>(b_idx * num_feat + cam_off + scale_start_index[s_idx]) * num_embeds) + c_start;
 
-            int cam_offset = is_cam_shared ? (cam_index * (num_feat / num_cams)) : 0;
+            float py = lh * h - 0.5f, px = lw * w - 0.5f;
+            int yl = floorf(py), xl = floorf(px);
+            float dy = py - yl, dx = px - xl;
+            float w00 = (1.0f-dy)*(1.0f-dx), w01 = (1.0f-dy)*dx, w10 = dy*(1.0f-dx), w11 = dy*dx;
 
-            for (int scale_index = 0; scale_index < num_scale; ++scale_index) {
-                
-                int shape_index = is_cam_shared ? scale_index : (cam_index * num_scale + scale_index);
-                int current_start_index = scale_start_index[shape_index];
-                
-                int value_offset = (batch_index * num_feat + cam_offset + current_start_index) * num_embeds + channel_index;
-                int shape_idx_2d = shape_index << 1;
-                int h = spatial_shape[shape_idx_2d];
-                int w = spatial_shape[shape_idx_2d + 1];
-
-                if (h <= 0 || w <= 0 || h > num_feat || w > num_feat) continue;
-
-                int weight_offset = ((((batch_index * num_anchors + anchor_index) * num_pts + pts_index) * num_cams + cam_index) * num_scale + scale_index) * num_groups + group_index;
-                float weight = static_cast<float>(weights[weight_offset]);
-
-                float h_im = loc_h * h - 0.5f;
-                float w_im = loc_w * w - 0.5f;
-
-                out_val += bilinear_sampling_fp32<T>(mc_ms_feat, h, w, num_embeds, h_im, w_im, value_offset) * weight;
+            #pragma unroll
+            for(int i=0; i<8; ++i) {
+                float v00=0, v01=0, v10=0, v11=0;
+                if (yl>=0 && xl>=0 && yl<h && xl<w) v00 = (float)f_ptr[yl*w*num_embeds + xl*num_embeds + i];
+                if (yl>=0 && xl+1<w && yl<h && xl+1>=0) v01 = (float)f_ptr[yl*w*num_embeds + (xl+1)*num_embeds + i];
+                if (yl+1<h && xl>=0 && yl+1>=0 && xl<w) v10 = (float)f_ptr[(yl+1)*w*num_embeds + xl*num_embeds + i];
+                if (yl+1<h && xl+1<w && yl+1>=0 && xl+1>=0) v11 = (float)f_ptr[(yl+1)*w*num_embeds + (xl+1)*num_embeds + i];
+                fres[i] += (w00*v00 + w01*v01 + w10*v10 + w11*v11) * weight;
             }
         }
     }
-    // 全局只执行一次显存写入
-    output[idx] = static_cast<T>(out_val);
+
+    T* out_ptr = output + (static_cast<size_t>(b_idx * num_anchors + a_idx) * num_embeds) + c_start;
+    #pragma unroll
+    for(int i=0; i<8; ++i) { dfa_atomicAdd(out_ptr + i, (T)fres[i]); }
 }
 
+// =========================================================================
+// 2. Det 专用：高带宽向量化读取 (针对 13 Pts 场景)
+// =========================================================================
+template<typename T>
+__global__ void dfa_vector_kernel(
+    const T* __restrict__ mc_ms_feat, const int* __restrict__ spatial_shape,
+    const int* __restrict__ scale_start_index, const T* __restrict__ sample_location,
+    const T* __restrict__ weights, T* __restrict__ output,
+    int batch_size, int num_cams, int num_feat, int num_embeds,
+    int num_scale, int num_anchors, int num_pts, int num_groups, bool is_cam_shared) {
+    
+    int num_vec = num_embeds / 8;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= batch_size * num_anchors * num_vec) return;
+
+    int v_idx = tid % num_vec;
+    int a_idx = (tid / num_vec) % num_anchors;
+    int b_idx = tid / (num_vec * num_anchors);
+    int real_a_idx = b_idx * num_anchors + a_idx;
+    int c_start = v_idx * 8;
+    int g_idx = c_start / (num_embeds / num_groups);
+
+    float fres[8] = {0.0f};
+
+    for (int p = 0; p < num_pts; ++p) {
+        for (int cam = 0; cam < num_cams; ++cam) {
+            int loc_ptr = ((real_a_idx * num_pts + p) * num_cams + cam) << 1;
+            float lw = (float)sample_location[loc_ptr], lh = (float)sample_location[loc_ptr+1];
+            if (lw <= -0.5f || lw >= 1.5f || lh <= -0.5f || lh >= 1.5f) continue;
+            
+            int cam_off = is_cam_shared ? (cam * (num_feat / num_cams)) : 0;
+            int w_base = (((real_a_idx * num_pts + p) * num_cams + cam) * num_scale) * num_groups;
+
+            for (int s = 0; s < num_scale; ++s) {
+                int s_idx = is_cam_shared ? s : (cam * num_scale + s);
+                int h = spatial_shape[s_idx << 1], w = spatial_shape[(s_idx << 1) + 1];
+                float weight = (float)weights[w_base + s * num_groups + g_idx];
+                const T* f_ptr = mc_ms_feat + (static_cast<size_t>(b_idx * num_feat + cam_off + scale_start_index[s_idx]) * num_embeds) + c_start;
+
+                float py = lh * h - 0.5f, px = lw * w - 0.5f;
+                int yl = floorf(py), xl = floorf(px);
+                float dy = py - yl, dx = px - xl;
+
+                #pragma unroll
+                for(int i=0; i<8; ++i) {
+                    float v00=0, v01=0, v10=0, v11=0;
+                    if (yl>=0 && xl>=0 && yl<h && xl<w) v00 = (float)f_ptr[yl*w*num_embeds + xl*num_embeds + i];
+                    if (yl>=0 && xl+1<w && yl<h && xl+1>=0) v01 = (float)f_ptr[yl*w*num_embeds + (xl+1)*num_embeds + i];
+                    if (yl+1<h && xl>=0 && yl+1>=0 && xl<w) v10 = (float)f_ptr[(yl+1)*w*num_embeds + xl*num_embeds + i];
+                    if (yl+1<h && xl+1<w && yl+1>=0 && xl+1>=0) v11 = (float)f_ptr[(yl+1)*w*num_embeds + (xl+1)*num_embeds + i];
+                    fres[i] += ((1.f-dy)*(1.f-dx)*v00 + (1.f-dy)*dx*v01 + dy*(1.f-dx)*v10 + dy*dx*v11) * weight;
+                }
+            }
+        }
+    }
+    T* out_ptr = output + (static_cast<size_t>(tid) * 8);
+    #pragma unroll
+    for(int i=0; i<8; ++i) { out_ptr[i] = (T)fres[i]; }
+}
+
+// =========================================================================
+// 3. Launcher: 智能选择 Kernel
+// =========================================================================
 extern "C" void DeformableAggregationLauncher(
     const void* mc_ms_feat, const int* spatial_shape, const int* scale_start_index,
     const void* sample_location, const void* weights, void* output,
     int batch_size, int num_cams, int num_feat, int num_embeds,
     int num_scale, int num_anchors, int num_pts, int num_groups,
-    bool is_cam_shared,
-    bool is_fp16,
-    cudaStream_t stream
-) {
-    const int num_outputs = batch_size * num_anchors * num_embeds;
-    if (num_outputs <= 0) return;
-    
-    dim3 threads(256);
-    dim3 blocks((num_outputs + threads.x - 1) / threads.x);
+    bool is_cam_shared, bool is_fp16, cudaStream_t stream) 
+{
+    size_t out_bytes = batch_size * num_anchors * num_embeds * (is_fp16 ? 2 : 4);
+    cudaMemsetAsync(output, 0, out_bytes, stream);
+
+    // 🎯 核心逻辑：分流。如果是 Map 头(pts=300)，原子版更快；Det 头(pts=13)，向量版更快。
+    bool use_atomic = (num_pts > 64);
 
     if (is_fp16) {
-        deformable_aggregation_forward_kernel<__half><<<blocks, threads, 0, stream>>>(
-            num_outputs,
-            (const __half*)mc_ms_feat, spatial_shape, scale_start_index,
-            (const __half*)sample_location, (const __half*)weights,
-            (__half*)output,
-            batch_size, num_cams, num_feat, num_embeds,
-            num_scale, num_anchors, num_pts, num_groups,
-            is_cam_shared
-        );
+        if (use_atomic) {
+            int threads = batch_size * num_anchors * num_pts * (num_embeds / 8);
+            dfa_atomic_kernel<__half><<<DIVUP(threads, 256), 256, 0, stream>>>(
+                (const __half*)mc_ms_feat, spatial_shape, scale_start_index, (const __half*)sample_location, (const __half*)weights,
+                (__half*)output, batch_size, num_cams, num_feat, num_embeds, num_scale, num_anchors, num_pts, num_groups, is_cam_shared);
+        } else {
+            int threads = batch_size * num_anchors * (num_embeds / 8);
+            dfa_vector_kernel<__half><<<DIVUP(threads, 256), 256, 0, stream>>>(
+                (const __half*)mc_ms_feat, spatial_shape, scale_start_index, (const __half*)sample_location, (const __half*)weights,
+                (__half*)output, batch_size, num_cams, num_feat, num_embeds, num_scale, num_anchors, num_pts, num_groups, is_cam_shared);
+        }
     } else {
-        deformable_aggregation_forward_kernel<float><<<blocks, threads, 0, stream>>>(
-            num_outputs,
-            (const float*)mc_ms_feat, spatial_shape, scale_start_index,
-            (const float*)sample_location, (const float*)weights,
-            (float*)output,
-            batch_size, num_cams, num_feat, num_embeds,
-            num_scale, num_anchors, num_pts, num_groups,
-            is_cam_shared
-        );
+        // 🎯 即使 TensorRT 把这一层 Fallback 成了 FP32，我们依然有加速逻辑！
+        if (use_atomic) {
+            int threads = batch_size * num_anchors * num_pts * (num_embeds / 8);
+            dfa_atomic_kernel<float><<<DIVUP(threads, 256), 256, 0, stream>>>(
+                (const float*)mc_ms_feat, spatial_shape, scale_start_index, (const float*)sample_location, (const float*)weights,
+                (float*)output, batch_size, num_cams, num_feat, num_embeds, num_scale, num_anchors, num_pts, num_groups, is_cam_shared);
+        } else {
+            int threads = batch_size * num_anchors * (num_embeds / 8);
+            dfa_vector_kernel<float><<<DIVUP(threads, 256), 256, 0, stream>>>(
+                (const float*)mc_ms_feat, spatial_shape, scale_start_index, (const float*)sample_location, (const float*)weights,
+                (float*)output, batch_size, num_cams, num_feat, num_embeds, num_scale, num_anchors, num_pts, num_groups, is_cam_shared);
+        }
     }
 }

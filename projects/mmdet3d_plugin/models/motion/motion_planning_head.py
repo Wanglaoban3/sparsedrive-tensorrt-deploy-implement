@@ -639,34 +639,38 @@ class MotionPlanningHead(BaseModule):
         # === 外部维护的历史张量状态 ===
         T_temp2cur=None,            # [B, 4, 4]
         history_instance_feature=None, 
-        history_anchor=None,           
-        history_period=None,           
-        prev_instance_id=None,         
+        history_anchor=None,          
+        history_period=None,          
+        prev_instance_id=None,        
         prev_confidence=None,          
         history_ego_feature=None,      
         history_ego_anchor=None,       
         history_ego_period=None,       
-        prev_ego_status=None           
+        prev_ego_status=None          
     ):
         bs, num_anchor, dim = det_instance_feature.shape
         queue_length = self.instance_queue.queue_length
         
         # 1. Det & Map TopK
+        # (确保你在文件顶部定义了 trt_friendly_topk)
         det_confidence = det_classification_sigmoid.max(dim=-1).values
-        _, (instance_feature_selected, anchor_embed_selected) = topk(
+        _, res_det = topk(
             det_confidence, self.num_det, det_instance_feature, det_anchor_embed
         )
+        instance_feature_selected, anchor_embed_selected = res_det
+        
         map_confidence = map_classification_sigmoid.max(dim=-1).values
-        _, (map_instance_feature_selected, map_anchor_embed_selected) = topk(
+        _, res_map = topk(
             map_confidence, self.num_map, map_instance_feature, map_anchor_embed
         )
+        map_instance_feature_selected, map_anchor_embed_selected = res_map
 
         # 2. Ego 特征初始化
         ego_feature = self.instance_queue.ego_feature_encoder(ego_feature_map)
         ego_feature = ego_feature.unsqueeze(1).squeeze(-1).squeeze(-1) # [B, 1, dim]
         ego_anchor = self.instance_queue.ego_anchor[None].repeat(bs, 1, 1) # [B, 1, 11]
 
-        # 3. 手动实现 instance_queue.get() 逻辑 (完全使用你跑通的代码2)
+        # 3. 历史队列时序匹配与更新
         if is_first_frame:
             new_history_feature = det_instance_feature.new_zeros((bs, num_anchor, queue_length, dim))
             new_history_feature[:, :, -1, :] = det_instance_feature
@@ -684,11 +688,22 @@ class MotionPlanningHead(BaseModule):
             
             new_ego_period = det_instance_id.new_ones((bs, 1)).to(torch.int32)
         else:
-            mask_float = mask.to(prev_ego_status.dtype)
-            prev_ego_status_masked = prev_ego_status * mask_float[:, None, None]
-            ego_anchor[..., VY] = prev_ego_status_masked[..., 6]
+            # ==========================================================
+            # 🚀 优化 1：彻底消灭 ScatterND，用拆分拼接替代 in-place 赋值
+            # ==========================================================
+            mask_float = mask.to(prev_ego_status.dtype).view(-1, 1, 1)
+            prev_ego_status_masked = prev_ego_status * mask_float
+            vy_val = prev_ego_status_masked[..., 6:7]  # [B, 1, 1]
             
+            ego_anchor_pre = ego_anchor[..., :VY]
+            ego_anchor_post = ego_anchor[..., VY+1:]
+            ego_anchor = torch.cat([ego_anchor_pre, vy_val, ego_anchor_post], dim=-1)
+            
+            # ==========================================================
+            # 🚀 优化 2：坐标系转换 
+            # ==========================================================
             B, N, Q, _ = history_anchor.shape
+            
             flat_history_anchor = history_anchor.view(B, N * Q, 11)
             flat_history_anchor = anchor_handler.anchor_projection(flat_history_anchor, [T_temp2cur])[0]
             history_anchor = flat_history_anchor.view(B, N, Q, 11)
@@ -697,43 +712,67 @@ class MotionPlanningHead(BaseModule):
             flat_ego_anchor = anchor_handler.anchor_projection(flat_ego_anchor, [T_temp2cur])[0]
             history_ego_anchor = flat_ego_anchor.view(B, 1, Q, 11)
             
-            # 完全沿用你正确的匹配逻辑
+            # ==========================================================
+            # 🚀 优化 3：极纯粹的 BMM 匹配，杜绝 5GB 广播！
+            # ==========================================================
             match = det_instance_id.unsqueeze(-1) == prev_instance_id.unsqueeze(1) 
-            match_float = match.to(history_instance_feature.dtype)
+            match_float = match.to(history_instance_feature.dtype) # [B, N, N]
             
             if self.instance_queue.tracking_threshold > 0:
                 track_mask = prev_confidence > self.instance_queue.tracking_threshold
                 track_mask_float = track_mask.to(match_float.dtype)
                 match_float = match_float * track_mask_float.unsqueeze(1) 
-                
-            match_long = match_float.to(history_period.dtype)
 
-            matched_history_feature = (match_float.unsqueeze(-1).unsqueeze(-1) * history_instance_feature.unsqueeze(1)).sum(dim=2) 
-            matched_history_anchor = (match_float.unsqueeze(-1).unsqueeze(-1) * history_anchor.unsqueeze(1)).sum(dim=2) 
-            matched_period = (match_long * history_period.unsqueeze(1)).sum(dim=2)
+            dim_f = history_instance_feature.shape[-1]
+            dim_a = history_anchor.shape[-1]
             
-            new_history_feature = torch.cat([matched_history_feature[:, :, 1:, :], det_instance_feature.unsqueeze(2)], dim=2)
-            new_history_anchor = torch.cat([matched_history_anchor[:, :, 1:, :], det_anchors.unsqueeze(2)], dim=2)
+            matched_history_feature = torch.matmul(
+                match_float, history_instance_feature.view(B, N, Q * dim_f)
+            ).view(B, N, Q, dim_f)
+            
+            matched_history_anchor = torch.matmul(
+                match_float, history_anchor.view(B, N, Q * dim_a)
+            ).view(B, N, Q, dim_a)
+            
+            matched_period = torch.matmul(
+                match_float, history_period.to(match_float.dtype).unsqueeze(-1)
+            ).squeeze(-1).to(history_period.dtype)
+            
+            # ==========================================================
+            # 🚀 优化 4：用 Roll (环形队列) 替代全量 Slice+Concat
+            # ==========================================================
+            new_history_feature = torch.roll(matched_history_feature, shifts=-1, dims=2)
+            new_history_feature[:, :, -1, :] = det_instance_feature
+            
+            new_history_anchor = torch.roll(matched_history_anchor, shifts=-1, dims=2)
+            new_history_anchor[:, :, -1, :] = det_anchors
+            
             new_period = torch.clamp(matched_period + 1, 0, queue_length)
             
-            mask_int = mask.to(history_ego_period.dtype)
-            curr_history_ego_period = history_ego_period * mask_int[:, None]
-            new_history_ego_feature = torch.cat([history_ego_feature[:, :, 1:, :], ego_feature.unsqueeze(2)], dim=2)
-            new_history_ego_anchor = torch.cat([history_ego_anchor[:, :, 1:, :], ego_anchor.unsqueeze(2)], dim=2)
+            mask_int = mask.to(history_ego_period.dtype).view(-1, 1)
+            curr_history_ego_period = history_ego_period * mask_int
+            
+            new_history_ego_feature = torch.roll(history_ego_feature, shifts=-1, dims=2)
+            new_history_ego_feature[:, :, -1, :] = ego_feature
+            
+            new_history_ego_anchor = torch.roll(history_ego_anchor, shifts=-1, dims=2)
+            new_history_ego_anchor[:, :, -1, :] = ego_anchor
+            
             new_ego_period = torch.clamp(curr_history_ego_period + 1, 0, queue_length)
 
+        # 联合张量合并
         temp_instance_feature = torch.cat([new_history_feature, new_history_ego_feature], dim=1) 
         temp_anchor = torch.cat([new_history_anchor, new_history_ego_anchor], dim=1) 
         period = torch.cat([new_period, new_ego_period], dim=1) 
         
-        num_agent = temp_anchor.shape[1]
-        temp_mask_base = temp_anchor.new_tensor(range(queue_length, 0, -1)).view(1, 1, queue_length)
-        temp_mask_base_float = temp_mask_base.to(torch.float32)
+        # 🚀 优化 5：用 torch.arange 替换动态 new_tensor
+        temp_mask_base_float = torch.arange(
+            queue_length, 0, -1, dtype=torch.float32, device=temp_anchor.device
+        ).view(1, 1, queue_length)
         period_float = period.unsqueeze(-1).to(torch.float32)
-        diff = temp_mask_base_float - period_float
-        temp_mask = diff > 0
+        temp_mask = (temp_mask_base_float - period_float) > 0
 
-        # 4. 后续网络推理逻辑与原版保持一致
+        # 4. 后续网络推理逻辑
         ego_anchor_embed = anchor_encoder(ego_anchor)
         temp_anchor_embed = anchor_encoder(temp_anchor)
         temp_instance_feature_flat = temp_instance_feature.flatten(0, 1)
@@ -743,6 +782,7 @@ class MotionPlanningHead(BaseModule):
         motion_anchor = self.get_motion_anchor(det_classification_sigmoid, det_anchors)
         plan_anchor = self.plan_anchor[None].repeat(bs, 1, 1, 1, 1)
 
+        # 此处 gen_sineembed_for_position 需要用之前提供给你的无切片极速版本
         motion_mode_query = self.motion_anchor_encoder(gen_sineembed_for_position(motion_anchor[..., -1, :]))
         plan_pos = gen_sineembed_for_position(plan_anchor[..., -1, :])
         plan_mode_query = self.plan_anchor_encoder(plan_pos).flatten(1, 2).unsqueeze(1)

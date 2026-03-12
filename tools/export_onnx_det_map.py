@@ -91,16 +91,18 @@ class SparseDriveONNXWrapper(nn.Module):
 
         # 5. 合并导出所有的输出节点 (Det + Map + Ego + Bridge Features)
         return (
-            det_outs["cls_scores"], det_outs["bbox_preds"], 
-            det_outs["instance_feature"], det_outs["anchor_embed"], det_outs["instance_id"], # 桥接给 Motion 的张量
+            # 👇 核心修改 1：加上 det_outs["quality"]
+            det_outs["cls_scores"], det_outs["bbox_preds"], det_outs["quality"],
+            det_outs["instance_feature"], det_outs["anchor_embed"], det_outs["instance_id"], 
             det_outs["next_instance_feature"], det_outs["next_anchor"], det_outs["next_confidence"],
-            det_outs["next_instance_id"], det_outs["next_id_count"], # 桥接给下一帧的 Tracking 状态
+            det_outs["next_instance_id"], det_outs["next_id_count"], 
             
+            # 👇 核心修改 2：加上 map_outs["quality"]
             map_outs["cls_scores"], map_outs["bbox_preds"],
-            map_outs["instance_feature"], map_outs["anchor_embed"], # 桥接给 Motion 的张量
+            map_outs["instance_feature"], map_outs["anchor_embed"], 
             map_outs["next_instance_feature"], map_outs["next_anchor"], map_outs["next_confidence"],
             
-            ego_feature_map # 桥接给 Motion 的张量
+            ego_feature_map 
         )
 
 def simplify_onnx(model_path):
@@ -165,17 +167,17 @@ def main():
 
     input_names = [
         'img', 'projection_mat', 
-        'prev_det_feat', 'prev_det_anchor', 'prev_det_conf', 'prev_det_id', 'prev_id_count', # 🎯 新增 ID
+        'prev_det_feat', 'prev_det_anchor', 'prev_det_conf', 'prev_det_id', 'prev_id_count', 
         'prev_map_feat', 'prev_map_anchor', 'prev_map_conf',
         'instance_t_matrix', 'time_interval'
     ]
     
-    # 🎯 极其严格匹配流水线需要的名字
+    # 👇 核心修改 3：添加 'det_quality' 和 'map_quality' 到输出名字列表
     output_names = [
-        'det_cls', 'det_bbox', 
+        'det_cls', 'det_bbox', 'det_quality',
         'det_instance_feature', 'det_anchor_embed', 'det_instance_id',
         'next_det_feat', 'next_det_anchor', 'next_det_conf', 'next_det_instance_id', 'next_id_count',
-        'map_cls', 'map_pts',  
+        'map_cls', 'map_pts',
         'map_instance_feature', 'map_anchor_embed',
         'next_map_feat', 'next_map_anchor', 'next_map_conf',
         'ego_feature_map'
@@ -190,7 +192,6 @@ def main():
     det_feat_zeros = torch.zeros(batch_size, num_det_history, embed_dims, device=device)
     det_anchor_zeros = torch.zeros(batch_size, num_det_history, 11, device=device)
     det_conf_zeros = torch.zeros(batch_size, num_det_history, device=device)
-    # 首帧的 ID 输入必须是 -1
     det_id_zeros = torch.full((batch_size, num_det_history), -1, dtype=torch.int32, device=device)
     det_id_count_zeros = torch.zeros((batch_size, 1), dtype=torch.int32, device=device)
 
@@ -209,7 +210,7 @@ def main():
             input_names=input_names,
             output_names=output_names,
             opset_version=13,
-            do_constant_folding=False,
+            do_constant_folding=True,
         )
     simplify_onnx(out_first)
     print("🎉 First-Frame Export finished!")
@@ -240,7 +241,7 @@ def main():
             input_names=input_names,
             output_names=output_names,
             opset_version=13,
-            do_constant_folding=False,
+            do_constant_folding=True,
         )
     simplify_onnx(args.out)
     print("🎉 Temporal Export finished!")

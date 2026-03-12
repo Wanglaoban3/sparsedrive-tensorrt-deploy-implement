@@ -4,13 +4,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.cuda.amp.autocast_mode import autocast
-from torch.nn import Linear
 
-# [FIX] 补全丢失的 mmcv 工具函数导入
-from mmcv.cnn import build_activation_layer, build_norm_layer, constant_init, xavier_init
-from mmcv.cnn.bricks.drop import build_dropout
-from mmcv.runner.base_module import BaseModule, Sequential
+from mmcv.cnn import Linear, build_activation_layer, build_norm_layer
+from mmcv.runner.base_module import Sequential, BaseModule
+from mmcv.cnn.bricks.transformer import FFN
 from mmcv.utils import build_from_cfg
+from mmcv.cnn.bricks.drop import build_dropout
+from mmcv.cnn import xavier_init, constant_init
 from mmcv.cnn.bricks.registry import (
     ATTENTION,
     PLUGIN_LAYERS,
@@ -28,6 +28,7 @@ __all__ = [
     "AsymmetricFFN",
 ]
 
+
 def linear_relu_ln(embed_dims, in_loops, out_loops, input_dims=None):
     if input_dims is None:
         input_dims = embed_dims
@@ -40,7 +41,8 @@ def linear_relu_ln(embed_dims, in_loops, out_loops, input_dims=None):
         layers.append(nn.LayerNorm(embed_dims))
     return layers
 
-@ATTENTION.register_module(force=True)
+
+@ATTENTION.register_module()
 class DeformableFeatureAggregation(BaseModule):
     def __init__(
         self,
@@ -115,49 +117,34 @@ class DeformableFeatureAggregation(BaseModule):
         **kwargs: dict,
     ):
         bs, num_anchor = instance_feature.shape[:2]
-        
-        kps_output = self.kps_generator(anchor, instance_feature)
-        if isinstance(kps_output, tuple):
-            key_points = kps_output[0]
-        else:
-            key_points = kps_output
-            
-        # [Strategy] Break fusion pattern: Weights calculation
+        key_points = self.kps_generator(anchor, instance_feature)
         weights = self._get_weights(instance_feature, anchor_embed, metas)
 
         if self.use_deformable_func:
-            # 1. Project points
-            points_2d_raw = self.project_points(
-                key_points,
-                metas["projection_mat"],
-                metas.get("image_wh"),
+            points_2d = (
+                self.project_points(
+                    key_points,
+                    metas["projection_mat"],
+                    metas.get("image_wh"),
+                )
+                .permute(0, 2, 3, 1, 4)
+                .reshape(bs, num_anchor, self.num_pts, self.num_cams, 2)
             )
-            
-            # [CRITICAL FIX] Break Permute+Reshape fusion in ONNX
-            # Original: permute(0, 2, 3, 1, 4).reshape(...)
-            # New: Explicit contiguous() to force memory re-layout
-            points_2d = points_2d_raw.permute(0, 2, 3, 1, 4).contiguous()
-            points_2d = points_2d.reshape(bs, num_anchor, self.num_pts, self.num_cams, 2)
-            
-            # 2. Process Weights
-            # [CRITICAL FIX] Ensure weights are contiguous before reshape
-            weights = weights.permute(0, 1, 4, 2, 3, 5).contiguous()
-            weights = weights.reshape(
-                bs,
-                num_anchor,
-                self.num_pts,
-                self.num_cams,
-                self.num_levels,
-                self.num_groups,
+            weights = (
+                weights.permute(0, 1, 4, 2, 3, 5)
+                .contiguous()
+                .reshape(
+                    bs,
+                    num_anchor,
+                    self.num_pts,
+                    self.num_cams,
+                    self.num_levels,
+                    self.num_groups,
+                )
             )
-            
-            # 3. Call Plugin
-            features = DAF(*feature_maps, points_2d, weights)
-            features = features.reshape(bs, num_anchor, self.embed_dims)
-            
-            if features.dtype != instance_feature.dtype:
-                features = features.to(instance_feature.dtype)
-
+            features = DAF(*feature_maps, points_2d, weights).reshape(
+                bs, num_anchor, self.embed_dims
+            )
         else:
             features = self.feature_sampling(
                 feature_maps,
@@ -166,10 +153,8 @@ class DeformableFeatureAggregation(BaseModule):
                 metas.get("image_wh"),
             )
             features = self.multi_view_level_fusion(features, weights)
-            features = features.sum(dim=2)
-        
+            features = features.sum(dim=2)  # fuse multi-point features
         output = self.proj_drop(self.output_proj(features))
-        
         if self.residual_mode == "add":
             output = output + instance_feature
         elif self.residual_mode == "cat":
@@ -185,20 +170,23 @@ class DeformableFeatureAggregation(BaseModule):
                     bs, self.num_cams, -1
                 )
             )
-            # [Fix] Broadcasting
-            feature_expanded = feature.unsqueeze(2).expand(-1, -1, self.num_cams, -1)
-            feature = feature_expanded + camera_embed.unsqueeze(1)
+            feature = feature[:, :, None] + camera_embed[:, None]
 
-        # [CRITICAL FIX] Break potential fusion in weight calculation
-        # Simplify the chain: Linear -> Reshape -> Softmax -> Reshape
-        raw_weights = self.weights_fc(feature)
+        # ==========================================================
+        # 🔥 终极优化：消灭跨步 Softmax，转置到连续内存进行极速计算
+        # ==========================================================
+        weights = self.weights_fc(feature).reshape(bs, num_anchor, -1, self.num_groups)
         
-        # Split reshape to avoid fusion
-        weights_view = raw_weights.reshape(bs, num_anchor, -1, self.num_groups)
-        weights_softmax = weights_view.softmax(dim=-2)
+        # 1. 把 num_groups 转置到倒数第二维，把需要做 softmax 的维度 (-1) 暴露到最后！
+        weights = weights.transpose(-1, -2) # shape: [bs, num_anchor, num_groups, -1]
         
-        # Force contiguous before final reshape to protect against Myelin fusion
-        weights = weights_softmax.contiguous().reshape(
+        # 2. 在物理连续的内存 (dim=-1) 上执行极速 Softmax (TRT 会在这里瞬间起飞)
+        weights = weights.softmax(dim=-1)
+        
+        # 3. 再转置回原来的形状
+        weights = weights.transpose(-1, -2) # shape: [bs, num_anchor, -1, num_groups]
+        
+        weights = weights.reshape(
             bs,
             num_anchor,
             self.num_cams,
@@ -206,7 +194,8 @@ class DeformableFeatureAggregation(BaseModule):
             self.num_pts,
             self.num_groups,
         )
-        
+        # ==========================================================
+
         if self.training and self.attn_drop > 0:
             mask = torch.rand(
                 bs, num_anchor, self.num_cams, 1, self.num_pts, 1
@@ -236,15 +225,7 @@ class DeformableFeatureAggregation(BaseModule):
         
         # Robust broadcasting for image_wh
         if image_wh is not None:
-            if image_wh.dim() == 1:
-                w_h = image_wh.view(1, 1, 1, 1, 2)
-                points_2d = points_2d / w_h
-            elif image_wh.dim() == 2:
-                w_h = image_wh.view(bs, 1, 1, 1, 2)
-                points_2d = points_2d / w_h
-            else:
-                points_2d = points_2d / image_wh[:, :, None, None]
-                
+            points_2d = points_2d / image_wh[:, :, None, None]
         return points_2d
 
     @staticmethod
@@ -295,18 +276,29 @@ class DeformableFeatureAggregation(BaseModule):
         )
         return features
 
-@PLUGIN_LAYERS.register_module(force=True)
+
+@PLUGIN_LAYERS.register_module()
 class DenseDepthNet(BaseModule):
-    def __init__(self, embed_dims=256, num_depth_layers=1, equal_focal=100, max_depth=60, loss_weight=1.0):
+    def __init__(
+        self,
+        embed_dims=256,
+        num_depth_layers=1,
+        equal_focal=100,
+        max_depth=60,
+        loss_weight=1.0,
+    ):
         super().__init__()
         self.embed_dims = embed_dims
         self.equal_focal = equal_focal
         self.num_depth_layers = num_depth_layers
         self.max_depth = max_depth
         self.loss_weight = loss_weight
+
         self.depth_layers = nn.ModuleList()
         for i in range(num_depth_layers):
-            self.depth_layers.append(nn.Conv2d(embed_dims, 1, kernel_size=1, stride=1, padding=0))
+            self.depth_layers.append(
+                nn.Conv2d(embed_dims, 1, kernel_size=1, stride=1, padding=0)
+            )
 
     def forward(self, feature_maps, focal=None, gt_depths=None):
         if focal is None:
@@ -325,12 +317,47 @@ class DenseDepthNet(BaseModule):
         return depths
 
     def loss(self, depth_preds, gt_depths):
-        return 0.0 # Simplified
+        loss = 0.0
+        for pred, gt in zip(depth_preds, gt_depths):
+            pred = pred.permute(0, 2, 3, 1).contiguous().reshape(-1)
+            gt = gt.reshape(-1)
+            fg_mask = torch.logical_and(
+                gt > 0.0, torch.logical_not(torch.isnan(pred))
+            )
+            gt = gt[fg_mask]
+            pred = pred[fg_mask]
+            pred = torch.clip(pred, 0.0, self.max_depth)
+            with autocast(enabled=False):
+                error = torch.abs(pred - gt).sum()
+                _loss = (
+                    error
+                    / max(1.0, len(gt) * len(depth_preds))
+                    * self.loss_weight
+                )
+            loss = loss + _loss
+        return loss
 
-@FEEDFORWARD_NETWORK.register_module(force=True)
+
+@FEEDFORWARD_NETWORK.register_module()
 class AsymmetricFFN(BaseModule):
-    def __init__(self, in_channels=None, pre_norm=None, embed_dims=256, feedforward_channels=1024, num_fcs=2, act_cfg=dict(type="ReLU", inplace=True), ffn_drop=0.0, dropout_layer=None, add_identity=True, init_cfg=None, **kwargs):
+    def __init__(
+        self,
+        in_channels=None,
+        pre_norm=None,
+        embed_dims=256,
+        feedforward_channels=1024,
+        num_fcs=2,
+        act_cfg=dict(type="ReLU", inplace=True),
+        ffn_drop=0.0,
+        dropout_layer=None,
+        add_identity=True,
+        init_cfg=None,
+        **kwargs,
+    ):
         super(AsymmetricFFN, self).__init__(init_cfg)
+        assert num_fcs >= 2, (
+            "num_fcs should be no less " f"than 2. got {num_fcs}."
+        )
         self.in_channels = in_channels
         self.pre_norm = pre_norm
         self.embed_dims = embed_dims
@@ -338,21 +365,37 @@ class AsymmetricFFN(BaseModule):
         self.num_fcs = num_fcs
         self.act_cfg = act_cfg
         self.activate = build_activation_layer(act_cfg)
+
         layers = []
         if in_channels is None:
             in_channels = embed_dims
         if pre_norm is not None:
             self.pre_norm = build_norm_layer(pre_norm, in_channels)[1]
+
         for _ in range(num_fcs - 1):
-            layers.append(Sequential(Linear(in_channels, feedforward_channels), self.activate, nn.Dropout(ffn_drop)))
+            layers.append(
+                Sequential(
+                    Linear(in_channels, feedforward_channels),
+                    self.activate,
+                    nn.Dropout(ffn_drop),
+                )
+            )
             in_channels = feedforward_channels
         layers.append(Linear(feedforward_channels, embed_dims))
         layers.append(nn.Dropout(ffn_drop))
         self.layers = Sequential(*layers)
-        self.dropout_layer = build_dropout(dropout_layer) if dropout_layer else torch.nn.Identity()
+        self.dropout_layer = (
+            build_dropout(dropout_layer)
+            if dropout_layer
+            else torch.nn.Identity()
+        )
         self.add_identity = add_identity
         if self.add_identity:
-            self.identity_fc = torch.nn.Identity() if in_channels == embed_dims else Linear(self.in_channels, embed_dims)
+            self.identity_fc = (
+                torch.nn.Identity()
+                if in_channels == embed_dims
+                else Linear(self.in_channels, embed_dims)
+            )
 
     def forward(self, x, identity=None):
         if self.pre_norm is not None:

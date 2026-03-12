@@ -30,6 +30,7 @@ from mmdet.models import build_detector
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from projects.mmdet3d_plugin.apis.test import custom_multi_gpu_test
 from projects.mmdet3d_plugin.ops import feature_maps_format
+import projects.mmdet3d_plugin
 
 # ==============================================================================
 # 💡 核心注入逻辑：使用 forward_onnx 替换原生的 simple_test
@@ -183,8 +184,8 @@ def main():
 
     # 强制所有任务开启
     if hasattr(cfg, 'task_config'):
-        cfg.task_config['with_det'] = False
-        cfg.task_config['with_map'] = False
+        cfg.task_config['with_det'] = True
+        cfg.task_config['with_map'] = True
         cfg.task_config['with_motion_plan'] = True
         if 'head' in cfg.model:
             cfg.model.head.task_config = cfg.task_config
@@ -271,7 +272,7 @@ def main():
         
         # 确保 motion 和 planning 是开启的
         eval_kwargs['eval_mode']['with_motion'] = True
-        eval_kwargs['eval_mode']['with_planning'] = True
+        eval_kwargs['eval_mode']['with_planning'] = False
         
         # 补充必要的阈值，防止触发 KeyError
         if 'motion_threshhold' not in eval_kwargs['eval_mode']:

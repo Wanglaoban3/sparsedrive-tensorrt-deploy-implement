@@ -42,6 +42,29 @@ def topk(confidence, k, *inputs):
         
     return confidence, outputs
 
+def trt_friendly_topk(confidence, k, *tensors):
+    """
+    专为 TensorRT 优化的 TopK 与数据捞取逻辑。
+    使用完全动态的张量维度，避免评估时因写死尺寸导致越界或空输出。
+    """
+    B = confidence.shape[0]
+    N = confidence.shape[1]
+    
+    topk_vals, topk_indices = torch.topk(confidence, k, dim=1)
+    
+    # 动态构建 1D 扁平索引
+    batch_offsets = torch.arange(B, device=confidence.device, dtype=torch.long).unsqueeze(1) * N
+    flat_indices = (topk_indices + batch_offsets).view(-1)
+    
+    res_tensors = []
+    for t in tensors:
+        shape_rest = t.shape[2:]
+        flat_t = t.view(B * N, -1) 
+        gathered_t = flat_t[flat_indices] 
+        res_tensors.append(gathered_t.view(B, k, *shape_rest))
+        
+    return topk_vals, res_tensors
+
 __all__ = ["Sparse4DHead"]
 
 
@@ -752,7 +775,7 @@ class Sparse4DHead(BaseModule):
                     temp_anchor_embed = anchor_embed[:, : self.instance_bank.num_temp_instances]
 
         # ==============================================================================
-        # 5. 生成下一帧缓存 & 外挂 ID 分配系统 (隔离修改区)
+        # 5. 生成下一帧缓存 & 外挂 ID 分配系统 (🔥 TRT 终极动态矩阵融合版)
         # ==============================================================================
         last_cls, last_pred = classification[-1], prediction[-1]
         last_qt = quality[-1]
@@ -764,19 +787,17 @@ class Sparse4DHead(BaseModule):
             decayed_conf = prev_confidence.to(dtype) * self.instance_bank.confidence_decay
             confidence[:, :num_temp] = torch.maximum(decayed_conf, confidence[:, :num_temp])
 
-        # 🚀 极其关键的更新：TRT 友好版 Instance ID 分配逻辑
         if getattr(self, 'with_instance_id', False):
-            B, N = confidence.shape
+            # 获取动态的 B 和 N，绝对不强制转 int
+            B = confidence.shape[0]
+            N = confidence.shape[1]
             
-            # 1. 默认置为 -1
             instance_id = torch.full((B, N), -1, dtype=torch.int32, device=device)
             
-            # 2. 继承历史帧保留下来的有效 ID
             if prev_instance_id is not None and is_valid_history.any():
                 num_prev = prev_instance_id.shape[1]
                 instance_id[:, :num_prev] = prev_instance_id.to(torch.int32)
                 
-            # 3. 🎯 修复 NoneType 报错：安全地筛选需要分配新 ID 的框
             score_thresh = getattr(self.decoder, 'score_threshold', None) if hasattr(self, 'decoder') else None
             if score_thresh is not None:
                 new_id_mask = (instance_id < 0) & (confidence >= score_thresh)
@@ -786,29 +807,48 @@ class Sparse4DHead(BaseModule):
             if prev_id_count is None:
                 prev_id_count = instance_id.new_zeros((B, 1))
                 
-            # 4. TRT 魔法：利用 cumsum 无动态维度生成自增 ID！
-            new_id_offsets = new_id_mask.to(torch.int32).cumsum(dim=1)
+            # =========================================================================
+            # 🔥 神级替换：用“动态上三角矩阵乘法”完美替换串行的 cumsum！
+            # 既保留了 ONNX 动态形状，又完美调用了 3090 的高并发 FP32 算力！
+            # =========================================================================
+            idx = torch.arange(N, device=device)
+            
+            # 行号 <= 列号，利用广播生成上三角全 1 矩阵
+            upper_tri_mat = (idx.unsqueeze(1) <= idx.unsqueeze(0)).to(torch.float32)
+            
+            # 将掩码转为 float32 用于矩阵相乘 (规避 Int 不能 matmul 的报错)
+            mask_float = new_id_mask.to(torch.float32)
+            
+            # [B, 1, N] @ [N, N] -> [B, 1, N] -> squeeze -> [B, N]
+            new_id_offsets = torch.matmul(mask_float.unsqueeze(1), upper_tri_mat).squeeze(1).to(torch.int32)
+            
+            # 生成新 ID
             new_ids = prev_id_count + new_id_offsets - 1
             
-            # 5. 安全填入 (不使用 where indexing)
+            # 安全填入 (保留原汁原味的 where，TRT 处理纯元素级 where 非常快)
             instance_id = torch.where(new_id_mask, new_ids, instance_id)
             
-            # 6. 结算本帧一共发了多少新 ID，留给下一帧用
-            next_id_count = prev_id_count + new_id_mask.to(torch.int32).sum(dim=1, keepdim=True)
+            # 结算本帧一共发了多少新 ID
+            # 最后一个元素天然就是前缀和的总数，直接拿来用，省去一次求和！
+            next_id_count = prev_id_count + new_id_offsets[:, -1:]
             
-            # 7. 一并将 instance_id 加入 topk 队列滑动！
-            next_conf_vals, (next_instance_feature, next_anchor, next_instance_id) = topk(
-                confidence, num_temp, instance_feature, last_pred, instance_id.unsqueeze(-1)
+            # 🎯 扁平化极速 Gather
+            next_conf_vals, gathered_res = trt_friendly_topk(
+                confidence, num_temp, 
+                instance_feature, 
+                last_pred, 
+                instance_id.unsqueeze(-1)
             )
+            next_instance_feature, next_anchor, next_instance_id = gathered_res
             next_instance_id = next_instance_id.view(B, num_temp).to(torch.int32)
 
             return {
                 "cls_scores": last_cls,
                 "bbox_preds": last_pred,
                 "quality": last_qt, 
-                "instance_id": instance_id,              # 给 Motion 的 det_instance_id
-                "instance_feature": instance_feature,    # 🎯 必须加上这行！Motion 需要！
-                "anchor_embed": anchor_embed,            # 🎯 必须加上这行！Motion 需要！
+                "instance_id": instance_id,              
+                "instance_feature": instance_feature,    
+                "anchor_embed": anchor_embed,            
                 "next_instance_feature": next_instance_feature,
                 "next_anchor": next_anchor, 
                 "next_confidence": next_conf_vals,
@@ -817,15 +857,19 @@ class Sparse4DHead(BaseModule):
             }
         else:
             # Map 等不需要跟踪 ID 的 Head 走这里
-            next_conf_vals, (next_instance_feature, next_anchor) = topk(
-                confidence, num_temp, instance_feature, last_pred
+            next_conf_vals, gathered_res = trt_friendly_topk(
+                confidence, num_temp, 
+                instance_feature, 
+                last_pred
             )
+            next_instance_feature, next_anchor = gathered_res
+            
             return {
                 "cls_scores": last_cls,
                 "bbox_preds": last_pred,
                 "quality": last_qt, 
-                "instance_feature": instance_feature,    # 🎯 必须加上这行！Motion 需要！
-                "anchor_embed": anchor_embed,            # 🎯 必须加上这行！Motion 需要！
+                "instance_feature": instance_feature,    
+                "anchor_embed": anchor_embed,            
                 "next_instance_feature": next_instance_feature,
                 "next_anchor": next_anchor, 
                 "next_confidence": next_conf_vals

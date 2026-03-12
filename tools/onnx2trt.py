@@ -81,17 +81,28 @@ def build_engine(onnx_file_path, engine_file_path, plugin_path, fp16=False, verb
         dangerous_keywords = ['Softmax', 'Exp']
 
         fallback_count = 0
+        dfa_fp16_count = 0  # 新增统计
+        
         for i in range(network.num_layers):
             layer = network.get_layer(i)
             layer_name = layer.name
             
+            # 1. 危险算子：强制设为 FP32 护体
             if any(k in layer_name for k in dangerous_keywords):
                 layer.precision = trt.DataType.FLOAT
                 for j in range(layer.num_outputs):
                     layer.set_output_type(j, trt.DataType.FLOAT)
                 fallback_count += 1
                 
-        print(f"✅ Successfully forced {fallback_count} dangerous floating-point layers to FP32.")
+            # 2. 🎯 耗时大户：强制夺回 FP16 运行权！
+            elif layer.type == trt.LayerType.PLUGIN and 'DeformableAggregation' in layer_name:
+                layer.precision = trt.DataType.HALF
+                for j in range(layer.num_outputs):
+                    layer.set_output_type(j, trt.DataType.HALF)
+                dfa_fp16_count += 1
+                
+        print(f"✅ Successfully forced {fallback_count} dangerous layers to FP32.")
+        print(f"🚀 Successfully forced {dfa_fp16_count} DeformableAggregation layers to FP16.")
     # =========================================================================
 
     # 8. 构建

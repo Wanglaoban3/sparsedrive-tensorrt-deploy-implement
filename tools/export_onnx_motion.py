@@ -191,19 +191,19 @@ def main():
     wrapper_first = MotionPlanONNXWrapper(model.head.motion_plan_head, model.head.det_head, is_first_frame=True)
     mask_first = torch.tensor([False], dtype=torch.bool, device=device) # is_first_frame=True 对应 mask 为 False
     
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper_first,
-            (det_instance_feature, det_anchor_embed, det_classification_sigmoid,
-             det_anchors, det_instance_id,
-             map_instance_feature, map_anchor_embed, map_classification_sigmoid,
-             ego_feature_map, instance_t_matrix, mask_first,
-             hist_feat, hist_anc, hist_period, prev_id, prev_conf,
-             hist_ego_feat, hist_ego_anc, hist_ego_period, prev_ego_stat),
-            out_first, input_names=input_names, output_names=output_names, opset_version=13,
-            do_constant_folding=False, # 🎯 核心修复：关掉导致报错的优化器
-        )
-    simplify_onnx(out_first)
+    # with torch.no_grad():
+    #     torch.onnx.export(
+    #         wrapper_first,
+    #         (det_instance_feature, det_anchor_embed, det_classification_sigmoid,
+    #          det_anchors, det_instance_id,
+    #          map_instance_feature, map_anchor_embed, map_classification_sigmoid,
+    #          ego_feature_map, instance_t_matrix, mask_first,
+    #          hist_feat, hist_anc, hist_period, prev_id, prev_conf,
+    #          hist_ego_feat, hist_ego_anc, hist_ego_period, prev_ego_stat),
+    #         out_first, input_names=input_names, output_names=output_names, opset_version=13,
+    #         do_constant_folding=False, # 🎯 核心修复：关掉导致报错的优化器
+    #     )
+    # simplify_onnx(out_first)
 
     # ==========================================================
     # 2️⃣ 导出 TEMPORAL 模型

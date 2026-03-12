@@ -28,8 +28,5 @@ add_library(SparseDrivePlugin SHARED ${SOURCE_FILES})
 # 链接 nvinfer 和 cudart
 target_link_libraries(SparseDrivePlugin nvinfer cudart)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
-
+set(CMAKE_CUDA_ARCHITECTURES 75 80 86)
 set_target_properties(SparseDrivePlugin PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

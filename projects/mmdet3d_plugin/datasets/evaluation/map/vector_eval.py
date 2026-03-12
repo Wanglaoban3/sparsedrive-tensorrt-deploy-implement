@@ -18,7 +18,7 @@ from .AP import instance_match, average_precision
 
 INTERP_NUM = 200 # number of points to interpolate during evaluation
 THRESHOLDS = [0.5, 1.0, 1.5] # AP thresholds
-N_WORKERS = 16 # num workers to parallel
+N_WORKERS = 3 # num workers to parallel
 
 class VectorEvaluate(object):
     """Evaluator for vectorized map.

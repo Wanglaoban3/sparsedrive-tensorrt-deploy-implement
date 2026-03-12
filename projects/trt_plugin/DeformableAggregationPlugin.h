@@ -8,21 +8,17 @@ namespace nvinfer1 {
 class DeformableAggregationPlugin : public IPluginV2DynamicExt {
 public:
     DeformableAggregationPlugin() = default;
-    DeformableAggregationPlugin(const void* data, size_t length); // 反序列化构造
+    DeformableAggregationPlugin(const void* data, size_t length); 
 
-    // IPluginV2DynamicExt 方法
+    // IPluginV2DynamicExt 
     int getNbOutputs() const noexcept override { return 1; }
     DimsExprs getOutputDimensions(int outputIndex, const DimsExprs* inputs, int nbInputs, IExprBuilder& exprBuilder) noexcept override;
-    
-    // ⬇️ 修复：删除了这里的 DeformableAggregationPlugin:: 前缀
     bool supportsFormatCombination(int pos, const PluginTensorDesc* inOut, int nbInputs, int nbOutputs) noexcept override;
     void configurePlugin(const DynamicPluginTensorDesc* in, int nbInputs, const DynamicPluginTensorDesc* out, int nbOutputs) noexcept override;
     size_t getWorkspaceSize(const PluginTensorDesc* inputs, int nbInputs, const PluginTensorDesc* outputs, int nbOutputs) const noexcept override { return 0; }
-    
-    // ⬇️ 修复：删除了这里的 DeformableAggregationPlugin:: 前缀
     int enqueue(const PluginTensorDesc* inputDesc, const PluginTensorDesc* outputDesc, const void* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
 
-    // IPluginV2 方法
+    // IPluginV2 
     const char* getPluginType() const noexcept override { return "DeformableAggregation"; }
     const char* getPluginVersion() const noexcept override { return "1"; }
     void destroy() noexcept override { delete this; }
@@ -55,7 +51,6 @@ public:
 private:
     std::string mNamespace;
     PluginFieldCollection mFC;
-    std::vector<PluginField> mPluginAttributes;
 };
 
 } // namespace nvinfer1

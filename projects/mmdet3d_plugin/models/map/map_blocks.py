@@ -105,11 +105,16 @@ class SparsePoint3DKeyPointsGenerator(BaseModule):
         self.num_sample = num_sample
         self.num_learnable_pts = num_learnable_pts
         self.num_pts = num_sample * len(fix_height) * num_learnable_pts
+        
         if self.num_learnable_pts > 0:
             self.learnable_fc = Linear(self.embed_dims, self.num_pts * 2)
 
-        self.fix_height = np.array(fix_height)
         self.ground_height = ground_height
+        
+        # 🎯 [核心修复与优化 1]：在初始化阶段直接算好所有的 Z 坐标！
+        # 注册为 buffer，它会永远跟模型一起待在正确的 CUDA 设备上，ONNX 导出再也不会设备冲突。
+        z_vals = torch.tensor(fix_height, dtype=torch.float32) + ground_height
+        self.register_buffer('z_vals', z_vals)
 
     def init_weight(self):
         if self.num_learnable_pts > 0:
@@ -125,24 +130,28 @@ class SparsePoint3DKeyPointsGenerator(BaseModule):
     ):
         assert self.num_learnable_pts > 0, 'No learnable pts'
         bs, num_anchor, _ = anchor.shape
-        key_points = anchor.view(bs, num_anchor, self.num_sample, -1)
-        offset = (
-            self.learnable_fc(instance_feature)
-            .reshape(bs, num_anchor, self.num_sample, len(self.fix_height), self.num_learnable_pts, 2)
+        
+        # 1. 提取基础的 X, Y 坐标 [B, Q, num_sample, 2]
+        base_xy = anchor.view(bs, num_anchor, self.num_sample, 2)
+        
+        # 2. 计算学习到的 X, Y 偏移量
+        offset = self.learnable_fc(instance_feature).view(
+            bs, num_anchor, self.num_sample, len(self.z_vals), self.num_learnable_pts, 2
         )        
-        key_points = offset + key_points[..., None, None, :]
-        key_points = torch.cat(
-            [
-                key_points,
-                key_points.new_full(key_points.shape[:-1]+(1,), fill_value=self.ground_height),
-            ],
-            dim=-1,
-        )
-        fix_height = key_points.new_tensor(self.fix_height)
-        height_offset = key_points.new_zeros([len(fix_height), 2])
-        height_offset = torch.cat([height_offset, fix_height[:,None]], dim=-1)
-        key_points = key_points + height_offset[None, None, None, :, None]
-        key_points = key_points.flatten(2, 4)
+        
+        # 3. 叠加偏移量得到最终的 X, Y [B, Q, num_sample, len(fix_height), num_learnable_pts, 2]
+        xy = base_xy[:, :, :, None, None, :] + offset
+        
+        # 🎯 [核心优化 2]：利用广播机制，用 0 开销补齐 Z 轴！
+        # 将我们提前算好的 1D Z坐标扩充维度，然后像拼图一样贴上去
+        z = self.z_vals.view(1, 1, 1, -1, 1, 1).expand_as(xy[..., :1])
+        
+        # 只需要一次极其干净的 cat！
+        key_points = torch.cat([xy, z], dim=-1) # 得到完美的 [..., 3]
+        
+        # 一次性展平，替代原本的 flatten(2, 4)
+        key_points = key_points.view(bs, num_anchor, self.num_pts, 3)
+
         if (
             cur_timestamp is None
             or temp_timestamps is None
@@ -153,23 +162,20 @@ class SparsePoint3DKeyPointsGenerator(BaseModule):
 
         temp_key_points_list = []
         for i, t_time in enumerate(temp_timestamps):
-            temp_key_points = key_points
-            T_cur2temp = T_cur2temp_list[i].to(dtype=key_points.dtype)
-            temp_key_points = (
-                T_cur2temp[:, None, None, :3]
-                @ torch.cat(
-                    [
-                        temp_key_points,
-                        torch.ones_like(temp_key_points[..., :1]),
-                    ],
-                    dim=-1,
-                ).unsqueeze(-1)
-            )
-            temp_key_points = temp_key_points.squeeze(-1)
+            T_cur2temp = T_cur2temp_list[i].to(dtype=key_points.dtype) # [B, 4, 4]
+            
+            # 🎯 [核心优化 3]：消灭猫和老鼠式的 torch.cat(ones_like)
+            # 我们不需要再把 3D 点拼成齐次坐标 [x,y,z,1] 去做 4x4 矩阵乘法了
+            # 把它拆成纯代数的 R * P + T 形式，TensorRT 最爱吃这种计算！
+            R = T_cur2temp[:, :3, :3].unsqueeze(1).unsqueeze(1) # 旋转矩阵 [B, 1, 1, 3, 3]
+            t = T_cur2temp[:, :3, 3].unsqueeze(1).unsqueeze(1)  # 平移向量 [B, 1, 1, 3]
+            
+            # 矩阵广播相乘: key_points @ R^T + t
+            temp_key_points = torch.matmul(key_points, R.transpose(-1, -2)) + t
             temp_key_points_list.append(temp_key_points)
+            
         return key_points, temp_key_points_list
 
-    # @staticmethod
     def anchor_projection(
         self,
         anchor,
@@ -180,20 +186,19 @@ class SparsePoint3DKeyPointsGenerator(BaseModule):
     ):
         dst_anchors = []
         for i in range(len(T_src2dst_list)):
-            dst_anchor = anchor.clone()
             bs, num_anchor, _ = anchor.shape
-            dst_anchor = dst_anchor.reshape(bs, num_anchor, self.num_sample, -1).flatten(1, 2)
-            T_src2dst = torch.unsqueeze(
-                T_src2dst_list[i].to(dtype=anchor.dtype), dim=1
-            )
-
-            dst_anchor = (
-                torch.matmul(
-                    T_src2dst[..., :2, :2], dst_anchor[..., None]
-                ).squeeze(dim=-1)
-                + T_src2dst[..., :2, 3]
-            )
-
-            dst_anchor = dst_anchor.reshape(bs, num_anchor, self.num_sample, -1).flatten(2, 3)
+            dst_anchor = anchor.view(bs, num_anchor, self.num_sample, 2)
+            
+            T_src2dst = T_src2dst_list[i].to(dtype=anchor.dtype) # [B, 4, 4]
+            
+            # 取出 2D 平面的旋转和平移
+            R_2d = T_src2dst[:, :2, :2].unsqueeze(1).unsqueeze(1) # [B, 1, 1, 2, 2]
+            t_2d = T_src2dst[:, :2, 3].unsqueeze(1).unsqueeze(1)  # [B, 1, 1, 2]
+            
+            # 同样使用最纯净的代数计算
+            dst_anchor = torch.matmul(dst_anchor, R_2d.transpose(-1, -2)) + t_2d
+            
+            dst_anchor = dst_anchor.view(bs, num_anchor, self.num_sample * 2)
             dst_anchors.append(dst_anchor)
+            
         return dst_anchors

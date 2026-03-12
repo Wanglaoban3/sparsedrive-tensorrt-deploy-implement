@@ -41,6 +41,9 @@ def pytorch_unified_forward_onnx_test(model, data_loader):
             'prev_instance_feature': torch.zeros((1, nh, 256), dtype=torch.float32, device='cuda'),
             'prev_anchor': torch.zeros((1, nh, dim), dtype=torch.float32, device='cuda'),
             'prev_confidence': torch.zeros((1, nh), dtype=torch.float32, device='cuda'),
+            # 🎯 加上这两个，给 ID 追踪提供初始值
+            'prev_instance_id': torch.full((1, nh), -1, dtype=torch.int32, device='cuda'),
+            'prev_id_count': torch.zeros((1, 1), dtype=torch.int32, device='cuda'),
         }
 
     history_det = get_zero_history(nh_det, dim_det)
@@ -101,17 +104,26 @@ def pytorch_unified_forward_onnx_test(model, data_loader):
                 instance_t_matrix=instance_t_matrix,
                 time_interval=dt_tensor,
                 prev_confidence=history_det['prev_confidence'],
+                # 🎯 传进去！
+                prev_instance_id=history_det.get('prev_instance_id', None),
+                prev_id_count=history_det.get('prev_id_count', None),
                 metas=kwargs
             )
             history_det['prev_instance_feature'] = outs_det['next_instance_feature']
             history_det['prev_anchor'] = outs_det['next_anchor']
             history_det['prev_confidence'] = outs_det['next_confidence']
+            # 🎯 接住并更新给下一帧！
+            if 'next_instance_id' in outs_det:
+                history_det['prev_instance_id'] = outs_det['next_instance_id']
+            if 'next_id_count' in outs_det:
+                history_det['prev_id_count'] = outs_det['next_id_count']
 
             model_outs_det = {
                 "classification": [outs_det['cls_scores']],
                 "prediction": [outs_det['bbox_preds']],
                 "quality": [outs_det['quality']],    
-                "instance_id": None   
+                # 🎯 删掉外面的中括号 []，直接传 Tensor！
+                "instance_id": outs_det.get('instance_id')
             }
             decoded_det_res = det_head.post_process(model_outs_det)
 
@@ -220,7 +232,7 @@ def main():
             eval_kwargs.pop(key, None)
             
         if 'eval_mode' in eval_kwargs:
-            eval_kwargs['eval_mode']['with_tracking'] = False
+            eval_kwargs['eval_mode']['with_tracking'] = True
             eval_kwargs['eval_mode']['with_motion'] = False
             eval_kwargs['eval_mode']['with_planning'] = False
             eval_kwargs['eval_mode']['with_det'] = True
