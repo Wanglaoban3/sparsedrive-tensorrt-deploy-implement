@@ -39,7 +39,7 @@ mkdir data
 ln -s path/to/nuscenes ./data/nuscenes
 ```
 
-打包数据集的元信息和标签，并在 `data/infos` 目录下生成所需的 pkl 文件。请注意，我们还在 `data_converter` 中生成了 `map_annos`，默认的 `roi_size` 为 `(30, 60)`，如果你想使用不同的范围，可以在 `tools/data_converter/nuscenes_converter.py` 中修改 `roi_size`。
+打包数据集的元信息和标签，并在 `data/infos` 目录下生成所需的 pkl 文件。请注意，我还在 `data_converter` 中生成了 `map_annos`，默认的 `roi_size` 为 `(30, 60)`，如果你想使用不同的范围，可以在 `tools/data_converter/nuscenes_converter.py` 中修改 `roi_size`。
 ```bash
 sh scripts/create_data.sh
 ```
@@ -110,20 +110,20 @@ python test_trt.py projects/configs/sparsedrive_small_stage2.py ckpt/sparsedrive
 #### 端到端核心指标对比 (End-to-End Performance)
 | Method | NDS | AMOTA | minADE (m)* | L2 (m) Avg | Col. (%) Avg | FPS |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **SparseDrive-S (Official)** | **0.525** | **0.386** | **0.620** | **0.610** | 0.100 | 4.8 |
-| **SparseDrive-S (Ours TRT)** | 0.520 | 0.370 | 0.648 | 0.612 | **0.092** | **35.7** |
+| **SparseDrive-S (Official Pytorch)** | **0.525** | **0.386** | **0.620** | **0.610** | 0.100 | 4.8 |
+| **SparseDrive-S (Ours TRT FP16)** | 0.520 | 0.370 | 0.648 | 0.612 | **0.092** | **35.7** |
 
 > **注：** `minADE` 采用的是 Car 类别的指标。TRT 引擎在保证感知和规划核心指标（L2 误差仅相差 0.002m）高度对齐的前提下，在**平均碰撞率 (Col. Avg)** 上取得了更优的表现，同时推理吞吐量（FPS）实现了 **~7.4x** 的巨大飞跃。
 
 #### 规划指标详细对比 (Detailed Planning Metrics)
 | Method | L2 1s | L2 2s | L2 3s | L2 Avg | Col. 1s | Col. 2s | Col. 3s | Col. Avg |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Official** | 0.300 | **0.580** | **0.950** | **0.610** | **0.010%** | **0.050%** | 0.230% | 0.100% |
-| **Ours TRT** | **0.299** | 0.581 | 0.957 | 0.612 | **0.010%** | 0.054% | **0.212%** | **0.092%** |
+| **Official (Official Pytorch)** | 0.300 | **0.580** | **0.950** | **0.610** | **0.010%** | **0.050%** | 0.230% | 0.100% |
+| **Ours TRT (Ours TRT FP16)** | **0.299** | 0.581 | 0.957 | 0.612 | **0.010%** | 0.054% | **0.212%** | **0.092%** |
 
 > **数据解析：**
 > * **L2 误差（L2 Distance）：** TRT 版本与官方原版紧紧咬合。短时（1s）预测甚至达到了 0.299m 的优秀水准。
-> * **碰撞率（Collision Rate）：** TRT 部署展现出了极高的安全性。在 1s 碰撞率与官方持平（0.010%）的基础上，3s 维度的长时碰撞率显著下降（从 0.230% 降至 0.212%），这说明我们的 FP16 引擎和算子融合在时序特征的处理上非常鲁棒。
+> * **碰撞率（Collision Rate）：** TRT 部署展现出了极高的安全性。在 1s 碰撞率与官方持平（0.010%）的基础上，3s 维度的长时碰撞率显著下降（从 0.230% 降至 0.212%），这说明我的 FP16 引擎和算子融合在时序特征的处理上非常鲁棒。
 
 ### 5. 推理速度测试 (Latency Profile)
 可以使用 Python 脚本进行宏观的 FPS 测试：
@@ -151,4 +151,4 @@ trtexec --loadEngine=work_dirs/sparsedrive_small_stage2/motion_plan_engine.engin
 - [ ] 针对长时序队列的显存和访存进行更深度的 Kernel 级优化
 
 ### 7. 技术沉淀与避坑指南
-在算子融合、ONNX 控制流消除（If 节点剪枝）、动态维度支持以及 C++ 插件编写等优化过程中的经验与心得，详见 [TECH_DETAILS.md](TECH_DETAILS.md) 文档。欢迎交流探讨！
+在算子融合、ONNX 控制流消除（If 节点剪枝）、动态维度支持以及 C++ 插件编写等优化过程中的经验与心得，详见 [TECH_DETAILS.md](TECH_DETAILS_CN.md) 文档。欢迎交流探讨！

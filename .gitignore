@@ -21,3 +21,4 @@ temp_ops/
 
 *.onnx
 *.pkl
+*.log

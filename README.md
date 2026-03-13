@@ -38,7 +38,7 @@ mkdir data
 ln -s path/to/nuscenes ./data/nuscenes
 ```
 
-Pack the meta-information and labels of the dataset, and generate the required pkl files to data/infos. Note that we also generate map_annos in data_converter, with a roi_size of (30, 60) as default, if you want a different range, you can modify roi_size in tools/data_converter/nuscenes_converter.py.
+Pack the meta-information and labels of the dataset, and generate the required pkl files to data/infos. Note that I also generate map_annos in data_converter, with a roi_size of (30, 60) as default, if you want a different range, you can modify roi_size in tools/data_converter/nuscenes_converter.py.
 ```bash
 sh scripts/create_data.sh
 ```
@@ -58,8 +58,8 @@ make -j8
 ```
 
 ### 2. Export ONNX Models
-Considering that in real-world autonomous driving systems, the **perception module** and the **planning/control module** often run at different frequencies, we decoupled the perception head from the motion & planning head at the engineering level, exporting them as independent engines.
-Additionally, since the temporal model has different graph structures for the initial frame (without historical features) and subsequent frames (with historical features), we exported them separately.
+Considering that in real-world autonomous driving systems, the **perception module** and the **planning/control module** often run at different frequencies, I decoupled the perception head from the motion & planning head at the engineering level, exporting them as independent engines.
+Additionally, since the temporal model has different graph structures for the initial frame (without historical features) and subsequent frames (with historical features), I exported them separately.
 
 **Export Perception Module (Det & Map):**
 ```bash
@@ -109,20 +109,20 @@ python test_trt.py projects/configs/sparsedrive_small_stage2.py ckpt/sparsedrive
 #### End-to-End Performance
 | Method | NDS | AMOTA | minADE (m)* | L2 (m) Avg | Col. (%) Avg | FPS |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **SparseDrive-S (Official)** | **0.525** | **0.386** | **0.620** | **0.610** | 0.100 | 4.8 |
-| **SparseDrive-S (Ours TRT)** | 0.520 | 0.370 | 0.648 | 0.612 | **0.092** | **35.7** |
+| **SparseDrive-S (Official Pytorch)** | **0.525** | **0.386** | **0.620** | **0.610** | 0.100 | 4.8 |
+| **SparseDrive-S (My TRT FP16)** | 0.520 | 0.370 | 0.648 | 0.612 | **0.092** | **35.7** |
 
 > **Note:** `minADE` uses the metrics for the Car category. Under the premise of highly aligning core perception and planning metrics (L2 error difference is only 0.002m), the TRT engine achieved even better performance in **Average Collision Rate (Col. Avg)**. Meanwhile, inference throughput (FPS) achieved a massive leap of **~7.4x**.
 
 #### Detailed Planning Metrics
 | Method | L2 1s | L2 2s | L2 3s | L2 Avg | Col. 1s | Col. 2s | Col. 3s | Col. Avg |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Official** | 0.300 | **0.580** | **0.950** | **0.610** | **0.010%** | **0.050%** | 0.230% | 0.100% |
-| **Ours TRT** | **0.299** | 0.581 | 0.957 | 0.612 | **0.010%** | 0.054% | **0.212%** | **0.092%** |
+| **Official (Official Pytorch)** | 0.300 | **0.580** | **0.950** | **0.610** | **0.010%** | **0.050%** | 0.230% | 0.100% |
+| **My TRT (My TRT FP16)** | **0.299** | 0.581 | 0.957 | 0.612 | **0.010%** | 0.054% | **0.212%** | **0.092%** |
 
 > **Data Analysis:**
 > * **L2 Distance:** The TRT version tightly matches the official PyTorch version. The short-term (1s) prediction even reaches an excellent level of 0.299m.
-> * **Collision Rate:** The TRT deployment demonstrates extremely high safety. While the 1s collision rate matches the official version (0.010%), the long-term (3s) collision rate drops significantly (from 0.230% to 0.212%). This indicates that our FP16 engine and operator fusion are highly robust in handling temporal features.
+> * **Collision Rate:** The TRT deployment demonstrates extremely high safety. While the 1s collision rate matches the official version (0.010%), the long-term (3s) collision rate drops significantly (from 0.230% to 0.212%). This indicates that my FP16 engine and operator fusion are highly robust in handling temporal features.
 
 ### 5. Inference Speed Test (Latency Profiling)
 You can use the Python script for macroscopic FPS testing:
