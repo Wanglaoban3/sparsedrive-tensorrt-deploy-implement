@@ -1,0 +1,211 @@
+&&&& RUNNING TensorRT.trtexec [TensorRT v8503] # /usr/src/tensorrt/bin/trtexec --loadEngine=work_dirs/sparsedrive_small_stage2/motion_plan_engine.engine --plugins=projects/trt_plugin/build/libSparseDrivePlugin.so --dumpProfile --exportProfile=my_profile.json --iterations=100
+[03/12/2026-16:06:58] [I] === Model Options ===
+[03/12/2026-16:06:58] [I] Format: *
+[03/12/2026-16:06:58] [I] Model: 
+[03/12/2026-16:06:58] [I] Output:
+[03/12/2026-16:06:58] [I] === Build Options ===
+[03/12/2026-16:06:58] [I] Max batch: 1
+[03/12/2026-16:06:58] [I] Memory Pools: workspace: default, dlaSRAM: default, dlaLocalDRAM: default, dlaGlobalDRAM: default
+[03/12/2026-16:06:58] [I] minTiming: 1
+[03/12/2026-16:06:58] [I] avgTiming: 8
+[03/12/2026-16:06:58] [I] Precision: FP32
+[03/12/2026-16:06:58] [I] LayerPrecisions: 
+[03/12/2026-16:06:58] [I] Calibration: 
+[03/12/2026-16:06:58] [I] Refit: Disabled
+[03/12/2026-16:06:58] [I] Sparsity: Disabled
+[03/12/2026-16:06:58] [I] Safe mode: Disabled
+[03/12/2026-16:06:58] [I] DirectIO mode: Disabled
+[03/12/2026-16:06:58] [I] Restricted mode: Disabled
+[03/12/2026-16:06:58] [I] Build only: Disabled
+[03/12/2026-16:06:58] [I] Save engine: 
+[03/12/2026-16:06:58] [I] Load engine: work_dirs/sparsedrive_small_stage2/motion_plan_engine.engine
+[03/12/2026-16:06:58] [I] Profiling verbosity: 0
+[03/12/2026-16:06:58] [I] Tactic sources: Using default tactic sources
+[03/12/2026-16:06:58] [I] timingCacheMode: local
+[03/12/2026-16:06:58] [I] timingCacheFile: 
+[03/12/2026-16:06:58] [I] Heuristic: Disabled
+[03/12/2026-16:06:58] [I] Preview Features: Use default preview flags.
+[03/12/2026-16:06:58] [I] Input(s)s format: fp32:CHW
+[03/12/2026-16:06:58] [I] Output(s)s format: fp32:CHW
+[03/12/2026-16:06:58] [I] Input build shapes: model
+[03/12/2026-16:06:58] [I] Input calibration shapes: model
+[03/12/2026-16:06:58] [I] === System Options ===
+[03/12/2026-16:06:58] [I] Device: 0
+[03/12/2026-16:06:58] [I] DLACore: 
+[03/12/2026-16:06:58] [I] Plugins: projects/trt_plugin/build/libSparseDrivePlugin.so
+[03/12/2026-16:06:58] [I] === Inference Options ===
+[03/12/2026-16:06:58] [I] Batch: 1
+[03/12/2026-16:06:58] [I] Input inference shapes: model
+[03/12/2026-16:06:58] [I] Iterations: 100
+[03/12/2026-16:06:58] [I] Duration: 3s (+ 200ms warm up)
+[03/12/2026-16:06:58] [I] Sleep time: 0ms
+[03/12/2026-16:06:58] [I] Idle time: 0ms
+[03/12/2026-16:06:58] [I] Streams: 1
+[03/12/2026-16:06:58] [I] ExposeDMA: Disabled
+[03/12/2026-16:06:58] [I] Data transfers: Enabled
+[03/12/2026-16:06:58] [I] Spin-wait: Disabled
+[03/12/2026-16:06:58] [I] Multithreading: Disabled
+[03/12/2026-16:06:58] [I] CUDA Graph: Disabled
+[03/12/2026-16:06:58] [I] Separate profiling: Disabled
+[03/12/2026-16:06:58] [I] Time Deserialize: Disabled
+[03/12/2026-16:06:58] [I] Time Refit: Disabled
+[03/12/2026-16:06:58] [I] NVTX verbosity: 0
+[03/12/2026-16:06:58] [I] Persistent Cache Ratio: 0
+[03/12/2026-16:06:58] [I] Inputs:
+[03/12/2026-16:06:58] [I] === Reporting Options ===
+[03/12/2026-16:06:58] [I] Verbose: Disabled
+[03/12/2026-16:06:58] [I] Averages: 10 inferences
+[03/12/2026-16:06:58] [I] Percentiles: 90,95,99
+[03/12/2026-16:06:58] [I] Dump refittable layers:Disabled
+[03/12/2026-16:06:58] [I] Dump output: Disabled
+[03/12/2026-16:06:58] [I] Profile: Enabled
+[03/12/2026-16:06:58] [I] Export timing to JSON file: 
+[03/12/2026-16:06:58] [I] Export output to JSON file: 
+[03/12/2026-16:06:58] [I] Export profile to JSON file: my_profile.json
+[03/12/2026-16:06:58] [I] 
+[03/12/2026-16:06:58] [I] === Device Information ===
+[03/12/2026-16:06:58] [I] Selected Device: NVIDIA GeForce RTX 3090
+[03/12/2026-16:06:58] [I] Compute Capability: 8.6
+[03/12/2026-16:06:58] [I] SMs: 82
+[03/12/2026-16:06:58] [I] Compute Clock Rate: 1.695 GHz
+[03/12/2026-16:06:58] [I] Device Global Memory: 24130 MiB
+[03/12/2026-16:06:58] [I] Shared Memory per SM: 100 KiB
+[03/12/2026-16:06:58] [I] Memory Bus Width: 384 bits (ECC disabled)
+[03/12/2026-16:06:58] [I] Memory Clock Rate: 9.751 GHz
+[03/12/2026-16:06:58] [I] 
+[03/12/2026-16:06:58] [I] TensorRT version: 8.5.3
+[03/12/2026-16:06:58] [I] Loading supplied plugin library: projects/trt_plugin/build/libSparseDrivePlugin.so
+[03/12/2026-16:06:58] [I] Engine loaded in 0.0310116 sec.
+[03/12/2026-16:06:58] [I] [TRT] Loaded engine size: 21 MiB
+[03/12/2026-16:06:58] [I] [TRT] [MemUsageChange] TensorRT-managed allocation in engine deserialization: CPU +0, GPU +19, now: CPU 0, GPU 19 (MiB)
+[03/12/2026-16:06:58] [I] Engine deserialized in 0.274892 sec.
+[03/12/2026-16:06:58] [I] [TRT] [MemUsageChange] TensorRT-managed allocation in IExecutionContext creation: CPU +0, GPU +107, now: CPU 0, GPU 126 (MiB)
+[03/12/2026-16:06:58] [I] Setting persistentCacheLimit to 0 bytes.
+[03/12/2026-16:06:58] [I] Using random values for input det_instance_feature
+[03/12/2026-16:06:58] [I] Created input binding for det_instance_feature with dimensions 1x900x256
+[03/12/2026-16:06:58] [I] Using random values for input det_anchor_embed
+[03/12/2026-16:06:58] [I] Created input binding for det_anchor_embed with dimensions 1x900x256
+[03/12/2026-16:06:58] [I] Using random values for input det_classification_sigmoid
+[03/12/2026-16:06:58] [I] Created input binding for det_classification_sigmoid with dimensions 1x900x10
+[03/12/2026-16:06:58] [I] Using random values for input det_anchors
+[03/12/2026-16:06:58] [I] Created input binding for det_anchors with dimensions 1x900x11
+[03/12/2026-16:06:58] [I] Using random values for input det_instance_id
+[03/12/2026-16:06:58] [I] Created input binding for det_instance_id with dimensions 1x900
+[03/12/2026-16:06:58] [I] Using random values for input map_instance_feature
+[03/12/2026-16:06:58] [I] Created input binding for map_instance_feature with dimensions 1x100x256
+[03/12/2026-16:06:58] [I] Using random values for input map_anchor_embed
+[03/12/2026-16:06:58] [I] Created input binding for map_anchor_embed with dimensions 1x100x256
+[03/12/2026-16:06:58] [I] Using random values for input map_classification_sigmoid
+[03/12/2026-16:06:58] [I] Created input binding for map_classification_sigmoid with dimensions 1x100x3
+[03/12/2026-16:06:58] [I] Using random values for input ego_feature_map
+[03/12/2026-16:06:58] [I] Created input binding for ego_feature_map with dimensions 1x256x8x22
+[03/12/2026-16:06:58] [I] Using random values for input instance_t_matrix
+[03/12/2026-16:06:58] [I] Created input binding for instance_t_matrix with dimensions 1x4x4
+[03/12/2026-16:06:58] [I] Using random values for input mask
+[03/12/2026-16:06:58] [I] Created input binding for mask with dimensions 1
+[03/12/2026-16:06:58] [I] Using random values for input mo_history_instance_feature
+[03/12/2026-16:06:58] [I] Created input binding for mo_history_instance_feature with dimensions 1x900x4x256
+[03/12/2026-16:06:58] [I] Using random values for input mo_history_anchor
+[03/12/2026-16:06:58] [I] Created input binding for mo_history_anchor with dimensions 1x900x4x11
+[03/12/2026-16:06:58] [I] Using random values for input mo_history_period
+[03/12/2026-16:06:58] [I] Created input binding for mo_history_period with dimensions 1x900
+[03/12/2026-16:06:58] [I] Using random values for input mo_prev_instance_id
+[03/12/2026-16:06:58] [I] Created input binding for mo_prev_instance_id with dimensions 1x900
+[03/12/2026-16:06:58] [I] Using random values for input mo_prev_confidence
+[03/12/2026-16:06:58] [I] Created input binding for mo_prev_confidence with dimensions 1x900
+[03/12/2026-16:06:58] [I] Using random values for input mo_history_ego_feature
+[03/12/2026-16:06:58] [I] Created input binding for mo_history_ego_feature with dimensions 1x1x4x256
+[03/12/2026-16:06:58] [I] Using random values for input mo_history_ego_anchor
+[03/12/2026-16:06:58] [I] Created input binding for mo_history_ego_anchor with dimensions 1x1x4x11
+[03/12/2026-16:06:58] [I] Using random values for input mo_history_ego_period
+[03/12/2026-16:06:58] [I] Created input binding for mo_history_ego_period with dimensions 1x1
+[03/12/2026-16:06:58] [I] Using random values for input mo_prev_ego_status
+[03/12/2026-16:06:58] [I] Created input binding for mo_prev_ego_status with dimensions 1x1x10
+[03/12/2026-16:06:58] [I] Using random values for output next_mo_prev_confidence
+[03/12/2026-16:06:58] [I] Created output binding for next_mo_prev_confidence with dimensions 1x900
+[03/12/2026-16:06:58] [I] Using random values for output next_mo_history_instance_feature
+[03/12/2026-16:06:58] [I] Created output binding for next_mo_history_instance_feature with dimensions 1x900x4x256
+[03/12/2026-16:06:58] [I] Using random values for output next_mo_history_anchor
+[03/12/2026-16:06:58] [I] Created output binding for next_mo_history_anchor with dimensions 1x900x4x11
+[03/12/2026-16:06:58] [I] Using random values for output next_mo_history_ego_anchor
+[03/12/2026-16:06:58] [I] Created output binding for next_mo_history_ego_anchor with dimensions 1x1x4x11
+[03/12/2026-16:06:58] [I] Using random values for output next_mo_history_ego_period
+[03/12/2026-16:06:58] [I] Created output binding for next_mo_history_ego_period with dimensions 1x1
+[03/12/2026-16:06:58] [I] Using random values for output motion_cls
+[03/12/2026-16:06:58] [I] Created output binding for motion_cls with dimensions 1x900x6
+[03/12/2026-16:06:58] [I] Using random values for output motion_reg
+[03/12/2026-16:06:58] [I] Created output binding for motion_reg with dimensions 1x900x6x12x2
+[03/12/2026-16:06:58] [I] Using random values for output plan_cls
+[03/12/2026-16:06:58] [I] Created output binding for plan_cls with dimensions 1x1x18
+[03/12/2026-16:06:58] [I] Using random values for output plan_reg
+[03/12/2026-16:06:58] [I] Created output binding for plan_reg with dimensions 1x1x18x6x2
+[03/12/2026-16:06:58] [I] Using random values for output plan_status
+[03/12/2026-16:06:58] [I] Created output binding for plan_status with dimensions 1x1x10
+[03/12/2026-16:06:58] [I] Using random values for output next_mo_prev_ego_status
+[03/12/2026-16:06:58] [I] Created output binding for next_mo_prev_ego_status with dimensions 1x1x10
+[03/12/2026-16:06:58] [I] Using random values for output next_mo_history_ego_feature
+[03/12/2026-16:06:58] [I] Created output binding for next_mo_history_ego_feature with dimensions 1x1x4x256
+[03/12/2026-16:06:58] [I] Using random values for output next_mo_history_period
+[03/12/2026-16:06:58] [I] Created output binding for next_mo_history_period with dimensions 1x900
+[03/12/2026-16:06:58] [I] Using random values for output next_mo_prev_instance_id
+[03/12/2026-16:06:58] [I] Created output binding for next_mo_prev_instance_id with dimensions 1x900
+[03/12/2026-16:06:58] [I] Starting inference
+[03/12/2026-16:07:02] [I] The e2e network timing is not reported since it is inaccurate due to the extra synchronizations when the profiler is enabled.
+[03/12/2026-16:07:02] [I] To show e2e network timing report, add --separateProfileRun to profile layer timing in a separate run or remove --dumpProfile to disable the profiler.
+[03/12/2026-16:07:02] [I] 
+[03/12/2026-16:07:02] [I] === Profile (523 iterations ) ===
+[03/12/2026-16:07:02] [I]                                                                                         Layer   Time (ms)   Avg. Time (ms)   Median Time (ms)   Time %
+[03/12/2026-16:07:02] [I]                            Reformatting CopyNode for Network Input det_classification_sigmoid        4.65           0.0089             0.0041      0.2
+[03/12/2026-16:07:02] [I]                                       Reformatting CopyNode for Network Input det_instance_id        2.34           0.0045             0.0041      0.1
+[03/12/2026-16:07:02] [I]                                                                                    ArgMax_983        4.72           0.0090             0.0051      0.2
+[03/12/2026-16:07:02] [I]                                                          {ForeignNode[Cast_416...Slice_1070]}       21.61           0.0413             0.0410      0.8
+[03/12/2026-16:07:02] [I]                                      Reformatting CopyNode for Input Tensor 0 to ReduceMax_36        2.31           0.0044             0.0041      0.1
+[03/12/2026-16:07:02] [I]                                                                                  ReduceMax_36       28.87           0.0552             0.0051      1.0
+[03/12/2026-16:07:02] [I]                                                                                       TopK_41        7.07           0.0135             0.0133      0.2
+[03/12/2026-16:07:02] [I]                                           Reformatting CopyNode for Input Tensor 0 to Conv_70        4.32           0.0083             0.0061      0.2
+[03/12/2026-16:07:02] [I]                                                                                       Conv_70        8.47           0.0162             0.0164      0.3
+[03/12/2026-16:07:02] [I]                                                                             Conv_71 + Relu_72        8.07           0.0154             0.0154      0.3
+[03/12/2026-16:07:02] [I]                                                                                AveragePool_75        3.48           0.0067             0.0072      0.1
+[03/12/2026-16:07:02] [I]                                                                                 PWN(Sin_1071)        3.75           0.0072             0.0072      0.1
+[03/12/2026-16:07:02] [I]                                                                    Unsqueeze_1079_copy_output        4.02           0.0077             0.0072      0.1
+[03/12/2026-16:07:02] [I]                                                                                 PWN(Cos_1077)        4.39           0.0084             0.0082      0.2
+[03/12/2026-16:07:02] [I]                                                                    Unsqueeze_1081_copy_output        4.22           0.0081             0.0082      0.1
+[03/12/2026-16:07:02] [I]                                                                      Reshape_1090_copy_output        4.21           0.0080             0.0082      0.1
+[03/12/2026-16:07:02] [I]                                                                                 PWN(Sin_1096)        4.31           0.0082             0.0082      0.2
+[03/12/2026-16:07:02] [I]                                                                    Unsqueeze_1104_copy_output        4.17           0.0080             0.0082      0.1
+[03/12/2026-16:07:02] [I]                                                                                 PWN(Cos_1102)        4.13           0.0079             0.0082      0.1
+[03/12/2026-16:07:02] [I]                                                                    Unsqueeze_1106_copy_output        3.98           0.0076             0.0072      0.1
+[03/12/2026-16:07:02] [I]                                                                      Reshape_1115_copy_output        4.48           0.0086             0.0082      0.2
+[03/12/2026-16:07:02] [I]                                                                                   MatMul_1118       87.78           0.1678             0.0184      3.1
+[03/12/2026-16:07:02] [I]                                                                          Add_1119 + Relu_1120        6.45           0.0123             0.0092      0.2
+[03/12/2026-16:07:02] [I]                             Reformatting CopyNode for Output Tensor 0 to Add_1119 + Relu_1120        7.04           0.0135             0.0123      0.2
+[03/12/2026-16:07:02] [I]                                                                               ReduceMean_1121       10.15           0.0194             0.0195      0.4
+[03/12/2026-16:07:02] [I]                                                                                      Sub_1122        5.26           0.0101             0.0102      0.2
+[03/12/2026-16:07:02] [I]    Reformatting CopyNode for Input Tensor 0 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.40           0.0046             0.0041      0.1
+[03/12/2026-16:07:02] [I]    Reformatting CopyNode for Input Tensor 1 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.43           0.0046             0.0041      0.1
+[03/12/2026-16:07:02] [I]    Reformatting CopyNode for Input Tensor 2 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        3.63           0.0069             0.0072      0.1
+[03/12/2026-16:07:02] [I]    Reformatting CopyNode for Input Tensor 3 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        3.47           0.0066             0.0072      0.1
+[03/12/2026-16:07:02] [I]    Reformatting CopyNode for Input Tensor 5 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        3.85           0.0074             0.0072      0.1
+[03/12/2026-16:07:02] [I]    Reformatting CopyNode for Input Tensor 8 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.76           0.0053             0.0051      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Input Tensor 10 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.63           0.0050             0.0051      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Input Tensor 11 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.49           0.0048             0.0051      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Input Tensor 12 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        6.88           0.0132             0.0133      0.2
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Input Tensor 15 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.42           0.0046             0.0041      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Input Tensor 16 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.46           0.0047             0.0051      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Input Tensor 20 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.39           0.0046             0.0041      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Input Tensor 21 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.46           0.0047             0.0051      0.1
+[03/12/2026-16:07:02] [I]                                                {ForeignNode[onnx::Gather_426...Squeeze_3019]}     2512.68           4.8044             4.7411     88.7
+[03/12/2026-16:07:02] [I]  Reformatting CopyNode for Output Tensor 12 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.01           0.0038             0.0041      0.1
+[03/12/2026-16:07:02] [I]  Reformatting CopyNode for Output Tensor 11 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        1.87           0.0036             0.0032      0.1
+[03/12/2026-16:07:02] [I]  Reformatting CopyNode for Output Tensor 10 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        1.85           0.0035             0.0032      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Output Tensor 9 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.77           0.0053             0.0051      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Output Tensor 8 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        1.75           0.0034             0.0031      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Output Tensor 7 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        1.73           0.0033             0.0031      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Output Tensor 6 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        1.90           0.0036             0.0040      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Output Tensor 5 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        1.79           0.0034             0.0031      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Output Tensor 2 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        5.33           0.0102             0.0102      0.2
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Output Tensor 1 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        2.29           0.0044             0.0041      0.1
+[03/12/2026-16:07:02] [I]   Reformatting CopyNode for Output Tensor 0 to {ForeignNode[onnx::Gather_426...Squeeze_3019]}        1.73           0.0033             0.0031      0.1
+[03/12/2026-16:07:02] [I]                                                                                         Total     2832.23           5.4153             5.1343    100.0
+[03/12/2026-16:07:02] [I] 
+&&&& PASSED TensorRT.trtexec [TensorRT v8503] # /usr/src/tensorrt/bin/trtexec --loadEngine=work_dirs/sparsedrive_small_stage2/motion_plan_engine.engine --plugins=projects/trt_plugin/build/libSparseDrivePlugin.so --dumpProfile --exportProfile=my_profile.json --iterations=100

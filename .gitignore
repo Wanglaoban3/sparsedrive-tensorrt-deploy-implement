@@ -1,5 +1,4 @@
 *.pyc
-*.npy
 *.pth
 *.whl
 *.swp
@@ -22,4 +21,3 @@ temp_ops/
 
 *.onnx
 *.pkl
-*.log
