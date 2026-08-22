@@ -1,0 +1,16 @@
+services:
+  sparsedrive:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: sparsedrive:cu116
+    working_dir: /workspace/sparsedrive
+    gpus: all
+    volumes:
+      - .:/workspace/sparsedrive
+      - ${NUSCENES_ROOT:?Set NUSCENES_ROOT to the directory containing v1.0-mini and samples}:/mnt/nuscenes:ro
+      - ${CHECKPOINT_ROOT:-./ckpt}:/workspace/sparsedrive/ckpt:ro
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    stdin_open: true
+    tty: true

@@ -1,0 +1,17 @@
+.git
+.gitignore
+data
+ckpt
+work_dirs
+dist_test
+vis
+val
+lib
+*.pth
+*.onnx
+*.engine
+*.log
+__pycache__
+*.egg-info
+build
+*.so
