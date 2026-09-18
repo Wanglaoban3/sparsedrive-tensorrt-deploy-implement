@@ -1,5 +1,11 @@
+import os
+
 import torch
-from .deformable_aggregation import DeformableAggregationFunction
+from .deformable_aggregation import (
+    DeformableAggregationFunction,
+    _use_pure,
+)
+from .pure_torch_deformable_aggregation import deformable_aggregation_pure
 
 def deformable_aggregation_function(
     feature_maps,
@@ -8,6 +14,30 @@ def deformable_aggregation_function(
     sampling_location,
     weights,
 ):
+    if _use_pure() and torch.is_grad_enabled():
+        # Pure-torch path with autograd handling the backward pass
+        # (training / calibration). The Function wrapper detaches, so it
+        # must be bypassed when gradients are needed.
+        if os.environ.get("SPARSEDRIVE_DFA_CKPT", "0") == "1":
+            # The pure port materializes [bs, anchors, points, cams, scales, C]
+            # intermediates for every corner; checkpoint them away (recomputed
+            # in backward) so QAT fits in 16 GB.
+            return torch.utils.checkpoint.checkpoint(
+                deformable_aggregation_pure,
+                feature_maps,
+                spatial_shape,
+                scale_start_index,
+                sampling_location,
+                weights,
+                use_reentrant=False,
+            )
+        return deformable_aggregation_pure(
+            feature_maps,
+            spatial_shape,
+            scale_start_index,
+            sampling_location,
+            weights,
+        )
     return DeformableAggregationFunction.apply(
         feature_maps,
         spatial_shape,

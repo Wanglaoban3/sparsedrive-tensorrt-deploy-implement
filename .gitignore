@@ -22,3 +22,7 @@ temp_ops/
 *.onnx
 *.pkl
 *.log
+model_anchor_confi/
+
+_tmp_*.py 
+_tmp_*.bat 

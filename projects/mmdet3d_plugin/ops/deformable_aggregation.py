@@ -1,7 +1,22 @@
+import os
+
 import torch
 from torch.autograd.function import Function, once_differentiable
 
-from . import deformable_aggregation_ext
+from .pure_torch_deformable_aggregation import deformable_aggregation_pure
+
+try:
+    from . import deformable_aggregation_ext
+except ImportError:
+    deformable_aggregation_ext = None
+
+# Force the pure-torch path even when the extension is available
+# (e.g. for cross-checking the two implementations).
+_FORCE_PURE = os.environ.get("SPARSEDRIVE_DFA_PURE", "0") == "1"
+
+
+def _use_pure():
+    return _FORCE_PURE or deformable_aggregation_ext is None
 
 
 class DeformableAggregationFunction(Function):
@@ -14,6 +29,16 @@ class DeformableAggregationFunction(Function):
         sampling_location,
         weights,
     ):
+        if _use_pure():
+            # Pure-torch math; when tracing for ONNX export the symbolic
+            # below still replaces this with the SparseDrive custom node.
+            return deformable_aggregation_pure(
+                mc_ms_feat,
+                spatial_shape,
+                scale_start_index,
+                sampling_location,
+                weights,
+            )
         # output: [bs, num_pts, num_embeds]
         mc_ms_feat = mc_ms_feat.contiguous().float()
         spatial_shape = spatial_shape.contiguous().int()

@@ -1,0 +1,16 @@
+{
+  "iters": 100,
+  "lr": 1e-06,
+  "mean_loss_last20": 98.61745128631591,
+  "drift_fp32_to_ptq": {
+    "rel_l2": 0.2561188478721306,
+    "cos": 0.8839666008610617
+  },
+  "drift_fp32_to_qat": {
+    "rel_l2": 0.25552912472366274,
+    "cos": 0.8859110557558861
+  },
+  "skip_json": "deploy/artifacts/sparsedrive_ptq_sensitivity.json",
+  "skip_k": 28,
+  "qat_ckpt": "ckpt/sparsedrive_stage2_qat.pth"
+}
