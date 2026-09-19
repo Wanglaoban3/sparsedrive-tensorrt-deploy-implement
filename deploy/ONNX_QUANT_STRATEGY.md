@@ -116,6 +116,21 @@ deploy/qdq_onnx_rewrite.py  ──► *_rewritten.onnx (标准 ORT 风格 QDQ)
   - DFA 边界：两图各 12 个 `DeformableAggregation` 节点，所有输入边均为
     FP 收尾（Q→DQ 对），无需修补（`dfa boundary: int8_edges_fixed=0`）。
 - 最终精度以用户 TRT 侧对齐验证为准（本机不做引擎编译）。
+- **任务指标哨兵**（`deploy/task_sentinel.py`，mini-val 81 帧固定子集、
+  同帧配对比较；绝对值受子集噪声影响，配对差值是有效信号）：
+
+  | 变体 | mAP | ΔmAP | NDS | ΔNDS |
+  |---|---|---|---|---|
+  | fp32 | 0.4255 | — | 0.4805 | — |
+  | PTQ 全 INT8 (skip0) | 0.4151 | −0.0103 | 0.4733 | −0.0072 |
+  | PTQ skip14 | 0.4151 | −0.0104 | 0.4728 | −0.0077 |
+  | PTQ skip28 | 0.4178 | −0.0077 | 0.4773 | −0.0032 |
+  | PTQ skip56 | 0.4303 | +0.0048 | 0.4836 | +0.0031 |
+  | QAT skip28（交付） | 0.4197 | −0.0058 | 0.4777 | −0.0028 |
+
+  结论：无灾难性崩塌；skip 越多损伤越小；QAT 优于同 K 的 PTQ；
+  skip56 略超 fp32（在 81 帧噪声带内）。正式数字以完整 val 集
+  （6019 帧，`deploy/eval_nuscenes.py --version v1.0-trainval`）为准。
 
 ## 7. 复现命令（本项目根目录，sparsedrive_deploy 环境）
 
