@@ -75,7 +75,44 @@ deploy/qdq_onnx_rewrite.py  ──► *_rewritten.onnx (标准 ORT 风格 QDQ)
   weight/input/output 三个量化器（三件套必须一起关，漏掉 output_quantizer
   会让"全 FP"测量变成假的）。
 
-### 4.1 测量陷阱（重要教训，已修复）
+### 4.1 组级任务指标敏感度（mAP/NDS 口径，最终选层依据）
+
+逐模块 rel_l2 排名是长尾、头部在噪声带内，skip-topK 无任务收益
+（81 帧配对哨兵：skip14≈skip0）。因此改用**功能组留组法**：
+每组保持 FP（其余全量化），在固定 81 帧 mini-val 上配对测 mAP/NDS
+（`deploy/group_sensitivity.py`，每组独立重建+校准；ModelOpt 校准在
+calib 模式下前向恒等、只记录 amax，故 amax 一致、组间可比）。
+
+| 组（保FP模块数） | mAP | ΔmAP | NDS | ΔNDS |
+|---|---|---|---|---|
+| fp32 | — | 0.4255 | — | 0.4805 |
+| 全 INT8（无保护） | 0 | 0.4169 | −0.0086 | 0.4717 | −0.0088 |
+| det_head_output（cls/quality，12） | 0.4249 | **−0.0006** | 0.4786 | −0.0019 |
+| det_head_ffn（6） | 0.4222 | −0.0033 | 0.4731 | −0.0074 |
+| map_head_attn（44） | 0.4209 | −0.0046 | 0.4747 | −0.0058 |
+| backbone_deep（layer3+4，29） | 0.4204 | −0.0050 | 0.4756 | −0.0049 |
+| backbone_shallow（12） | 0.4201 | −0.0054 | 0.4772 | −0.0033 |
+| depth_branch（3） | 0.4189 | −0.0066 | 0.4716 | −0.0089 |
+| det_head_dfa（6） | 0.4163 | −0.0092 | 0.4730 | −0.0075 |
+| backbone_mid（13） | 0.4156 | −0.0098 | 0.4718 | −0.0087 |
+| det_head_enc（2） | 0.4130 | −0.0125 | 0.4714 | −0.0091 |
+| det_head_attn（QKV+proj，40） | 0.4063 | −0.0191 | 0.4647 | −0.0158 |
+| img_neck（FPN，8） | 0.4271 | +0.0016 | 0.4823 | +0.0018 |
+| 全 FP 控制组 | all | 0.4255 | +0.0000 | 0.4805 | +0.0000 |
+
+要点（噪声底约 ±0.005，来自 map_head_attn/img_neck 等与 det 路径无关
+组的波动和校准集噪声）：
+- 全 INT8 的任务损伤本身就小（−0.009 mAP / −0.009 NDS）；
+- **det_head_output（cls/quality 输出层，仅 12 个模块）保 FP 几乎完全
+  恢复损伤**——任务口径下性价比最高的保护组，与 rel_l2 排名
+  （全是 backbone）完全不同；
+- backbone_deep 次之；FPN 量化无代价；det_head_attn 保 FP 反而更差
+  （误差补偿效应，勿保护）；
+- 任务口径的推荐配置：保 FP = det_head_output + backbone_deep
+  （41 模块，其余 134 个量化模块含全部 QKV/DFA 生产者保持 INT8），
+  预期 mAP 与 fp32 差异在噪声带内。
+
+### 4.2 测量陷阱（重要教训，已修复）
 
 - **mtq.quantize() 会把整个模型翻成 train() 模式**：默认的校准循环在
   train 模式下跑，BatchNorm 会用 16 个 mini-batch 的批统计覆盖

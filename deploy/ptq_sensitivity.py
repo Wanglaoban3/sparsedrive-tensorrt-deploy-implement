@@ -170,22 +170,32 @@ def quantized_modules(wrapper):
     ]
 
 
-def set_module_quant(wrapper, names, enabled):
+def set_module_quant(obj, names, enabled):
     """Enable/disable every quantizer (weight, input AND output) of the
     given Quant modules.  MTQ 0.11 INT8_DEFAULT_CFG also puts an
     output_quantizer on each module; leaving those on keeps the graph
-    quantized even when weight/input are disabled."""
+    quantized even when weight/input are disabled.
+
+    Strict: every requested name must exist on `obj` — set_quantizer_attribute
+    silently no-ops unmatched names, which once masked a wrapper/bare-model
+    prefix mismatch and invalidated a whole measurement round."""
+    mod_map = dict(quantized_modules(obj))
+    missing = [n for n in names if n not in mod_map]
+    if missing:
+        raise ValueError(
+            f"set_module_quant: {len(missing)}/{len(names)} names not found "
+            f"on {'wrapper' if hasattr(obj, 'model') else 'model'}; "
+            f"e.g. {missing[:3]} (naming mismatch?)")
     attr = []
     for n in names:
-        mod = dict(quantized_modules(wrapper)).get(n)
-        suffixes = [a for a in dir(mod) if a.endswith("_quantizer")] \
-            if mod is not None else []
+        mod = mod_map[n]
+        suffixes = [a for a in dir(mod) if a.endswith("_quantizer")]
         if not suffixes:
             suffixes = ["weight_quantizer", "input_quantizer",
                         "output_quantizer"]
         attr += [f"{n}.{s}" for s in suffixes]
     for a in attr:
-        mtq.set_quantizer_attribute(wrapper, a, {"enable": enabled})
+        mtq.set_quantizer_attribute(obj, a, {"enable": enabled})
 
 
 def eval_drift(wrapper, sample_inputs, ref_out):
