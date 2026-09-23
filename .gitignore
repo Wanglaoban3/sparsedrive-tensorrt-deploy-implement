@@ -31,3 +31,6 @@ deploy/artifacts/eval_*/*.pkl
 deploy/artifacts/eval_*/plots/
 deploy/artifacts/eval_*/metrics_details.json
 deploy/artifacts/eval_*/results_nusc.json
+
+_official/
+*.err
