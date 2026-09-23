@@ -138,7 +138,25 @@ calib 模式下前向恒等、只记录 amax，故 amax 一致、组间可比）
 
 ## 6. 数值验收（本机实测）
 
-- torch 侧（nuScenes-mini 16 校准 / 8 评估样本，det/map 输出分组 rel_l2/cos）：
+### 6.1 正式指标：完整 val 集（nuScenes trainval val，6019 帧，官方 devkit）
+
+| 模型 | mAP | NDS | mATE↓ | mASE↓ | mAOE↓ | mAVE↓ | mAAE↓ |
+|---|---|---|---|---|---|---|---|
+| fp32（stage2 权重） | 0.4135 | 0.5226 | 0.5638 | 0.2768 | 0.5404 | 0.2697 | 0.1905 |
+| INT8 QAT（skip-28 保护组） | 0.4081 | 0.5200 | 0.5692 | 0.2767 | 0.5313 | 0.2737 | 0.1901 |
+| **Δ（量化代价）** | **−0.0053** | **−0.0026** | +0.0054 | −0.0001 | −0.0091 | +0.0040 | −0.0004 |
+
+- INT8 量化代价：**−0.53 mAP 点 / −0.26 NDS 点**（146 个可量化模块中
+  28 个敏感模块保 FP + QAT 微调）；mAOE 反而略优（噪声带内）。
+- fp32 基线与 SparseDrive 论文数字（mAP≈41.9/NDS≈52.5）吻合，验证
+  本机评测链路（无 CAN bus 的 ego status 重建、无矢量地图扩展、
+  纯 torch DFA）正确。
+- 复现：`deploy/eval_nuscenes.py --mode fp32/quant --version v1.0-trainval
+  --ann-file data/infos/nuscenes_infos_val.pkl --data-root <trainval 根>`；
+  结果 JSON 在 `deploy/artifacts/eval_fp32_val.json` /
+  `eval_int8qat_val.json`。
+
+### 6.2 torch 侧输出漂移（mini，16 校准 / 8 评估样本）
   - 全 INT8（无 skip）：rel_l2=0.2563，cos=0.8822；
   - QAT 起点（skip-k=28，即 146 个可量化模块中 28 个敏感层保 FP）：
     rel_l2=0.2561，cos=0.8840；
