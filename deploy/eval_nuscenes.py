@@ -171,7 +171,30 @@ def build_quantized(cfg, cfg_path, ckpt, skip_json, skip_k):
     return model
 
 
-def run_inference(model, ds):
+def run_inference(model, ds, attn_fp16=False):
+    if attn_fp16:
+        # mimic the official flash_attn fp16 kernels: the checkpoint was
+        # trained with fp16 attention, so fp32 attention is slightly
+        # out-of-distribution for the downstream layers
+        from projects.mmdet3d_plugin.models.attention import FlashAttention
+
+        def _fp16_forward(self, q, k, v, causal=False, key_padding_mask=None):
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            scale = self.softmax_scale if self.softmax_scale is not None \
+                else q.size(-1) ** -0.5
+            q16, k16, v16 = q.half(), k.half(), v.half()
+            w = torch.matmul(q16, k16.transpose(-2, -1)) * scale
+            if key_padding_mask is not None:
+                m = key_padding_mask.unsqueeze(1).unsqueeze(1).bool()
+                w = w.masked_fill(m, float("-inf"))
+            w = torch.softmax(w, dim=-1)
+            out = torch.matmul(w, v16)
+            return out.transpose(1, 2).contiguous().float(), None
+
+        FlashAttention.forward = _fp16_forward
+        print("attention compute dtype: fp16 (official-kernel mimic)")
     model.eval()
     outputs = []
     t0 = time.time()
@@ -202,6 +225,10 @@ def main():
     ap.add_argument("--max-samples", type=int, default=0,
                     help="0 = full set")
     ap.add_argument("--out-dir", default="deploy/artifacts")
+    ap.add_argument("--attn-fp16", action="store_true",
+                    help="compute attention in fp16 like the official "
+                         "flash_attn kernels the checkpoint was trained "
+                         "with")
     args = ap.parse_args()
     torch.manual_seed(0)
 
@@ -226,7 +253,7 @@ def main():
                             args.data_root, args.max_samples)
     print(f"dataset: {len(ds)} samples, version={ds.version}")
 
-    outputs = run_inference(model, ds)
+    outputs = run_inference(model, ds, attn_fp16=args.attn_fp16)
 
     ds.work_dir = os.path.join(args.out_dir, f"eval_{args.tag}")
     os.makedirs(ds.work_dir, exist_ok=True)
