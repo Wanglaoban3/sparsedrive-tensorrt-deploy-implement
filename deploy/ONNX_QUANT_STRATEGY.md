@@ -125,6 +125,10 @@ calib 模式下前向恒等、只记录 amax，故 amax 一致、组间可比）
 
 ## 5. 层折叠与图清理
 
+> 注：Conv+BN(+ReLU) 的运行时融合由 TRT 构图自动完成，本地无需预折叠
+> （预折叠只影响量化误差分布的统计口径，对部署无增益）；LayerNorm /
+> softmax / attention 内部算子同理，保持 FP 由 TRT 自动选择最优实现。
+
 1. **Conv+BN 预折叠**（训练后一次性）：`tools/fuse_conv_bn.py`（注意把 `mmdet3d.apis.init_model`
    换成 mmdet 的 build_detector+load_checkpoint，见 deploy/ 脚本内实现）。P100 上折叠与
    量化联合做更准（BN 的 running_var 直接参与 scale 计算）。
@@ -206,16 +210,15 @@ flash_attn **FP16 kernel** 训练的——权重对 FP16 注意力的数值噪�
 python deploy/ptq_sensitivity.py --calib-samples 16 --eval-samples 16
 python deploy/render_ptq_report.py          # 生成 Markdown 报告
 
-# 2. QAT（漂移门控：每 iters/10 评估一次漂移，只保存最优状态，
-#    微调无收益时自动回滚到 PTQ 状态，保证不劣化）
-python deploy/qat.py --iters 100 --lr 1e-6 \
-    --skip-json deploy/artifacts/sparsedrive_ptq_sensitivity.json --skip-k 28
+# 2. （可选）QAT——det_head_output 保护策略下残差已在噪声带内，
+#    无需 QAT；仅当保护更少时才建议使用
+# python deploy/qat.py --iters 100 --lr 1e-6 --skip-k 28 ...
 
-# 3. 量化 ONNX 导出（进程内重建量化结构 + 复原 QAT state_dict，
-#    含 amax；ModelOpt Quant* 动态类不可整体 pickle）
-python deploy/export_quant_onnx.py --checkpoint ckpt/sparsedrive_stage2_qat.pth \
-    --skip-json deploy/artifacts/sparsedrive_ptq_sensitivity.json --skip-k 28 \
-    --out work_dirs/sparsedrive_small_stage2/sparsedrive_int8.onnx
+# 3. 量化 ONNX 导出（最终策略：PTQ + det_head_output 保护 + fp16 注意力，
+#    免 QAT；checkpoint 直接用官方 fp32 权重）
+python deploy/export_quant_onnx.py --checkpoint ckpt/sparsedrive_stage2.pth \
+    --protect-groups det_head_output --attn-fp16 \
+    --out work_dirs/sparsedrive_small_stage2/sparsedrive_int8_dho.onnx
 
 # 4. QDQ 结构标准化 + DFA 边界归一（报告 *_rewrite_report.json）
 python deploy/qdq_onnx_rewrite.py work_dirs/sparsedrive_small_stage2/sparsedrive_int8.onnx
@@ -291,6 +294,18 @@ pack_to_linears(model)   # in_proj_weight/bias 按 E 切三份 → q/k/v nn.Line
   导出路径 = build → surgery → load QAT ckpt（键名才能对上）→ 导出；
 - 感知引擎 21 个注意力 × 3 = 63 个新量化器，总模块 112 → 133，
   总量化器 335 → 398；
+- **fp16 注意力导出**（`--attn-fp16`）：checkpoint 由官方 flash_attn
+  FP16 kernel 训练（见 §6.1 根因），导出分支在 QK^T/softmax/PV 处插入
+  fp16 Cast——精度找回 +0.22 NDS，注意力带宽减半。已验证落图：
+  63 个 FLOAT16 Cast、42 个 fp16 MatMul（21 注意力 × 2）；
+
+### 10.4 待办（TRT 侧，本机无法执行）
+
+- **DFA plugin 内部 INT8**：plugin 内的 gather/bilinear/加权求和仍是 FP
+  计算。feat 输入已是 int8 精度值（见 §10.3），plugin 内直接以 int8
+  读特征可把最贵的访存减半；需要修改 plugin 的 CUDA kernel 并重编译，
+  P100 无 nvcc 无法验证。图侧无需改动（QDQ 已就位，plugin 直收 FP 张量
+  内部自行取整即可）。
 
 ### 10.3 DFA 三输入（loc / feat / weights）的量化取舍
 

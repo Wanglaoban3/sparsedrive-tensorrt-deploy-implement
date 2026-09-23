@@ -112,15 +112,38 @@ def _load_weights(model, ckpt):
     return missing, unexpected
 
 
-def build_quantized(cfg, cfg_path, ckpt, skip_json, skip_k):
+def keep_modules_for_groups(wrapper, groups):
+    """Keep the given functional groups (bucket_rules names) in FP.
+    Returns the list of protected module names (wrapper-prefixed)."""
+    from group_sensitivity import bucket_rules
+    from ptq_sensitivity import quantized_modules, set_module_quant
+
+    prefixed = [n for n, _ in quantized_modules(wrapper)]
+
+    def bare(n):
+        return n[len("model."):] if n.startswith("model.") else n
+
+    keep = [n for n in prefixed if bucket_rules(bare(n)) in set(groups)]
+    if not keep:
+        raise ValueError(f"no quantized modules matched groups {groups}")
+    set_module_quant(wrapper, keep, False)
+    print(f"protection groups {list(groups)}: kept {len(keep)} modules FP")
+    return keep
+
+
+def build_quantized(cfg, cfg_path, ckpt, skip_json, skip_k,
+                    protect_groups=None):
     """Rebuild the quantized structure in-process and restore weights.
 
     PTQ path (mmcv fp32 ckpt): weights MUST be loaded BEFORE calibration so
     the amax statistics see real activations.  QAT path (plain state_dict
     with quantizer keys): loaded after quantize to restore weights + amax.
+    Protection (skip_k from the rel_l2 ranking OR functional-group based
+    protect_groups) is applied after calibration.
     """
     from qat import calib_inputs_from_train, apply_skip_from_report
     from flashmha_qkv import pack_to_linears
+    from ptq_sensitivity import set_module_quant  # noqa: used in skip_k
     from ptq_sensitivity import set_module_quant
 
     cfg2 = Config.fromfile(cfg_path)
@@ -151,18 +174,19 @@ def build_quantized(cfg, cfg_path, ckpt, skip_json, skip_k):
     mtq.quantize(wrapper_c, mtq.INT8_DEFAULT_CFG, _calib)
     if bn_backup:
         model.load_state_dict(bn_backup, strict=False)
-    if skip_json and os.path.exists(skip_json):
-        if skip_k is not None:
-            with open(skip_json, "r", encoding="utf-8") as f:
-                ranked = [p for p, _ in json.load(f).get("ranked", [])]
-            for name in ranked[:skip_k]:
-                try:
-                    set_module_quant(wrapper_c, [name], False)
-                except Exception:
-                    pass
-            print(f"skip-list: manual top-{skip_k} kept in FP")
-        else:
-            apply_skip_from_report(wrapper_c, skip_json)
+    if protect_groups:
+        keep_modules_for_groups(wrapper_c, protect_groups)
+    elif skip_k is not None:
+        with open(skip_json, "r", encoding="utf-8") as f:
+            ranked = [p for p, _ in json.load(f).get("ranked", [])]
+        for name in ranked[:skip_k]:
+            try:
+                set_module_quant(wrapper_c, [name], False)
+            except Exception:
+                pass
+        print(f"skip-list: manual top-{skip_k} kept in FP")
+    elif skip_json and os.path.exists(skip_json):
+        apply_skip_from_report(wrapper_c, skip_json)
 
     if is_plain:
         # QAT state_dict: weights + amax, restored onto the quant structure
@@ -217,6 +241,10 @@ def main():
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--skip-json", default=None)
     ap.add_argument("--skip-k", type=int, default=None)
+    ap.add_argument("--protect-groups", default=None,
+                    help="comma list of functional groups kept in FP "
+                         "(e.g. det_head_output); overrides --skip-json/"
+                         "--skip-k")
     ap.add_argument("--tag", required=True)
     ap.add_argument("--version", default=None,
                     help="e.g. v1.0-trainval (default: config's mini)")
@@ -246,8 +274,11 @@ def main():
     if args.mode == "fp32":
         model = build_fp32(args.config, args.checkpoint)
     else:
+        groups = ([g.strip() for g in args.protect_groups.split(",")]
+                  if args.protect_groups else None)
         model = build_quantized(cfg, args.config, args.checkpoint,
-                                args.skip_json, args.skip_k)
+                                args.skip_json, args.skip_k,
+                                protect_groups=groups)
 
     ds = build_eval_dataset(cfg, args.version, args.ann_file,
                             args.data_root, args.max_samples)

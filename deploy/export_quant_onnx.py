@@ -91,6 +91,13 @@ def main():
     ap.add_argument("--skip-sim", action="store_true")
     ap.add_argument("--skip-json", default=None)
     ap.add_argument("--skip-k", type=int, default=None)
+    ap.add_argument("--protect-groups", default=None,
+                    help="comma list of functional groups kept in FP "
+                         "(e.g. det_head_output); overrides skip options")
+    ap.add_argument("--attn-fp16", action="store_true",
+                    help="emit attention QK^T/softmax/PV in fp16 (matches "
+                         "the flash_attn kernels the checkpoint was "
+                         "trained with; ~half the attention bandwidth)")
     args = ap.parse_args()
     _enable_traceable_fake_quant()
 
@@ -104,7 +111,6 @@ def main():
     if "head" in cfg.model:
         cfg.model.head.task_config = cfg.task_config
 
-    qat_full = args.checkpoint.replace(".pth", "_model.pt")
     model = build_detector(cfg.model, test_cfg=cfg.get("test_cfg"))
     # QAT checkpoints carry q/k/v Linears (not the packed in_proj), so
     # surgery must run BEFORE quantization/load for the keys to line up
@@ -112,12 +118,20 @@ def main():
     n_attn = pack_to_linears(model)
     model.cuda().eval()
 
+    # checkpoint routing: mmcv-wrapped dict = fp32/PTQ weights (load BEFORE
+    # calibration); plain state_dict = QAT weights+amax (load after quantize)
+    from eval_nuscenes import _load_weights, keep_modules_for_groups
+    sd = torch.load(args.checkpoint, map_location="cpu")
+    is_qat = not (isinstance(sd, dict) and "state_dict" in sd)
+
     # rebuild the quantized model in-process: ModelOpt 0.11 Quant* classes
     # are dynamically generated (unpicklable), so QAT ships a state_dict
     # that is restored onto an identically-quantized structure here
     from qat import calib_inputs_from_train, apply_skip_from_report
     import modelopt.torch.quantization as mtq
     sys.path.append(os.path.join(ROOT, "deploy"))
+    if not is_qat:
+        _load_weights(model, args.checkpoint)
     wrapper_c, calib_inputs = calib_inputs_from_train(cfg, model, 16)
 
     # keep BN in eval during calib (see qat.py: train-mode calib pollutes
@@ -138,7 +152,10 @@ def main():
     mtq.quantize(wrapper_c, mtq.INT8_DEFAULT_CFG, _calib)
     if bn_backup:
         model.load_state_dict(bn_backup, strict=False)
-    if args.skip_json and os.path.exists(args.skip_json):
+    if args.protect_groups:
+        groups = [g.strip() for g in args.protect_groups.split(",")]
+        keep_modules_for_groups(wrapper_c, groups)
+    elif args.skip_json and os.path.exists(args.skip_json):
         if args.skip_k is not None:
             import json
             with open(args.skip_json, "r", encoding="utf-8") as f:
@@ -153,10 +170,9 @@ def main():
         else:
             apply_skip_from_report(wrapper_c, args.skip_json)
 
-    sd = torch.load(args.checkpoint, map_location="cpu")
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    print(f"loaded QAT state: {len(sd)} tensors "
-          f"(missing {len(missing)}, unexpected {len(unexpected)})")
+    if is_qat:
+        model.load_state_dict(sd, strict=False)
+        print(f"loaded QAT state: {len(sd)} tensors")
     print(f"QKV surgery: {n_attn} FlashMHA modules (checkpoint: "
           f"{args.checkpoint})")
 
@@ -212,6 +228,31 @@ def main():
         )
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
+
+    if args.attn_fp16:
+        # during trace, run QK^T/softmax/PV in fp16: the checkpoint was
+        # trained with fp16 flash kernels, and half matmuls halve the
+        # attention bandwidth on TRT
+        from projects.mmdet3d_plugin.models.attention import FlashAttention
+
+        def _fp16_export_forward(self, q, k, v, causal=False,
+                                 key_padding_mask=None):
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            scale = self.softmax_scale if self.softmax_scale is not None \
+                else q.size(-1) ** -0.5
+            q16, k16, v16 = q.half(), k.half(), v.half()
+            w = torch.matmul(q16, k16.transpose(-2, -1)) * scale
+            if key_padding_mask is not None:
+                m = key_padding_mask.unsqueeze(1).unsqueeze(1).bool()
+                w = w.masked_fill(m, float("-inf"))
+            w = torch.softmax(w, dim=-1)
+            out = torch.matmul(w, v16)
+            return out.transpose(1, 2).contiguous().float(), None
+
+        FlashAttention.forward = _fp16_export_forward
+        print("attention export dtype: fp16")
 
     for first_frame, suffix in [(True, "_first"), (False, "")]:
         out_path = args.out.replace(".onnx", f"{suffix}.onnx")
