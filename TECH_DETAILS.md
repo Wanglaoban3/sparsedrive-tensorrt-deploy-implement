@@ -1,5 +1,10 @@
 # SparseDrive TensorRT Deployment and Optimization Technical Details
 
+> This document covers the workstation (RTX 3090, FP16 multi-engine) era.
+> For the Jetson Orin (INT8+FP16) delivery and the full eight-round
+> optimization journal - including rigorously documented negative results -
+> see [docs/OPTIMIZATION_SUMMARY.md](docs/OPTIMIZATION_SUMMARY.md).
+
 During the process of migrating an extremely complex end-to-end autonomous driving model like SparseDrive from PyTorch to a TensorRT (TRT) Engine, I encountered numerous hidden operator performance bottlenecks and graph compilation errors.
 This document details my troubleshooting journey and core optimization solutions in areas such as **model refactoring, ONNX static graph export, and extreme CUDA operator squeezing**, hoping to inspire community developers.
 

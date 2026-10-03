@@ -83,6 +83,119 @@ def simplify_onnx(model_path):
         print("onnxsim not installed; skipped")
 
 
+def _run_reference(model, out_npz, fp16_attn=True, first_frame=False):
+    """量化后、trace 前, 在同一进程用同一量化状态生成数值参考.
+
+    - fp16 attention 前向与 --attn-fp16 trace 语义一致
+    - DFA 换成与 ONNX 侧桩逐运算一致的确定性桩, 并记录 12 个调用点的
+      5 路输入+输出 (供 cmp_mid_onnx.py 逐点对拍)
+    - 输入用固定 seed 现场生成并保存, 结束后恢复真实 DAF 再做 trace
+    - first_frame=True 时历史输入为 zeros/-1/0 (与 _first 图语义一致)
+    """
+    import numpy as np
+    import projects.mmdet3d_plugin.models.blocks as blocks_mod
+    from projects.mmdet3d_plugin.models.attention import FlashAttention
+
+    if fp16_attn:
+        def _fp16_ref_forward(self, q, k, v, causal=False,
+                              key_padding_mask=None):
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            scale = self.softmax_scale if self.softmax_scale is not None \
+                else q.size(-1) ** -0.5
+            q16, k16, v16 = q.half(), k.half(), v.half()
+            w = torch.matmul(q16, k16.transpose(-2, -1)) * scale
+            if key_padding_mask is not None:
+                m = key_padding_mask.unsqueeze(1).unsqueeze(1).bool()
+                w = w.masked_fill(m, float("-inf"))
+            w = torch.softmax(w, dim=-1)
+            out = torch.matmul(w.half(), v16)
+            return out.transpose(1, 2).contiguous().float(), None
+
+        FlashAttention.forward = _fp16_ref_forward
+
+    orig_daf = blocks_mod.DAF
+    rec = {"_n": 0}
+
+    def _daf_stub(feat, spatial_shape, scale_start_index, points, weights):
+        f = feat.float().sum(dim=1)
+        lw = points.float().sum(dim=(2, 3, 4)) \
+            + weights.float().sum(dim=(2, 3, 4, 5))
+        sc = spatial_shape.float().sum() + scale_start_index.float().sum()
+        out = (f.unsqueeze(1) * lw.unsqueeze(2)) * sc
+        i = rec["_n"]
+        rec["_n"] += 1
+        rec[f"dfa{i}_feat"] = feat.detach().float().cpu().numpy()
+        rec[f"dfa{i}_shp"] = spatial_shape.detach().cpu().numpy()
+        rec[f"dfa{i}_ssi"] = scale_start_index.detach().cpu().numpy()
+        rec[f"dfa{i}_loc"] = points.detach().float().cpu().numpy()
+        rec[f"dfa{i}_w"] = weights.detach().float().cpu().numpy()
+        rec[f"dfa{i}_out"] = out.detach().float().cpu().numpy()
+        return out
+
+    blocks_mod.DAF = _daf_stub
+
+    wrapper = SparseDriveONNXWrapper(model)
+    bs, nc, H, W, embed = 1, 6, 256, 704, 256
+    n_det = model.head.det_head.instance_bank.num_temp_instances
+    n_map = model.head.map_head.instance_bank.num_temp_instances
+
+    torch.manual_seed(0)
+    if first_frame:
+        dfeat = torch.zeros(bs, n_det, embed)
+        danc = torch.zeros(bs, n_det, 11)
+        dconf = torch.zeros(bs, n_det)
+        did = torch.full((bs, n_det), -1, dtype=torch.int32)
+        didc = torch.zeros((bs, 1), dtype=torch.int32)
+        mfeat = torch.zeros(bs, n_map, embed)
+        manc = torch.zeros(bs, n_map, 40)
+        mconf = torch.zeros(bs, n_map)
+    else:
+        dfeat = torch.randn(bs, n_det, embed)
+        danc = torch.randn(bs, n_det, 11)
+        dconf = torch.rand(bs, n_det)
+        did = torch.randint(0, 100, (bs, n_det), dtype=torch.int32)
+        didc = torch.tensor([[100]], dtype=torch.int32)
+        mfeat = torch.randn(bs, n_map, embed)
+        manc = torch.randn(bs, n_map, 40)
+        mconf = torch.rand(bs, n_map)
+    inputs = (
+        torch.randn(bs, nc, 3, H, W),
+        torch.randn(bs, nc, 4, 4),
+        dfeat, danc, dconf, did, didc,
+        mfeat, manc, mconf,
+        torch.eye(4).unsqueeze(0),
+        torch.tensor([0.5], dtype=torch.float32),
+    )
+    names = ["img", "projection_mat", "prev_det_feat", "prev_det_anchor",
+             "prev_det_conf", "prev_det_id", "prev_id_count",
+             "prev_map_feat", "prev_map_anchor", "prev_map_conf",
+             "instance_t_matrix", "time_interval"]
+    os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
+    np.savez(out_npz + ".inputs.npz",
+             **{n_: t.numpy() for n_, t in zip(names, inputs)})
+
+    model.eval()  # BN must use running stats here, not batch stats
+
+    with torch.no_grad():
+        outputs = wrapper(*[t.cuda() for t in inputs])
+    out_names = ["det_cls", "det_bbox", "det_quality", "det_instance_feature",
+                 "det_anchor_embed", "det_instance_id", "next_det_feat",
+                 "next_det_anchor", "next_det_conf", "next_det_instance_id",
+                 "next_id_count", "map_cls", "map_pts", "map_instance_feature",
+                 "map_anchor_embed", "next_map_feat", "next_map_anchor",
+                 "next_map_conf", "ego_feature_map"]
+    assert len(outputs) == len(out_names), len(outputs)
+    np.savez(out_npz, **{n_: o.detach().float().cpu().numpy()
+                         for n_, o in zip(out_names, outputs)})
+    mid = {k: v for k, v in rec.items() if k != "_n"}
+    np.savez(out_npz + ".mid.npz", **mid)
+    print(f"REF saved: {len(outputs)} outputs, {rec['_n']} dfa calls "
+          f"-> {out_npz}")
+    blocks_mod.DAF = orig_daf
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="projects/configs/sparsedrive_small_stage2.py")
@@ -94,6 +207,14 @@ def main():
     ap.add_argument("--protect-groups", default=None,
                     help="comma list of functional groups kept in FP "
                          "(e.g. det_head_output); overrides skip options")
+    ap.add_argument("--with-ref", default=None, metavar="NPZ",
+                    help="after quantization, run the SAME quantized model "
+                         "in-process (fixed fp16 attention + deterministic "
+                         "DFA stub) on seeded inputs and save inputs+outputs"
+                         "+DFA call-site intermediates to NPZ(.inputs/.mid);"
+                         " this is the numeric reference the exported ONNX "
+                         "is gated against - same process => same quant "
+                         "state, no calibration randomness between them")
     ap.add_argument("--attn-fp16", action="store_true",
                     help="emit attention QK^T/softmax/PV in fp16 (matches "
                          "the flash_attn kernels the checkpoint was "
@@ -132,6 +253,14 @@ def main():
     sys.path.append(os.path.join(ROOT, "deploy"))
     if not is_qat:
         _load_weights(model, args.checkpoint)
+    # 校准确定性: train 管线带随机增广, 不锁 RNG 的话每次 mtq.quantize
+    # 落在不同量化状态, 导出的 ONNX 无法与任何参考/验证对上
+    import random
+    import numpy as np
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
     wrapper_c, calib_inputs = calib_inputs_from_train(cfg, model, 16)
 
     # keep BN in eval during calib (see qat.py: train-mode calib pollutes
@@ -152,6 +281,9 @@ def main():
     mtq.quantize(wrapper_c, mtq.INT8_DEFAULT_CFG, _calib)
     if bn_backup:
         model.load_state_dict(bn_backup, strict=False)
+    # quantize 的校准循环可能把模型留在 train 模式: BN 会用 batch 统计计算并
+    # 持续刷新 running stats, 必须回到 eval, 否则参考/trace 落在不同统计上
+    model.eval()
     if args.protect_groups:
         groups = [g.strip() for g in args.protect_groups.split(",")]
         keep_modules_for_groups(wrapper_c, groups)
@@ -175,6 +307,9 @@ def main():
         print(f"loaded QAT state: {len(sd)} tensors")
     print(f"QKV surgery: {n_attn} FlashMHA modules (checkpoint: "
           f"{args.checkpoint})")
+
+    if args.with_ref:
+        _run_reference(model, args.with_ref, fp16_attn=args.attn_fp16)
 
     wrapper = SparseDriveONNXWrapper(model)
 
@@ -248,12 +383,15 @@ def main():
                 m = key_padding_mask.unsqueeze(1).unsqueeze(1).bool()
                 w = w.masked_fill(m, float("-inf"))
             w = torch.softmax(w, dim=-1)
-            out = torch.matmul(w, v16)
+            # w is f32 here (the scale Mul promoted it); PV must run f16/f16
+            # or the exported graph gets an illegal mixed-type MatMul
+            out = torch.matmul(w.half(), v16)
             return out.transpose(1, 2).contiguous().float(), None
 
         FlashAttention.forward = _fp16_export_forward
         print("attention export dtype: fp16")
 
+    model.eval()  # trace 必须在 eval 语义下: BN 用 running stats
     for first_frame, suffix in [(True, "_first"), (False, "")]:
         out_path = args.out.replace(".onnx", f"{suffix}.onnx")
         print(f"exporting {out_path} ...")

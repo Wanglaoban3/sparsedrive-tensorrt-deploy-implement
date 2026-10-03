@@ -1,0 +1,17 @@
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.cpp text eol=lf
+*.cu text eol=lf
+*.cc text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.tsv text eol=lf
+*.engine binary
+*.onnx binary
+*.pth binary
+*.pkl binary
+*.npz binary
+*.png binary
+*.jpg binary

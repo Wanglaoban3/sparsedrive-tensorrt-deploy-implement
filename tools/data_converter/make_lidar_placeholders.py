@@ -12,7 +12,7 @@ Run AFTER blob extraction so real files (if any blob carried lidar) win:
 import json
 import os
 
-ROOT = r"H:\datasets\nuscenes-trainval"
+ROOT = r"data/nuscenes"
 META = os.path.join(ROOT, "v1.0-trainval")
 
 with open(os.path.join(META, "sample.json"), encoding="utf-8") as f:

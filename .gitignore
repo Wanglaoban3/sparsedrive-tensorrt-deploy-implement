@@ -34,3 +34,9 @@ deploy/artifacts/eval_*/results_nusc.json
 
 _official/
 *.err
+
+# agent/session working notes (local infra details, not for the public repo)
+AGENTS.md
+*.engine
+*.zip
+evaldata/

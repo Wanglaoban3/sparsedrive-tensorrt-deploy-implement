@@ -1,5 +1,9 @@
 # SparseDrive TensorRT 部署与优化技术细节
 
+> 本文档覆盖工作站（RTX 3090，FP16 多引擎）阶段。Jetson Orin
+> （INT8+FP16）交付与完整八轮优化日志（含严谨归档的负结果）见
+> [docs/OPTIMIZATION_SUMMARY.md](docs/OPTIMIZATION_SUMMARY.md)。
+
 在将 SparseDrive 这种极其复杂的端到端自动驾驶模型从 PyTorch 迁移到 TensorRT（TRT）Engine 的过程中，我遇到了大量隐蔽的算子性能瓶颈和图编译报错。
 本文档详细记录了我在**模型重构、ONNX 静态图导出、CUDA 算子极致压榨**等方面的踩坑过程与核心优化方案，希望对社区开发者有所启发。
 

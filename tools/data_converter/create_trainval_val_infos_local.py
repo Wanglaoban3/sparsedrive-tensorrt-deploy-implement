@@ -7,9 +7,9 @@ converter's file-existence checks pass (the eval pipeline never reads
 lidar).  Ego status is reconstructed from keyframe ego poses; the map
 extractor is stubbed (map_annos empty - det mAP/NDS unaffected).
 
-Before running:
-  - H:\\datasets\\nuscenes-trainval\\v1.0-trainval\\  (metadata)
-  - H:\\datasets\\nuscenes-trainval\\samples\\CAM_*\\  (extracted)
+Before running, point NUSCENES_ROOT at a camera-only layout:
+  - $NUSCENES_ROOT/v1.0-trainval/  (metadata)
+  - $NUSCENES_ROOT/samples/CAM_*/  (extracted)
   - placeholders: python tools/data_converter/make_lidar_placeholders.py
 
 Run from project root:
@@ -26,7 +26,8 @@ sys.path.insert(0, os.path.join(ROOT, "tools", "data_converter"))
 import numpy as np
 from pyquaternion import Quaternion
 
-DATA_ROOT = r"H:\datasets\nuscenes-trainval"
+DATA_ROOT = os.environ.get("NUSCENES_ROOT",
+                           os.path.join(ROOT, "data", "nuscenes"))
 sys.argv = [
     "create_trainval_val_infos_local.py", "nuscenes",
     "--root-path", DATA_ROOT,
