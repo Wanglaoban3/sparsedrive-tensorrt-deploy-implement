@@ -260,6 +260,23 @@ OPTIMIZATION_SUMMARY 第十三轮。方法学：跨 run 的 bit 比对必然失�
 （TRT tactic 非确定），判别新旧路径差异要用"当前二进制原模式重跑"做对照
 （`_m7a_gate.py` / `_m7a_bit2.py` / `_m7a_cmp.py`）。
 
+M8 设备池零拷贝实验（`--dma`，2026-10-03 定案，平台负结果）：iGPU 上
+跨进程设备池三条标准路全部实测不可用——(a) cuMemCreate VMM 分配 + POSIX
+fd 导出成功，但 `cuMemMap` invalid argument（primary context 就绪、尺寸按
+granularity 2MB 对齐后仍失败；VMM 映射 dGPU-only）；(b) `cudaIpcGetMemHandle`
+成功但跨进程 `cudaIpcOpenMemHandle` invalid argument（两个真实进程，
+flags=0 与 lazy 均试）；(c) NvBufSurface 运行库/头文件不在本镜像（裸工业
+版，无多媒体包）。因此 mapped-shm + cudaHostRegisterMapped（M1.5 交付机制）
+就是 Orin iGPU 唯一跨进程零拷贝路径（unified DRAM，12.96 GB/s 基线已是
+设备侧读带宽），**交付维持 mapped-shm**；`--dma` 开关与 fd 池代码
+（sp_dmapool.h/.cpp、sp_bus v2 RingMeta dma 尾字段、claim_of/commit_dma）
+留档为真实相机迁移点：JetPack 多媒体镜像上仅需把消费端 handle 类型
+OpaqueFd→DmaBufFd（cudaExternalMemoryImportFd），池/fence/节点机制复用。
+证据链：`deploy/prepost/probe_vmm.cu` / `probe_vmm2.cu`（板端
+`nvcc -O2 -arch=sm_87 ... -lcuda`，驱动 `deploy/_m8_probe.py`）；
+门禁 `_m8_gate.py`（base 模式 81 帧、pre p50=1.45ms、信箱 81 写全过；
+RingMeta v2 双向 guard 生效——--dma 节点遇未注册池正确拒绝）。
+
 ## 10. 坑索引（每条详情见 AGENTS.md 对应小节 / OPTIMIZATION_SUMMARY"遇到的主要坑"）
 
 | # | 坑 | 一句话修法 |
@@ -276,6 +293,8 @@ OPTIMIZATION_SUMMARY 第十三轮。方法学：跨 run 的 bit 比对必然失�
 | 10 | Windows cmd 多行 python -c 静默失败 | 一律 Write 临时 .py 再跑（本项目最高频坑） |
 | 11 | dump 参考数据 provenance 不明被当真值 | 任何历史 dump 先用常量链哨兵验明正身 |
 | 12 | 单引擎图 map −10.4pt | 全图编译 tactic 损伤，非量化；拆分链复活——不要再试整图 |
+| 13 | cuMemCreate invalid argument | size 必须按 granularity 对齐（本板 2MB）；对齐后 create/export 通过，但 iGPU 上 cuMemMap 依然 invalid argument——VMM 映射 dGPU-only |
+| 14 | iGPU 跨进程设备池全灭 | cudaIpcOpenMemHandle 与 cuMemMap 在 Orin iGPU 均 invalid argument；唯一零拷贝 = host mapped shm（即交付机制）；另：fork 子进程里 CUDA 调用静默失败（探针 IPC 段假象） |
 
 ## 11. 工件与数据清单（复刻时去哪找）
 

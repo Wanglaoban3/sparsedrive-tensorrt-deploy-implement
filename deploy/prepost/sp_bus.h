@@ -23,7 +23,7 @@ constexpr int kMaxCams = 6;
 constexpr int kMaxConsumers = 8;
 constexpr int kRingDepth = 4;
 constexpr uint32_t kMagic = 0x53504231;  // "SPB1"
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;  // v2: + M8 dmabuf 池尾字段 (向后兼容 append)
 constexpr size_t kNameMax = 64;
 
 // FrameMeta.flags 源状态位 (发布端置位, 消费端只读透传到结果消息):
@@ -75,6 +75,12 @@ struct RingMeta {
   std::atomic<int32_t> n_consumers;
   ConsumerEntry cons[kMaxConsumers];
   uint64_t forced_recycles;     // lease-expired references stolen
+  // v2 尾段: M8 dmabuf 池注册 (发布端建池+listen 后置位; fd 走 UDS 旁路,
+  // 不进 RingMeta). 消费端 --dma 校验三者一致后 OpaqueFd 导入.
+  uint32_t dma_present;         // 0/1
+  uint32_t dma_n_slots;
+  uint64_t dma_slot_bytes;
+  uint32_t reserved2[5];
 };
 
 // Read-only view handed to a consumer. `cam[i]` points into the shared
@@ -98,10 +104,16 @@ class Bus {
   // Rotates to the next slot and blocks (bounded by timeout_ms) until its
   // reference count drops to 0; lease-expired holders are force-recycled.
   // Returns the payload pointer to fill, or nullptr on timeout.
-  uint8_t* claim(int64_t timeout_ms);
+  uint8_t* claim(int64_t timeout_ms) { return claim_of(nullptr, timeout_ms); }
+  // M8: 同 claim(), 另回槽位号 (--dma 写池槽用).
+  uint8_t* claim_of(int32_t* slot_idx, int64_t timeout_ms);
   // Publishes the slot filled after claim(): assigns the sequence number
   // and wakes consumers. `meta` fields except seq are taken as-is.
   void commit(FrameMeta meta);
+  // M8: --dma 发布 (payload 在设备池, 校验和由发布端自算, 不读 shm 重算).
+  void commit_dma(FrameMeta meta);
+  // M8: 建池后注册池几何 (消费端开环即可见; 必须在消费者 attach 前调用).
+  void set_dma_info(uint32_t n_slots, uint64_t slot_bytes);
 
   // --- consumer side ---
   int32_t register_consumer();

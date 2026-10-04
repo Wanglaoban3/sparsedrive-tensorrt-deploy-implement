@@ -43,6 +43,7 @@ SRCS = ["sp_bus.h", "sp_bus.cpp", "image_source.h", "file_source.h",
         "sp_filesrc.cpp", "sp_kernels.h", "sp_kernels.cu",
         "preproc.h", "preproc.cu", "sp_preproc_test.cpp",
         "postproc.h", "sp_result.h", "sp_resultmon.cpp",
+        "sp_dmapool.h", "sp_dmapool.cpp",
         "sp_modelnode.cpp"]
 
 
@@ -90,6 +91,8 @@ def stage_build(cli):
 set -e
 cd {bd}
 g++ -O2 -std=c++14 -Wall -Wextra -pthread -c sp_bus.cpp -o sp_bus.o
+g++ -O2 -std=c++14 -Wall -Wextra -pthread -c sp_dmapool.cpp -o sp_dmapool.o \
+    -I/usr/local/cuda/include
 g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_pub.cpp sp_bus.o -o sp_pub -lrt
 g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_inspect.cpp sp_bus.o -o sp_inspect -lrt
 nvcc -O3 -arch=sm_87 -c sp_kernels.cu -o sp_kernels.o
@@ -104,15 +107,16 @@ else
   echo SUB_CUDA=no
 fi
 g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_filesrc.cpp file_source.cpp \
-    sp_bus.o -o sp_filesrc -lrt
+    sp_bus.o sp_dmapool.o -o sp_filesrc -lrt \
+    -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lcudart -lcuda
 g++ -O2 -std=c++14 sp_preproc_test.cpp preproc.o \
     -o sp_preproc_test -I/usr/local/cuda/include \
     -L/usr/local/cuda/lib64 -lcudart
 g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_resultmon.cpp sp_bus.o \
     -o sp_resultmon -lrt
-g++ -O2 -std=c++14 sp_modelnode.cpp preproc.o sp_bus.o \
+g++ -O2 -std=c++14 sp_modelnode.cpp preproc.o sp_bus.o sp_dmapool.o \
     -o sp_modelnode -I/usr/local/cuda/include -I/usr/local/cuda/include \
-    -L/usr/local/cuda/lib64 -lcudart -lnvinfer -ldl -lrt -lpthread
+    -L/usr/local/cuda/lib64 -lcudart -lcuda -lnvinfer -ldl -lrt -lpthread
 cp -f sp_pub sp_sub sp_inspect sp_filesrc sp_preproc_test sp_modelnode \
     sp_resultmon /usr/local/bin/
 echo BUILD_DONE

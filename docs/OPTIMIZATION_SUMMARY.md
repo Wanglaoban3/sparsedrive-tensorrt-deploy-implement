@@ -952,3 +952,45 @@ bit 比对必然失败，只有容差与 mAP/EPA 口径有效。已记入 AGENTS
 
 **遗留方向**：吞吐要破 22.7fps 天花板只有减小每帧 SM 工作量——DLA offload
 int8 bb2（需验证 DLA INT8 conv 支持与 plugin 边界）或升 TRT 重 tactical。
+
+## 第十四轮：M8 设备池零拷贝采集——iGPU 平台三路全灭（2026-10-03 定案，已优雅退出）
+
+**方案**：dmabuf/NvBufSurface 风格零拷贝采集的 CUDA 模拟器——发布端
+sp_filesrc `--dma` 建每槽一块的设备内存池、fd 经 UDS SCM_RIGHTS 一次性分发；
+消费端 sp_modelnode `--dma` cudaExternalMemoryImportFd 映射设备指针直喂
+现有 preproc kernel（kernel 零改动）；shm payload 不填，校验和对 host 源自
+算；槽位回收复用 bus claim/release+fence 纪律（RingMeta 升 v2 带 dma 几何
+尾字段，双向 guard：--dma 节点遇未注册池拒绝、非 dma 节点遇 dma 池拒绝）。
+
+**平台实测（Orin X iGPU, CUDA 11.4/JetPack 5, 全部有探针证据）**：
+
+| 路径 | 结果 | 证据 |
+|---|---|---|
+| cuMemCreate（VMM 分配） | 尺寸按 granularity（本板 2MB）对齐后成功；未对齐=invalid argument（M8 首败根因） | probe_vmm.cu |
+| cuMemExportToShareableHandle（POSIX fd） | 成功（rc=0） | probe_vmm.cu |
+| **cuMemMap** | **invalid argument——primary ctx 就绪、2MB 对齐仍失败；VMM 映射 dGPU-only，iGPU 上分配了也无法映射** | probe_vmm2.cu |
+| **cudaIpcOpenMemHandle** | **invalid argument（两个真实进程，flags=0 与 LazyEnablePeerAccess 均试；GetMemHandle 成功、句柄送达正常）** | sp_filesrc/sp_modelnode 两进程实测 |
+| NvBufSurface（真 dmabuf 分配器） | 本镜像无运行库无头文件（裸工业版无多媒体包），无法模拟 | _m8_nvbuf.py |
+
+**结论：交付维持 mapped-shm + cudaHostRegisterMapped（M1.5 机制）**。它
+本来就是 Orin iGPU 唯一的跨进程零拷贝路径：unified DRAM 下 host 映射内存的
+设备读就是设备侧读，12.96 GB/s 基线即平台带宽。"设备池绕开 C2C 读"的收益
+在 iGPU 上不存在对应机制。dma 模式等价门禁（逐字节 preproc 输出比对）按
+计划前置条件失效，不适用。
+
+**留档（真实相机迁移点）**：`sp_dmapool.h/.cpp`（fd 池 + 对齐修复 +
+OpaqueFd 导入）、`sp_bus` v2 dma 尾字段 + `claim_of`/`commit_dma`、
+`sp_filesrc`/`sp_modelnode` 的 `--dma` 与双向 guard、探针
+`probe_vmm.cu`/`probe_vmm2.cu`（`deploy/_m8_probe.py` 板端驱动）、门禁
+`_m8_gate.py`。base 模式门禁通过（81 帧、pre p50=1.45ms、信箱 81 写），
+RingMeta v2 双向 guard 生效被 dma 失败路径反向验证。换 JetPack 多媒体镜像
++ 真 ISP 相机时：池由 NvBufSurface 分配产真 dmabuf fd，消费端仅换
+handle 类型 OpaqueFd→DmaBufFd，池/fence/节点机制全部复用。
+
+**附带坑（已记 AGENTS）**：(1) cuMemCreate 尺寸必须按 granularity 对齐，
+未对齐报 invalid argument 且错误信息不含"对齐"线索；(2) driver API 与
+runtime 的 context 不同步，cuMemMap 前需 cuDevicePrimaryCtxRetain +
+cuCtxSetCurrent（本例主因是 iGPU 不支持，但 ctx 缺失同样报 invalid
+argument，判障时两者都要排除）；(3) fork 子进程里 CUDA 调用静默失败
+（probe_vmm IPC 段 got=0 假象），进程间 CUDA 共享探针必须 fork+exec；
+(4) 驱动 API 链接要 -lcuda（nvcc 不会自动带）。

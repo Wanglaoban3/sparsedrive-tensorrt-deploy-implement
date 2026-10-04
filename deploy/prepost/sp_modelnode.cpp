@@ -57,6 +57,7 @@
 #include "postproc.h"
 #include "preproc.h"
 #include "sp_bus.h"
+#include "sp_dmapool.h"
 #include "sp_result.h"
 
 using namespace sp;
@@ -281,7 +282,7 @@ int main(int argc, char** argv) {
             "<out_dir> [--hd hd.engine] [--mp mp.engine] [--frames N] "
             "[--warmup W] [--dump-img N] [--img-from P] [--serial] [--graph] "
             "[--dual] [--loop] [--no-dump] [--det-thr F] [--map-thr F] "
-            "[--det-topk N] [--mailbox NAME] [--cmd N]\n",
+            "[--det-topk N] [--mailbox NAME] [--cmd N] [--dma]\n",
             argv[0]);
     return 2;
   }
@@ -298,6 +299,7 @@ int main(int argc, char** argv) {
   const char* img_from = nullptr;  // 隔离模式: 目录根/模板/单文件
   bool serial = false, use_graph = false, loop = false, no_dump = false;
   bool dual = false;  // M7a: bb2 独立流与 hd+mp 重叠
+  bool use_dma = false;  // M8: 采集源走设备池 (fd 导入), 绕开 mapped-shm 读
   float det_thr = 0.0f, map_thr = 0.0f;  // Q2: 默认=离线评测口径(全保留)
   int det_topk = 300;
   int plan_cmd = 2;  // M6b: final_plan 便捷解码的 cmd (2=直行; 真 cmd 车辆给)
@@ -313,6 +315,7 @@ int main(int argc, char** argv) {
       img_from = argv[++i];
     else if (!strcmp(argv[i], "--serial")) serial = true;
     else if (!strcmp(argv[i], "--dual")) dual = true;
+    else if (!strcmp(argv[i], "--dma")) use_dma = true;
     else if (!strcmp(argv[i], "--graph")) use_graph = true;
     else if (!strcmp(argv[i], "--loop")) loop = true;
     else if (!strcmp(argv[i], "--no-dump")) no_dump = true;
@@ -382,6 +385,37 @@ int main(int argc, char** argv) {
   }
   printf("modelnode: registered %zu bytes, dev=%p\n", bus->mapped_bytes(),
          (void*)dev_base);
+
+  // ---- M8: --dma 设备池导入 (fd 旁路, 消费端 cudaExternalMemory) ----
+  const uint8_t* dma_dev[kRingDepth] = {};
+  if (use_dma || rm->dma_present) {
+    if (!rm->dma_present || !rm->dma_slot_bytes) {
+      fprintf(stderr, "modelnode: --dma 但发布端未注册设备池\n");
+      return 1;
+    }
+    if (!use_dma) {
+      fprintf(stderr, "modelnode: 发布端为 --dma 池 (shm payload 空), "
+                      "节点必须加 --dma\n");
+      return 1;
+    }
+    DmaPoolInfo want = {};
+    want.magic = 0x53445031;  // "SDP1" (sp_dmapool.h)
+    want.n_slots = rm->dma_n_slots;
+    want.slot_bytes = rm->dma_slot_bytes;
+    want.width = rm->width;
+    want.height = rm->height;
+    DmaPoolSub* sub = new DmaPoolSub();
+    if (!sub->attach(ring, want, err, sizeof(err))) {
+      fprintf(stderr, "modelnode: dma attach: %s\n", err);
+      return 1;
+    }
+    if (want.n_slots > kRingDepth) {
+      fprintf(stderr, "modelnode: dma slots %u > ring depth\n", want.n_slots);
+      return 1;
+    }
+    for (uint32_t i = 0; i < want.n_slots; ++i)
+      dma_dev[i] = sub->dev(i);
+  }
 
   // ---- preproc ----
   Preproc pre;
@@ -1266,8 +1300,10 @@ int main(int argc, char** argv) {
       cudaMemcpyAsync(d_img[p], refimg[p].data(), refimg[p].size(),
                       cudaMemcpyHostToDevice, pre_stream);
     } else {
+      // M8: --dma 时读设备池槽 (fd 导入的设备指针), 否则读 mapped-shm
       const uint8_t* slot_dev =
-          dev_base + (v.cam[0] - (const uint8_t*)bus->base());
+          use_dma ? dma_dev[v.slot_idx]
+                  : dev_base + (v.cam[0] - (const uint8_t*)bus->base());
       pre.run(slot_dev, rm->cam_bytes, d_img[p], pre_stream);
     }
     cudaEventRecord(ev_preB[p], pre_stream);

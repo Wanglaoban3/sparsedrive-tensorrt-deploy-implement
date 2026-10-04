@@ -1,8 +1,10 @@
 // sp_filesrc: manifest 驱动的 NV12 文件回放发布进程 (M1).
 // 用法: sp_filesrc <ring> <w> <h> <fps> <manifest.jsonl> <data_root>
-//                 [--loop] [--fresh] [--frames N]
+//                 [--loop] [--fresh] [--frames N] [--wait-cons N] [--dma]
 // IImageSource(FileReplaySource) → 拷贝进 shm ring 槽位 → commit.
-// 拷贝 12.9MB/帧 ~2ms, 2Hz 回放下可忽略; 零拷贝路径由 M5 dmabuf 源承担.
+// 拷贝 12.9MB/帧 ~2ms, 2Hz 回放下可忽略; --dma 走 M8 设备池零拷贝:
+// 文件字节 H2D 进 fd 可共享设备池 (SCM_RIGHTS 分发, 消费端
+// cudaExternalMemory 导入), shm payload 不填, 校验和对 host 源自算.
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -13,8 +15,11 @@
 #include <chrono>
 #include <thread>
 
+#include <cuda_runtime.h>
+
 #include "file_source.h"
 #include "sp_bus.h"
+#include "sp_dmapool.h"
 
 using namespace sp;
 
@@ -26,7 +31,7 @@ int main(int argc, char** argv) {
   if (argc < 7) {
     fprintf(stderr,
             "usage: %s <ring> <w> <h> <fps> <manifest.jsonl> <data_root> "
-            "[--loop] [--fresh] [--frames N]\n",
+            "[--loop] [--fresh] [--frames N] [--wait-cons N] [--dma]\n",
             argv[0]);
     return 2;
   }
@@ -36,13 +41,14 @@ int main(int argc, char** argv) {
   double fps = atof(argv[4]);
   const char* manifest = argv[5];
   const char* root = argv[6];
-  bool fresh = false, unlink_exit = false, loop = false;
+  bool fresh = false, unlink_exit = false, loop = false, dma = false;
   long n_frames = -1;
   int wait_cons = 0;
   for (int i = 7; i < argc; ++i) {
     if (!strcmp(argv[i], "--fresh")) fresh = true;
     else if (!strcmp(argv[i], "--unlink")) unlink_exit = true;
     else if (!strcmp(argv[i], "--loop")) loop = true;
+    else if (!strcmp(argv[i], "--dma")) dma = true;
     else if (!strcmp(argv[i], "--wait-cons") && i + 1 < argc)
       wait_cons = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--frames") && i + 1 < argc)
@@ -69,6 +75,18 @@ int main(int argc, char** argv) {
   const RingMeta* m = bus->meta();
   printf("filesrc: ring %ux%u cam=%u frame=%u slots=%u\n", m->width,
          m->height, m->cam_bytes, m->frame_bytes, kRingDepth);
+  // M8: --dma 建设备池 + fd 服务, 先于消费者注册注册池几何
+  DmaPoolPub pool;
+  if (dma) {
+    if (!pool.create(kRingDepth, m->frame_bytes, err, sizeof(err)) ||
+        !pool.serve(name, err, sizeof(err))) {
+      fprintf(stderr, "filesrc: dma pool: %s\n", err);
+      return 1;
+    }
+    // RingMeta 携带对齐后槽尺寸, 与 UDS DmaPoolInfo 一致 (消费端比对用)
+    bus->set_dma_info(kRingDepth, pool.slot_bytes());
+    printf("filesrc: dma pool ON (payload shm 槽不填)\n");
+  }
   printf("filesrc: manifest=%s entries=%zu %s\n", manifest,
          src.num_entries(), loop ? "loop" : "once");
   if (wait_cons > 0) {
@@ -86,7 +104,8 @@ int main(int argc, char** argv) {
   while (!g_stop && (n_frames < 0 || published < n_frames)) {
     // 先 claim 占槽, 后读盘: claim 失败不消耗清单条目 → seq↔manifest 永不错位
     int64_t ta = now_ms();
-    uint8_t* p = bus->claim(1000);
+    int32_t slot_idx = -1;
+    uint8_t* p = bus->claim_of(dma ? &slot_idx : nullptr, 1000);
     if (!p) {
       blocked += 1;
       fprintf(stderr, "filesrc: claim timeout (holders stuck?)\n");
@@ -103,9 +122,21 @@ int main(int argc, char** argv) {
       fprintf(stderr, "filesrc: acquire rc=%d\n", rc);
       continue;
     }
-    memcpy(p, v.cam[0], m->frame_bytes);
     FrameMeta meta = v.meta;  // seq 由 commit 重排, ts/scene 透传
-    bus->commit(meta);
+    if (dma) {
+      // 设备池路径: 文件字节 → 池槽 (设备), shm payload 不填;
+      // 校验和对 host 源自算 (commit_dma 不重读 shm)
+      if (cudaMemcpy(pool.dev(slot_idx), v.cam[0], m->frame_bytes,
+                     cudaMemcpyHostToDevice) != cudaSuccess) {
+        fprintf(stderr, "filesrc: dma h2d slot %d failed\n", slot_idx);
+        return 1;
+      }
+      meta.checksum = sampled_checksum(v.cam[0], m->frame_bytes);
+      bus->commit_dma(meta);
+    } else {
+      memcpy(p, v.cam[0], m->frame_bytes);
+      bus->commit(meta);
+    }
     src.release(v);
     published += 1;
     if (published % 30 == 0)

@@ -169,7 +169,7 @@ Bus::~Bus() {
   if (fd_ >= 0) close(fd_);
 }
 
-uint8_t* Bus::claim(int64_t timeout_ms) {
+uint8_t* Bus::claim_of(int32_t* slot_idx, int64_t timeout_ms) {
   const int64_t lease = lease_ms_from_env();
   const int64_t deadline = now_ms() + timeout_ms;
   pthread_mutex_lock(&m_->mu);
@@ -186,6 +186,7 @@ uint8_t* Bus::claim(int64_t timeout_ms) {
               m_->frame_bytes);
 #endif
       pthread_mutex_unlock(&m_->mu);
+      if (slot_idx) *slot_idx = idx;
       return payload_of(idx);
     }
     force_stale_locked(m_->pub_idx, now_ms(), lease);
@@ -193,6 +194,7 @@ uint8_t* Bus::claim(int64_t timeout_ms) {
       s.meta.seq = 0;
       const int32_t idx = m_->pub_idx;
       pthread_mutex_unlock(&m_->mu);
+      if (slot_idx) *slot_idx = idx;
       return payload_of(idx);
     }
     struct timespec ts;
@@ -226,6 +228,31 @@ void Bus::commit(FrameMeta meta) {
   m_->pub_idx = (idx + 1) % kRingDepth;
   pthread_cond_broadcast(&m_->cv_frame);
   pthread_mutex_unlock(&m_->mu);
+}
+
+void Bus::commit_dma(FrameMeta meta) {
+  const int32_t idx = m_->pub_idx;
+  SlotHdr& s = *slot(idx);
+  meta.width = m_->width;
+  meta.height = m_->height;
+  meta.cam_bytes = m_->cam_bytes;
+  meta.frame_bytes = m_->frame_bytes;
+  if (meta.group_ts_ns == 0) meta.group_ts_ns = now_real_ns();
+  // 校验和由发布端对 host 侧源数据自算 (payload 不落 shm, 无法重算)
+  pthread_mutex_lock(&m_->mu);
+  s.meta = meta;
+  s.meta.seq = m_->latest_seq + 1;
+  m_->latest_seq = s.meta.seq;
+  m_->published_count += 1;
+  m_->pub_idx = (idx + 1) % kRingDepth;
+  pthread_cond_broadcast(&m_->cv_frame);
+  pthread_mutex_unlock(&m_->mu);
+}
+
+void Bus::set_dma_info(uint32_t n_slots, uint64_t slot_bytes) {
+  m_->dma_present = 1;
+  m_->dma_n_slots = n_slots;
+  m_->dma_slot_bytes = slot_bytes;
 }
 
 int32_t Bus::register_consumer() {
