@@ -59,6 +59,7 @@
 #include "sp_bus.h"
 #include "sp_dmapool.h"
 #include "sp_result.h"
+#include "sp_watch.h"
 
 using namespace sp;
 
@@ -345,8 +346,7 @@ int main(int argc, char** argv) {
 
   ManifestV2 man;
   if (!load_manifest_v2(manifest_path, &man)) {
-    fprintf(stderr, "modelnode: bad manifest\n");
-    return 1;
+    fatal_exit(10, "init", "bad manifest %s", manifest_path);
   }
   printf("modelnode: manifest %zu frames, %ux%u -> %ux%u\n",
          man.frames.size(), man.pp.src_w, man.pp.src_h, man.pp.out_w,
@@ -367,21 +367,18 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
   }
   if (!bus) {
-    fprintf(stderr, "modelnode: bus open: %s\n", err);
-    return 1;
+    fatal_exit(10, "init", "bus open: %s", err);
   }
   const RingMeta* rm = bus->meta();
   cudaError_t ce = cudaHostRegister(bus->base(), bus->mapped_bytes(),
                                     cudaHostRegisterMapped);
   if (ce != cudaSuccess) {
-    fprintf(stderr, "modelnode: register: %s\n", cudaGetErrorString(ce));
-    return 1;
+    fatal_exit(12, "init", "register: %s", cudaGetErrorString(ce));
   }
   uint8_t* dev_base = nullptr;
   ce = cudaHostGetDevicePointer((void**)&dev_base, bus->base(), 0);
   if (ce != cudaSuccess) {
-    fprintf(stderr, "modelnode: getdevptr: %s\n", cudaGetErrorString(ce));
-    return 1;
+    fatal_exit(12, "init", "getdevptr: %s", cudaGetErrorString(ce));
   }
   printf("modelnode: registered %zu bytes, dev=%p\n", bus->mapped_bytes(),
          (void*)dev_base);
@@ -390,13 +387,10 @@ int main(int argc, char** argv) {
   const uint8_t* dma_dev[kRingDepth] = {};
   if (use_dma || rm->dma_present) {
     if (!rm->dma_present || !rm->dma_slot_bytes) {
-      fprintf(stderr, "modelnode: --dma 但发布端未注册设备池\n");
-      return 1;
+      fatal_exit(10, "init", "--dma 但发布端未注册设备池");
     }
     if (!use_dma) {
-      fprintf(stderr, "modelnode: 发布端为 --dma 池 (shm payload 空), "
-                      "节点必须加 --dma\n");
-      return 1;
+      fatal_exit(10, "init", "发布端为 --dma 池 (shm payload 空), 节点必须加 --dma");
     }
     DmaPoolInfo want = {};
     want.magic = 0x53445031;  // "SDP1" (sp_dmapool.h)
@@ -406,12 +400,10 @@ int main(int argc, char** argv) {
     want.height = rm->height;
     DmaPoolSub* sub = new DmaPoolSub();
     if (!sub->attach(ring, want, err, sizeof(err))) {
-      fprintf(stderr, "modelnode: dma attach: %s\n", err);
-      return 1;
+      fatal_exit(10, "init", "dma attach: %s", err);
     }
     if (want.n_slots > kRingDepth) {
-      fprintf(stderr, "modelnode: dma slots %u > ring depth\n", want.n_slots);
-      return 1;
+      fatal_exit(10, "init", "dma slots %u > ring depth", want.n_slots);
     }
     for (uint32_t i = 0; i < want.n_slots; ++i)
       dma_dev[i] = sub->dev(i);
@@ -420,8 +412,7 @@ int main(int argc, char** argv) {
   // ---- preproc ----
   Preproc pre;
   if (!pre.init(man.pp, err, sizeof(err))) {
-    fprintf(stderr, "modelnode: preproc: %s\n", err);
-    return 1;
+    fatal_exit(12, "init", "preproc: %s", err);
   }
   cudaStream_t pre_stream, eng_stream, post_stream;
   cudaStream_t eng_streamB = nullptr;  // M7a: bb2 专用流 (--dual)
@@ -465,8 +456,7 @@ int main(int argc, char** argv) {
   const char* main_path = use_hd ? hd_path : engine_path;
   void* plug = dlopen(plugin_so, RTLD_NOW);
   if (!plug) {
-    fprintf(stderr, "modelnode: dlopen(%s): %s\n", plugin_so, dlerror());
-    return 1;
+    fatal_exit(11, "init", "dlopen(%s): %s", plugin_so, dlerror());
   }
   printf("modelnode: plugin %s\n", plugin_so);
   Logger logger;
@@ -474,12 +464,13 @@ int main(int argc, char** argv) {
       nvinfer1::createInferRuntime(logger));
   auto load_eng = [&](const char* path) {
     FILE* f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "modelnode: open engine %s failed\n", path); exit(1); }
+    if (!f) fatal_exit(11, "init", "open engine %s failed", path);
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     std::vector<char> blob(sz);
-    if (fread(blob.data(), 1, sz, f) != (size_t)sz) exit(1);
+    if (fread(blob.data(), 1, sz, f) != (size_t)sz)
+      fatal_exit(11, "init", "short read engine %s", path);
     fclose(f);
     return std::unique_ptr<nvinfer1::ICudaEngine>(
         rt->deserializeCudaEngine(blob.data(), sz));
@@ -492,11 +483,10 @@ int main(int argc, char** argv) {
   std::string bb_out_name;
   if (use_hd) {
     engineBB = load_eng(engine_path);
-    if (!engineBB) { fprintf(stderr, "modelnode: bb2 deserialize FAILED\n"); return 1; }
+    if (!engineBB) fatal_exit(11, "init", "bb2 deserialize FAILED");
     for (int p = 0; p < kPar; ++p) ctxBB[p] = engineBB->createExecutionContext();
     if (!ctxBB[0] || !ctxBB[1]) {
-      fprintf(stderr, "modelnode: bb2 createExecutionContext FAILED\n");
-      return 1;
+      fatal_exit(11, "init", "bb2 createExecutionContext FAILED");
     }
     int nbB = engineBB->getNbIOTensors();
     bindsBB.resize(nbB);
@@ -522,8 +512,7 @@ int main(int argc, char** argv) {
         } else if (!strcmp(name, "projection_mat")) {
           for (int p = 0; p < kPar; ++p) b.dev[p] = d_proj[p];
         } else {
-          fprintf(stderr, "modelnode: bb2 unexpected input %s\n", name);
-          return 1;
+          fatal_exit(11, "init", "bb2 unexpected input %s", name);
         }
       } else {
         bb_out_name = name;
@@ -532,20 +521,18 @@ int main(int argc, char** argv) {
       }
     }
     if (n_out != 1) {
-      fprintf(stderr, "modelnode: bb2 outputs=%d (期望 1)\n", n_out);
-      return 1;
+      fatal_exit(11, "init", "bb2 outputs=%d (期望 1)", n_out);
     }
     printf("modelnode: bb2 %d tensors, boundary out %s\n", nbB,
            bb_out_name.c_str());
   }
 
   auto engine = load_eng(main_path);
-  if (!engine) { fprintf(stderr, "modelnode: deserialize FAILED\n"); return 1; }
+  if (!engine) fatal_exit(11, "init", "deserialize FAILED %s", main_path);
   nvinfer1::IExecutionContext* ctx[kPar] = {nullptr, nullptr};
   for (int p = 0; p < kPar; ++p) ctx[p] = engine->createExecutionContext();
   if (!ctx[0] || !ctx[1]) {
-    fprintf(stderr, "modelnode: createExecutionContext FAILED\n");
-    return 1;
+    fatal_exit(11, "init", "createExecutionContext FAILED");
   }
 
   const int nb = engine->getNbIOTensors();
@@ -570,22 +557,21 @@ int main(int argc, char** argv) {
       if (!strcmp(name, "img")) {
         for (int p = 0; p < kPar; ++p) b.dev[p] = d_img[p];
       } else if (!strcmp(name, "projection_mat")) {
-        if (b.bytes != 6 * 16 * 4) { fprintf(stderr, "proj size %zu\n", b.bytes); return 1; }
+        if (b.bytes != 6 * 16 * 4) fatal_exit(11, "init", "proj size %zu", b.bytes);
         for (int p = 0; p < kPar; ++p) b.dev[p] = d_proj[p];
       } else if (!strcmp(name, "instance_t_matrix")) {
-        if (b.bytes != 16 * 4) { fprintf(stderr, "tmat size %zu\n", b.bytes); return 1; }
+        if (b.bytes != 16 * 4) fatal_exit(11, "init", "tmat size %zu", b.bytes);
         for (int p = 0; p < kPar; ++p) b.dev[p] = d_tmat[p];
       } else if (!strcmp(name, "time_interval")) {
-        if (b.bytes != 4) { fprintf(stderr, "dt size %zu\n", b.bytes); return 1; }
+        if (b.bytes != 4) fatal_exit(11, "init", "dt size %zu", b.bytes);
         for (int p = 0; p < kPar; ++p) b.dev[p] = d_dt[p];
       } else if (use_hd && b.name == bb_out_name) {
         // M5 边界张量: 按 parity 固定双份 (graph 地址要求), bb2 输出直写
         for (int p = 0; p < kPar; ++p) {
           ce = cudaMalloc(&b.dev[p], b.bytes);
           if (ce != cudaSuccess) {
-            fprintf(stderr, "modelnode: boundary malloc: %s\n",
-                    cudaGetErrorString(ce));
-            return 1;
+            fatal_exit(12, "init", "boundary malloc: %s",
+                       cudaGetErrorString(ce));
           }
         }
         printf("modelnode: boundary %s (%zu B x%d, D2D 直供)\n", name,
@@ -611,27 +597,24 @@ int main(int argc, char** argv) {
     Bind* bnd = nullptr;
     for (auto& b : binds)
       if (b.is_input && b.name == bb_out_name) bnd = &b;
-    if (!bb_out || !bnd) { fprintf(stderr, "modelnode: boundary wire fail\n"); return 1; }
+    if (!bb_out || !bnd) fatal_exit(11, "init", "boundary wire fail");
     if (bb_out->bytes != bnd->bytes || bb_out->dt != bnd->dt) {
-      fprintf(stderr, "modelnode: boundary mismatch bb %zuB/%d vs hd %zuB/%d\n",
-              bb_out->bytes, (int)bb_out->dt, bnd->bytes, (int)bnd->dt);
-      return 1;
+      fatal_exit(11, "init", "boundary mismatch bb %zuB/%d vs hd %zuB/%d",
+                 bb_out->bytes, (int)bb_out->dt, bnd->bytes, (int)bnd->dt);
     }
     for (int p = 0; p < kPar; ++p) bb_out->dev[p] = bnd->dev[p];
     for (int p = 0; p < kPar; ++p)
       for (auto& b : bindsBB)
         if (!ctxBB[p]->setTensorAddress(b.name.c_str(), b.dev[p])) {
-          fprintf(stderr, "modelnode: bb2 setTensorAddress %s ctx%d failed\n",
-                  b.name.c_str(), p);
-          return 1;
+          fatal_exit(11, "init", "bb2 setTensorAddress %s ctx%d failed",
+                     b.name.c_str(), p);
         }
   }
   for (int p = 0; p < kPar; ++p)
     for (auto& b : binds)
       if (!ctx[p]->setTensorAddress(b.name.c_str(), b.dev[p])) {
-        fprintf(stderr, "modelnode: setTensorAddress %s ctx%d failed\n",
-                b.name.c_str(), p);
-        return 1;
+        fatal_exit(11, "init", "setTensorAddress %s ctx%d failed",
+                   b.name.c_str(), p);
       }
   printf("modelnode: %d tensors bound x%d ctx (%s)\n", nb, kPar,
          use_hd ? "split bb2+hd" : "single");
@@ -641,7 +624,7 @@ int main(int argc, char** argv) {
     if (st.in->name == "prev_det_id") next = "next_det_instance_id";
     for (auto& b : binds)
       if (!b.is_input && b.name == next) st.out = &b;
-    if (!st.out) { fprintf(stderr, "no output %s\n", next.c_str()); return 1; }
+    if (!st.out) fatal_exit(11, "init", "no output %s", next.c_str());
   }
   // 状态零填 (首帧): f32 → 0; i32 → -1 (id) / 0 (count)
   for (auto& st : states) {
@@ -694,9 +677,9 @@ int main(int argc, char** argv) {
       return nullptr;
     };
     engineM = load_eng(mp_path);
-    if (!engineM) { fprintf(stderr, "modelnode: mp deserialize FAILED\n"); return 1; }
+    if (!engineM) fatal_exit(11, "init", "mp deserialize FAILED");
     ctxM = engineM->createExecutionContext();
-    if (!ctxM) { fprintf(stderr, "modelnode: mp ctx FAILED\n"); return 1; }
+    if (!ctxM) fatal_exit(11, "init", "mp ctx FAILED");
     int nbM = engineM->getNbIOTensors();    bindsM.resize(nbM);
     for (int i = 0; i < nbM; ++i) {
       const char* name = engineM->getIOTensorName(i);
@@ -714,7 +697,7 @@ int main(int argc, char** argv) {
       b.bytes = vol * es;
       if (b.is_input) {
         if (!strcmp(name, "t_matrix")) {
-          if (b.bytes != 16 * 4) { fprintf(stderr, "mp tmat size %zu\n", b.bytes); return 1; }
+          if (b.bytes != 16 * 4) fatal_exit(11, "init", "mp tmat size %zu", b.bytes);
           for (int p = 0; p < kPar; ++p) b.dev[p] = d_tmat[p];
           continue;
         }
@@ -727,21 +710,18 @@ int main(int argc, char** argv) {
           // 状态口径一致; 反馈对/零填在下面 mstates 一节接
           void* st1 = nullptr;
           if (cudaMalloc(&st1, b.bytes) != cudaSuccess) {
-            fprintf(stderr, "modelnode: mp state %s alloc FAILED\n", name);
-            return 1;
+            fatal_exit(12, "init", "mp state %s alloc FAILED", name);
           }
           b.dev[0] = b.dev[1] = st1;
           continue;
         }
         Bind* sb = find_bind(src);
         if (!sb || sb->is_input) {
-          fprintf(stderr, "modelnode: mp input %s: 感知输出 %s 不存在\n", name, src);
-          return 1;
+          fatal_exit(11, "init", "mp input %s: 感知输出 %s 不存在", name, src);
         }
         if (sb->bytes != b.bytes || sb->dt != b.dt) {
-          fprintf(stderr, "modelnode: mp %s mismatch mp %zuB/%d vs per %zuB/%d\n",
-                  name, b.bytes, (int)b.dt, sb->bytes, (int)sb->dt);
-          return 1;
+          fatal_exit(11, "init", "mp %s mismatch mp %zuB/%d vs per %zuB/%d",
+                     name, b.bytes, (int)b.dt, sb->bytes, (int)sb->dt);
         }
         for (int p = 0; p < kPar; ++p) b.dev[p] = sb->dev[p];
       } else if (!strncmp(name, "next_", 5)) {
@@ -771,7 +751,7 @@ int main(int argc, char** argv) {
       Bind* ob = nullptr;
       for (auto& x : bindsM)
         if (!x.is_input && x.name == next) { ob = &x; break; }
-      if (!ob) { fprintf(stderr, "modelnode: no mp output %s\n", next.c_str()); return 1; }
+      if (!ob) fatal_exit(11, "init", "no mp output %s", next.c_str());
       mstates.push_back({&b, ob});
     }
     // 状态零填 + 场景复位模板 (prev id 全 -1, 其余全 0)
@@ -798,7 +778,7 @@ int main(int argc, char** argv) {
     return true;
   };
   if (use_mp) {
-    if (!mp_bind_all(0)) { fprintf(stderr, "modelnode: mp bind failed\n"); return 1; }
+    if (!mp_bind_all(0)) fatal_exit(11, "init", "mp bind failed");
     printf("modelnode: mp %d tensors (%zu outs, %zu states)\n",
            (int)bindsM.size(), outs_mp.size(), mstates.size());
   }
@@ -829,9 +809,8 @@ int main(int argc, char** argv) {
     };
     for (auto& c : chk)
       if (c.b->bytes != c.want) {
-        fprintf(stderr, "modelnode: %s bytes=%zu want=%zu (decode 口径失配)\n",
-                c.nm, c.b->bytes, c.want);
-        return 1;
+        fatal_exit(11, "init", "%s bytes=%zu want=%zu (decode 口径失配)",
+                   c.nm, c.b->bytes, c.want);
       }
     printf("modelnode: decode on (det_thr=%.3f topk=%d map_thr=%.3f)\n",
            det_thr, det_topk, map_thr);
@@ -847,16 +826,17 @@ int main(int argc, char** argv) {
   // dump 目录预建 (落盘移出关键路径); out_dir 本身无论是否 dump 都要建
   {
     std::string cmd = "mkdir -p " + out_dir;
-    if (system(cmd.c_str()) != 0) return 1;
+    if (system(cmd.c_str()) != 0)
+      fatal_exit(10, "init", "mkdir %s failed", out_dir.c_str());
   }
   if (!no_dump) {
     for (long k = 0; k < n_frames; ++k) {
       char d[512];
       snprintf(d, sizeof(d), "mkdir -p %s/out_%02ld", out_dir.c_str(), k);
-      if (system(d) != 0) return 1;
+      if (system(d) != 0) fatal_exit(10, "init", "mkdir %s failed", d);
       if (use_mp) {
         snprintf(d, sizeof(d), "mkdir -p %s/outm_%02ld", out_dir.c_str(), k);
-        if (system(d) != 0) return 1;
+        if (system(d) != 0) fatal_exit(10, "init", "mkdir %s failed", d);
       }
     }
   }
@@ -915,17 +895,14 @@ int main(int argc, char** argv) {
       cudaMemset(d_tmat[p], 0, 16 * 4);
       cudaMemset(d_dt[p], 0, 4);
       if (use_hd && !ctxBB[p]->enqueueV3(dual ? eng_streamB : eng_stream)) {
-        fprintf(stderr, "modelnode: warmup bb2 enqueue FAILED\n");
-        return 1;
+        fatal_exit(12, "warmup", "bb2 enqueue FAILED");
       }
       if (!ctx[p]->enqueueV3(eng_stream)) {
-        fprintf(stderr, "modelnode: warmup enqueue FAILED\n");
-        return 1;
+        fatal_exit(12, "warmup", "enqueue FAILED");
       }
       if (use_mp) {
         if (!mp_bind_all(p) || !ctxM->enqueueV3(eng_stream)) {
-          fprintf(stderr, "modelnode: warmup mp enqueue FAILED\n");
-          return 1;
+          fatal_exit(12, "warmup", "mp enqueue FAILED");
         }
       }
       cudaStreamSynchronize(eng_stream);
@@ -997,13 +974,17 @@ int main(int argc, char** argv) {
   }
 
   // 引擎就绪后才注册为消费者 —— filesrc --wait-cons 以此为发布起点,
-  // 保证 node 从 seq 1 开始消费, seq↔manifest 严格对齐
+  // 保证 node 从 seq 1 开始消费, seq↔manifest 严格对齐.
+  // watchdog 在图捕获完成后、进主循环前启动 (冷启动/加载期不设防).
+  watch_start();
   const int32_t cid = bus->register_consumer();
-  if (cid < 0) { fprintf(stderr, "modelnode: no consumer slot\n"); return 1; }
+  if (cid < 0) fatal_exit(11, "init", "no consumer slot");
   printf("modelnode: consumer registered, ready\n");
 
   // ---- 主循环 (默认流水线: 提交不阻塞, CPU 只在完成帧处同步) ----
   uint64_t last_seq = 0;
+  uint64_t seq_base = 0;  // resync 基线: 中途接入时设为 首帧seq-1, 之后
+                          // 期望 seq = seq_base + submitted + 1
   uint32_t cur_scene = 0xFFFFFFFFu;
   bool have_prev = false;
   double prev_l2g[16];
@@ -1022,8 +1003,7 @@ int main(int argc, char** argv) {
   res::Mailbox* mailbox = res::Mailbox::create(mailbox_name.c_str(), rerr,
                                                sizeof(rerr));
   if (!mailbox) {
-    fprintf(stderr, "modelnode: mailbox: %s\n", rerr);
-    return 1;
+    fatal_exit(12, "init", "mailbox: %s", rerr);
   }
   printf("modelnode: mailbox sp_res_%s ready\n", mailbox_name.c_str());
   FILE* fjson = nullptr;
@@ -1035,6 +1015,7 @@ int main(int argc, char** argv) {
   // 每帧提交时留档 (收割时填进结果消息; complete_frame 只看帧号)
   std::vector<uint64_t> f_seq(n_frames, 0);
   std::vector<int64_t> f_ts(n_frames, 0);
+  std::vector<int64_t> f_acq_ns(n_frames, 0);  // acquire 墙钟 (frame_age 基准)
   std::vector<uint32_t> f_scene(n_frames, 0), f_flags(n_frames, 0);
 
   std::vector<double> s_pre, s_inf, s_post, s_svc, s_dec, s_json;
@@ -1045,6 +1026,8 @@ int main(int argc, char** argv) {
 
   // 完成帧 j: 等 post D2H → 读事件耗时 → dump → 记日志
   auto complete_frame = [&](long j) {
+    watch_touch(kWsPost);
+    int64_t wpost0 = watch_now_ms();
     int p = (int)(j & 1);
     if (!no_dump) cudaEventSynchronize(ev_post[p]);
     else cudaEventSynchronize(ev_inf1[p]);
@@ -1058,6 +1041,9 @@ int main(int argc, char** argv) {
     if (!no_dump) cudaEventElapsedTime(&post_ms, ev_inf1[p], ev_post[p]);
     if (!no_dump) cudaEventElapsedTime(&gpu_ms, ev_preA[p], ev_post[p]);
     else cudaEventElapsedTime(&gpu_ms, ev_preA[p], ev_inf1[p]);
+    // 设防段只盖 GPU 同步等待 (hang 在这里现形); 落盘/解码/发布是 IO
+    watch_record(kWsPost, (double)(watch_now_ms() - wpost0));
+    watch_touch(kWsIo);
     double ready = now_ns();
     if (!t_first_ready) t_first_ready = ready;
     t_last_ready = ready;
@@ -1081,7 +1067,9 @@ int main(int argc, char** argv) {
       msg.version = res::kVer;
       msg.header_size = (uint16_t)offsetof(res::ResultMsg, det);
       msg.seq = f_seq[j];
-      msg.ts_capture_ns = f_ts[j];
+      // acquire 墙钟, 不用 manifest group_ts_ns (nuscenes 采集纪元, 与
+      // now 相减是 8 年, age 恒钳 65535); 评估口径仍走 f_ts
+      msg.ts_capture_ns = f_acq_ns[j];
       msg.frame_id = (uint32_t)j;
       // 打包: scene 高 24b; 低 8b = 源状态位重映射 — bit0 source_ok,
       // bit1..6 cam[0..5] ok (原 flags bits 8..13), bit7 备用
@@ -1137,6 +1125,15 @@ int main(int argc, char** argv) {
         msg.cmd = (uint32_t)plan_cmd;
       }
       msg.crc = res::msg_crc(msg, crc32);
+      // ---- v3 fail-visible (M-PROD A4): Phase A 恒 NOMINAL, 年龄照实填.
+      // age = 发布时刻 - 捕获时刻 (CLOCK_REALTIME, group_ts_ns 同源).
+      msg.status = res::kStatusNominal;
+      msg.reason = res::kReasonNone;
+      msg.wd_stage = (uint8_t)watch_cur_stage();
+      msg.last_valid_seq = (uint32_t)f_seq[j];
+      int64_t age_ms = (now_real_ns() - msg.ts_capture_ns) / 1000000;
+      msg.frame_age_ms = (uint16_t)(age_ms < 0 ? 0
+                                    : (age_ms > 65535 ? 65535 : age_ms));
       mailbox->publish(msg);
       double t_d1 = now_ns();
       if (fjson) {
@@ -1201,6 +1198,7 @@ int main(int argc, char** argv) {
     FrameView v;
     int nto = 0;
     bool got = false;
+    watch_touch(kWsAcq);
     while (!g_stop) {
       if (bus->acquire(cid, last_seq, &v, 2000) == 0) { got = true; break; }
       if (++nto > 30) {
@@ -1214,22 +1212,34 @@ int main(int argc, char** argv) {
     if (!got) break;
     double acq_ms = (now_ns() - t0) / 1e6;
     last_seq = v.meta.seq;
-    if (v.meta.seq != (uint64_t)(submitted + 1)) {
-      fprintf(stderr, "modelnode: SEQ MISALIGN got seq %lu expect %lu "
-              "(帧丢失, 终止)\n", (unsigned long)v.meta.seq,
-              (unsigned long)(submitted + 1));
-      bus->release(&v);
-      abort_run = true;
+    watch_seq(v.meta.seq);
+    if (v.meta.seq != seq_base + (uint64_t)(submitted + 1)) {
+      if (submitted == 0 && v.meta.seq > 1) {
+        // 服务重启重同步: unit 不带 --fresh, 环持久化 seq 单调, 中途接入
+        // 从当前 seq 续跑 (精度在下一场景边界自然刷新, 见 spec §5 A3)
+        printf("modelnode: resync at seq %lu (mid-stream attach)\n",
+               (unsigned long)v.meta.seq);
+        seq_base = v.meta.seq - 1;
+      } else {
+        fatal_exit(12, "run", "seq misalign got %lu expect %lu",
+                   (unsigned long)v.meta.seq,
+                   (unsigned long)(seq_base + submitted + 1));
+      }
     }
-    if (abort_run) break;
     t_acq[k] = t0;
     acq_ms_v[k] = acq_ms;
     f_seq[k] = v.meta.seq;
     f_ts[k] = v.meta.group_ts_ns;
+    f_acq_ns[k] = now_real_ns();  // 场景进入节点时刻 (age 语义: 消费方
+                                  // now-ts_capture 覆盖处理+重启间隙旧化)
     f_scene[k] = v.meta.scene_id;
     f_flags[k] = v.meta.flags;
     int p = (int)(k & 1);
-    const FrameMetaV2& fm = man.frames[k % nman];
+    // manifest 配对跟 seq 走: filesrc 从 seq=1 起按 seq s 携带 manifest[(s-1)%nman]
+    // (含 --loop 回绕)。中途接入 (resync) 时 k 与 seq 不再同步, k%nman 会
+    // 配错帧, seq 配对在任何接入时机都精确。
+    long mki = (long)((v.meta.seq - 1) % (uint64_t)nman);
+    const FrameMetaV2& fm = man.frames[mki];
 
     // 场景边界/首帧: 首帧零状态已在循环前完成; 边界与链路二口径一致 ——
     // 只重置 t_matrix(identity)+dt(0.5), 实例状态跨场景保留
@@ -1244,7 +1254,7 @@ int main(int argc, char** argv) {
 
     // P2 + t_matrix + dt (host, double)
     float proj[96];
-    make_projection(man, (int)(k % nman), proj);
+    make_projection(man, (int)mki, proj);
     float tmat[16];
     if (reset) {
       for (int i = 0; i < 16; ++i) tmat[i] = i % 5 == 0 ? 1.f : 0.f;
@@ -1262,7 +1272,13 @@ int main(int argc, char** argv) {
     // ---- pre submit (异步) ----
     // 该 parity 的 host 暂存上一次使用是 k-2 帧: 等那次 H2D 真正执行完
     // 才允许覆写 pinned 源 (正常远早于此就完成, 这里只是正确性兜底)
+    watch_touch(kWsPre);
+    watch_maybe_stall(kWsPre, k);
+    int64_t wpre0 = watch_now_ms();
     if (k >= 2) cudaEventSynchronize(ev_preB[p]);
+    // 设防段只盖 GPU 同步; 之后的 pinned 拷贝/读图是 IO (不设防)
+    watch_record(kWsPre, (double)(watch_now_ms() - wpre0));
+    watch_touch(kWsIo);
     memcpy(h_proj[p], proj, 96 * 4);
     memcpy(h_tmat[p], tmat, 16 * 4);
     memcpy(h_dt[p], &dt, 4);
@@ -1288,12 +1304,13 @@ int main(int argc, char** argv) {
         snprintf(pfb, sizeof(pfb), "%s", img_from);
       }
       FILE* g = fopen(pfb, "rb");
-      if (!g) { fprintf(stderr, "modelnode: open %s\n", pfb); return 1; }
+      if (!g) fatal_exit(10, "run", "open %s", pfb);
       fseek(g, 0, SEEK_END);
       long n = ftell(g);
       fseek(g, 0, SEEK_SET);
       refimg[p].resize(n);
-      if (fread(refimg[p].data(), 1, n, g) != (size_t)n) return 1;
+      if (fread(refimg[p].data(), 1, n, g) != (size_t)n)
+        fatal_exit(10, "run", "short read %s", pfb);
       fclose(g);
       if (k == 0)
         printf("modelnode: img-from %s (%ld bytes)\n", pfb, n);
@@ -1338,6 +1355,8 @@ int main(int argc, char** argv) {
     // 逐帧交错后 GPU 侧自然重叠: bb2(k+1) ∥ hd(k)+mp(k), 帧周期
     // ≈ max(bb2, hd+mp). 非双流路径与 M5 单流事件序完全一致.
     cudaStream_t sB = dual ? eng_streamB : eng_stream;
+    watch_touch(kWsBB2);
+    watch_maybe_stall(kWsBB2, k);
     cudaStreamWaitEvent(sB, ev_preB[p], 0);
     cudaStreamWaitEvent(sB, ev_post[p], 0);  // 槽 p 复用守卫 (B=边界, H=输出)
     cudaEventRecord(ev_inf0[p], sB);
@@ -1347,6 +1366,8 @@ int main(int argc, char** argv) {
       if (use_graph) ok = cudaGraphLaunch(gB[p], sB) == cudaSuccess;
       else ok = ctxBB[p]->enqueueV3(sB);
       cudaEventRecord(ev_b2[p], sB);
+      watch_touch(kWsHD);
+      watch_maybe_stall(kWsHD, k);
       if (ok) {
         cudaStreamWaitEvent(eng_stream, ev_post[p], 0);  // out[p] 复用守卫
         cudaStreamWaitEvent(eng_stream, dual ? ev_b2[p] : ev_preB[p], 0);
@@ -1374,6 +1395,8 @@ int main(int argc, char** argv) {
     cudaEventRecord(ev_hd[p], eng_stream);
     if (ok && use_mp) {
       // M6a: 场景首帧 mp 状态全清零 (模板 D2D, 同流定序), 再逐帧重绑+推理
+      watch_touch(kWsMP);
+      watch_maybe_stall(kWsMP, k);
       if (reset) {
         for (size_t si = 0; si < mstates.size(); ++si)
           cudaMemcpyAsync(mstates[si].in->dev[0], d_mrst[si],
@@ -1387,12 +1410,12 @@ int main(int argc, char** argv) {
                           cudaMemcpyDeviceToDevice, eng_stream);
     }
     if (!ok) {
-      fprintf(stderr, "modelnode: enqueue FAILED at %ld\n", k);
-      return 1;
+      fatal_exit(12, "run", "enqueue FAILED at frame %ld", k);
     }
     cudaEventRecord(ev_inf1[p], eng_stream);
 
     // ---- post submit (异步): 19 路 D2H → pinned host[p] ----
+    watch_touch(kWsPost);
     if (!no_dump) {
       cudaStreamWaitEvent(post_stream, ev_inf1[p], 0);
       for (auto* b : outs)
@@ -1453,5 +1476,12 @@ int main(int argc, char** argv) {
   ctx[0]->destroy();
   ctx[1]->destroy();
   printf("MODELNODE_DONE\n");
+  if (abort_run && loop) {
+    // --loop 常驻下源枯竭 = 发布端死亡: 退 20 让 systemd 重启本节点等待
+    // 发布端恢复 (Requires 不反向拉活, node 必须自己保持 restart 循环)。
+    // 评估/隔离跑是有限帧, 枯竭即正常收尾, 保持 0。
+    fprintf(stderr, "modelnode: upstream exhausted in loop mode, exit 20\n");
+    return 20;
+  }
   return 0;
 }

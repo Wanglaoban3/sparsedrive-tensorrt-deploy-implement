@@ -1,0 +1,18 @@
+[Unit]
+Description=SparseDrive replay publisher (%i)
+# systemd 245: StartLimit* 属于 [Unit], 放 [Service] 会被静默忽略
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sp/%i.env
+ExecStart=/usr/local/bin/sp_filesrc ${SP_RING} ${SP_W} ${SP_H} ${SP_FPS} \
+  ${SP_MANIFEST} ${SP_ROOT} --loop --wait-cons 1
+Restart=on-failure
+RestartSec=1s
+StandardOutput=append:/var/log/sp/filesrc-%i.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=SparseDrive perception node (%i)
+Requires=sp-filesrc@%i.service
+After=sp-filesrc@%i.service
+# systemd 245: StartLimit* 属于 [Unit], 放 [Service] 会被静默忽略
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sp/%i.env
+ExecStart=/usr/local/bin/sp_modelnode ${SP_RING} ${SP_MODELS_DIR}/e_bb2.engine \
+  ${SP_PLUGIN} ${SP_MANIFEST} ${SP_OUT} \
+  --hd ${SP_MODELS_DIR}/e_hd.engine --mp ${SP_MODELS_DIR}/e_mp.engine \
+  $SP_NODE_ARGS
+Restart=on-failure
+RestartSec=1s
+StandardOutput=append:/var/log/sp/node-%i.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

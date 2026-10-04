@@ -20,6 +20,7 @@
 #include "file_source.h"
 #include "sp_bus.h"
 #include "sp_dmapool.h"
+#include "sp_watch.h"
 
 using namespace sp;
 
@@ -60,8 +61,7 @@ int main(int argc, char** argv) {
   char err[256];
   Bus* bus = Bus::open(name, w, h, /*create=*/true, fresh, err, sizeof(err));
   if (!bus) {
-    fprintf(stderr, "filesrc: bus open: %s\n", err);
-    return 1;
+    fatal_exit(10, "init", "bus open: %s", err);
   }
   SourceConfig cfg;
   cfg.manifest_path = manifest;
@@ -69,8 +69,7 @@ int main(int argc, char** argv) {
   cfg.loop = loop;
   FileReplaySource src;
   if (src.open(cfg, err, sizeof(err)) != 0 || src.start() != 0) {
-    fprintf(stderr, "filesrc: source open: %s\n", err);
-    return 1;
+    fatal_exit(10, "init", "source open: %s", err);
   }
   const RingMeta* m = bus->meta();
   printf("filesrc: ring %ux%u cam=%u frame=%u slots=%u\n", m->width,
@@ -80,8 +79,7 @@ int main(int argc, char** argv) {
   if (dma) {
     if (!pool.create(kRingDepth, m->frame_bytes, err, sizeof(err)) ||
         !pool.serve(name, err, sizeof(err))) {
-      fprintf(stderr, "filesrc: dma pool: %s\n", err);
-      return 1;
+      fatal_exit(12, "init", "dma pool: %s", err);
     }
     // RingMeta 携带对齐后槽尺寸, 与 UDS DmaPoolInfo 一致 (消费端比对用)
     bus->set_dma_info(kRingDepth, pool.slot_bytes());
@@ -100,6 +98,8 @@ int main(int argc, char** argv) {
   const int64_t frame_ms =
       fps > 0 ? (int64_t)(1000.0 / fps) : 0;
   long published = 0, blocked = 0;
+  int consec_timeouts = 0;  // M-PROD A2: 连续 claim 超时 → exit 20 升级
+  bool exhausted = false;
   int64_t t0 = now_ms();
   while (!g_stop && (n_frames < 0 || published < n_frames)) {
     // 先 claim 占槽, 后读盘: claim 失败不消耗清单条目 → seq↔manifest 永不错位
@@ -108,13 +108,21 @@ int main(int argc, char** argv) {
     uint8_t* p = bus->claim_of(dma ? &slot_idx : nullptr, 1000);
     if (!p) {
       blocked += 1;
-      fprintf(stderr, "filesrc: claim timeout (holders stuck?)\n");
+      consec_timeouts += 1;
+      // 正常恢复路径靠 lease 强制回收 (M1.5); 连续 30 次 = 回收也失效,
+      // 交 systemd 重启 (spec §5 A3: exit 20 是兜底, 不是常规恢复动作)
+      if (consec_timeouts >= 30)
+        fatal_exit(20, "publish", "claim timeout x30 (recycle stuck?)");
+      fprintf(stderr, "filesrc: claim timeout (holders stuck?) %d/30\n",
+              consec_timeouts);
       continue;
     }
+    consec_timeouts = 0;
     FrameView v;
     int rc = src.acquire(v, 1000);
     if (rc == 2) {
       printf("filesrc: manifest exhausted at n=%ld\n", published);
+      exhausted = true;
       break;  // 占住的槽 ref=0, 下次 claim 自动复用, 无需回滚
     }
     if (rc != 0) {
@@ -160,5 +168,8 @@ int main(int argc, char** argv) {
     snprintf(full, sizeof(full), "/sp_%s", name);
     shm_unlink(full);
   }
+  // A2 退出码契约: 非 loop 模式清单耗尽 = 21 (编排可见的"正常结束";
+  // systemd 服务恒 --loop, 不会触发; 直接跑的门禁脚本不依赖该 rc)
+  if (exhausted && !loop) return 21;
   return 0;
 }

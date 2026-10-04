@@ -23,7 +23,7 @@ constexpr int kMaxCams = 6;
 constexpr int kMaxConsumers = 8;
 constexpr int kRingDepth = 4;
 constexpr uint32_t kMagic = 0x53504231;  // "SPB1"
-constexpr uint32_t kVersion = 2;  // v2: + M8 dmabuf 池尾字段 (向后兼容 append)
+constexpr uint32_t kVersion = 4;  // v4: 自研跨进程锁 (robust mutex 不可靠)
 constexpr size_t kNameMax = 64;
 
 // FrameMeta.flags 源状态位 (发布端置位, 消费端只读透传到结果消息):
@@ -58,6 +58,14 @@ struct ConsumerEntry {
   int32_t active;               // 0 free, 1 registered
 };
 
+// 跨进程锁 (自研, 替代 pthread robust mutex): 属主 pid+starttime 记在 shm,
+// /proc 证据表明属主已死/已复用时 CAS 强制接管, kill -9 安全不依赖内核
+// robust-list (平台实测 glibc 属主死亡移交在长跑 Orin 上偶发失效)。
+struct BusLock {
+  std::atomic<uint32_t> owner;  // 0=free, else owner pid
+  std::atomic<uint64_t> start;  // 属主 /proc/<pid>/stat starttime (防 pid 复用)
+};
+
 struct RingMeta {
   uint32_t magic;
   uint32_t version;
@@ -66,9 +74,7 @@ struct RingMeta {
   uint32_t cam_bytes;
   uint32_t frame_bytes;
   uint64_t slot_stride;         // sizeof(SlotHdr aligned) + frame_bytes
-  pthread_mutex_t mu;
-  pthread_cond_t cv_free;       // publisher: a held slot got released
-  pthread_cond_t cv_frame;      // consumers: a new frame was published
+  BusLock lk;                   // 互斥 (等待一律 lock 外 10ms 轮询, 无 cond)
   std::atomic<uint64_t> latest_seq;
   uint64_t published_count;
   uint32_t pub_idx;             // next slot the publisher rotates into

@@ -43,7 +43,7 @@ SRCS = ["sp_bus.h", "sp_bus.cpp", "image_source.h", "file_source.h",
         "sp_filesrc.cpp", "sp_kernels.h", "sp_kernels.cu",
         "preproc.h", "preproc.cu", "sp_preproc_test.cpp",
         "postproc.h", "sp_result.h", "sp_resultmon.cpp",
-        "sp_dmapool.h", "sp_dmapool.cpp",
+        "sp_dmapool.h", "sp_dmapool.cpp", "sp_watch.h",
         "sp_modelnode.cpp"]
 
 

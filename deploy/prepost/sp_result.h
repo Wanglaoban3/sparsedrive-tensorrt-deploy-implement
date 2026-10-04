@@ -28,7 +28,18 @@ namespace sp {
 namespace res {
 
 constexpr uint32_t kMagic = 0x53505231;   // "SPR1"
-constexpr uint16_t kVer = 2;              // v2: 追加 motion/plan 段 (M6b)
+constexpr uint16_t kVer = 3;              // v3: 尾部追加 fail-visible 段 (M-PROD A4)
+// ---- v3 fail-visible 状态/原因枚举 (M-PROD) ----
+enum {
+  kStatusNominal = 0,       // 本帧正常
+  kStatusDegReset = 1,      // 发散已复位, 本帧结果基于复位态 (Phase B)
+  kStatusDegLatch = 2,      // 持续异常, 载荷=last_valid + frame_age_ms 真实旧化
+  kStatusSelftestFail = 3   // 自检失败, det/map 清零, last_valid_seq=0
+};
+enum {
+  kReasonNone = 0, kReasonNan = 1, kReasonDivergence = 2,
+  kReasonResetCount = 3, kReasonSelftest = 4, kReasonStageFail = 5
+};
 constexpr int kDetCap = 300;              // 与 det topk 上限一致
 constexpr int kMapCap = post::kMapAnchors * post::kMapCls;
 constexpr int kPluginPathMax = 192;
@@ -59,7 +70,7 @@ struct ResultMsg {
   uint16_t version;             // kVer
   uint16_t header_size;         // offsetof(ResultMsg, det) 布局自证
   uint64_t seq;                 // 总线帧序 (1-based, 与 FrameMeta.seq 同源)
-  int64_t ts_capture_ns;        // CLOCK_REALTIME 捕获时间戳 (FrameMeta.group_ts_ns)
+  int64_t ts_capture_ns;        // CLOCK_REALTIME 节点 acquire 时刻 (非 manifest 采集 ts)
   uint32_t frame_id;            // 节点内帧号 (0-based, 回绕时随 seq 区分)
   uint32_t scene_flags;         // 高 24b scene_id, 低 8b 源状态位 (FrameMeta.flags)
   uint64_t config_hash;         // FNV1a(engine|plugin|det_thr|map_thr|topk)
@@ -88,6 +99,19 @@ struct ResultMsg {
   float t_mp;                   // mp 段耗时 ms (无 --mp 时 0)
   uint32_t cmd;                 // 节点解码用的 cmd 索引
   uint32_t reserved2;
+  // ---- v3 追加段 (M-PROD fail-visible; v2 读端按 header_size 忽略尾部) --
+  // 语义: 下游要么拿到新结果 (NOMINAL), 要么明确知道拿到的是 frame_age_ms
+  // 前的旧结果 (LATCH), 要么明确知道节点不可用 (SELFTEST_FAIL 心跳,
+  // last_valid_seq=0 表示"自本进程启动从未有有效结果"). 不再有静默.
+  uint8_t status;               // kStatus* (Phase A 恒 NOMINAL)
+  uint8_t reason;               // kReason*
+  uint8_t wd_stage;             // 发布时刻所处/最后阶段 (诊断)
+  uint8_t reserved3[5];
+  uint32_t last_valid_seq;      // status!=0 时有效结果所属帧 seq (低 32b)
+  uint16_t frame_age_ms;        // 结果相对输入帧年龄 (饱和 65535)
+  uint16_t resets_60s;          // 60s 窗口复位次数 (Phase B, 健康遥测)
+  uint32_t nan_hits;            // 累计 NaN/Inf 命中 (Phase B)
+  uint32_t div_hits;            // 累计发散命中 (Phase B)
 };
 
 constexpr size_t kMsgBytes = sizeof(ResultMsg);

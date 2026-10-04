@@ -116,6 +116,22 @@ int main(int argc, char** argv) {
                      m.final_plan[5][0], m.final_plan[5][1]);
             }
           }
+          if (m.version >= 3) {
+            // v3 fail-visible (M-PROD A4): 状态/年龄/健康计数.
+            // age = 发布时冻结的处理时延 (死节点信箱上恒定, 不能单读判活);
+            // lage = 读时活年龄 now-ts_capture, 死信箱上持续增长 —— 单读
+            // 即可判活的 fail-visible 信号, 下游告警应看它.
+            static const char* stn[] = {"NOMINAL", "DEGRADED_RESET",
+                                        "DEGRADED_LATCH", "SELFTEST_FAIL"};
+            int64_t lage = (now_real_ns() - m.ts_capture_ns) / 1000000;
+            if (lage < 0) lage = 0;
+            if (lage > 65535) lage = 65535;
+            printf("  v3 status=%s reason=%u age=%ums lage=%lldms "
+                   "last_valid=%u resets60=%u nan=%u div=%u\n",
+                   m.status < 4 ? stn[m.status] : "?", m.reason,
+                   m.frame_age_ms, (long long)lage, m.last_valid_seq,
+                   m.resets_60s, m.nan_hits, m.div_hits);
+          }
           if (json_out) {
             FILE* f = fopen(json_out, "wb");
             if (f) {

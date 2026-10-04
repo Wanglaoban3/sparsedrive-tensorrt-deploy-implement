@@ -1,0 +1,9 @@
+/var/log/sp/*.log {
+    daily
+    size 50M
+    rotate 7
+    compress
+    copytruncate
+    missingok
+    notifempty
+}

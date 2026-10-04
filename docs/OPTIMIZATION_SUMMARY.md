@@ -553,6 +553,36 @@ sp_modelnode 的 4x4 求逆先抄 MESA gluInvertMatrix（列主序约定 + 三�
 种子实验、闭环 mAP 唯一门禁）见第十二轮；公式对拍脚本
 `deploy/_inv_verify.py`。
 
+### glibc robust mutex 属主死亡移交在长跑 Orin 上不可靠（Phase A 最大坑）
+
+pthread PTHREAD_MUTEX_ROBUST 的 EOWNERDEAD 移交是教科书机制，实锤在本板
+失效：kill -9 持锁者后 filesrc+node 双进程**永久 futex 等待**（CPU 0%、
+日志冻结、gdb 双方栈都在 `__pthread_mutex_lock_full`），EOWNERDEAD 始终
+不来。短压测（M1 crash 阶段）测不出——是长跑 + 特定抢占窗口才现形。
+环锁整体换自研 BusLock（属主 pid+starttime 落 shm，加锁者读
+`/proc/<pid>/stat` 判死/判 pid 复用后 CAS 强制接管，等待一律解锁后 10ms
+轮询，全环无 condvar）；锁在 RingMeta 里 → kVersion 必须 bump（v4），
+filesrc create 侧 pread 头校验版本不匹配自动重建。教训：**进程间锁的
+故障移交路径必须做真实 kill -9 长跑注入，不能只信 glibc 语义**。
+
+### 信箱冻结消息假活性 + resultmon lage（Phase A）
+
+死节点留下的信箱消息 status 恒 NOMINAL、frame_age_ms 冻在发布时的处理
+时延（~207ms）不变——单读永远"健康"。下游单读判活必须用读时活年龄
+**lage = now − ts_capture_ns**（死信箱上线性增长，resultmon v3 行已加）；
+验收脚本判"恢复"要 **连续两次探测 seq 递进 + 末次 lage 新鲜**——双条件
+（seq>前值 AND age<1.5s）都会被"kill 前 1.4s 探测窗里旧进程多发几帧冻在
+信箱"骗过（1.8s 假恢复，真实热恢复 6.1-6.4s）。
+
+### systemd 245 StartLimit 键放 [Service] 被静默忽略
+
+StartLimitIntervalSec/StartLimitBurst 属 [Unit] 段；放 [Service] 只有一条
+"Unknown key name" journal 警告，重启策略照常、熔断**永不触发**（连杀 8
+次重启计数涨到 8 不熔断）。症状反查看 journal 该警告。另外熔断触发后的
+单元 restart 会被 "Start request repeated too quickly" 拒绝，恢复前必须
+reset-failed——且要对**所有**可能连环熔断的单元都 reset（filesrc 失效窗
+里 node exit20 循环重启会把自己也熔断）。
+
 ---
 
 ## 最终引擎 profile 分布 (T6 + v8 插件, 38.99ms mean)
@@ -994,3 +1024,98 @@ cuCtxSetCurrent（本例主因是 iGPU 不支持，但 ctx 缺失同样报 inval
 argument，判障时两者都要排除）；(3) fork 子进程里 CUDA 调用静默失败
 （probe_vmm IPC 段 got=0 假象），进程间 CUDA 共享探针必须 fork+exec；
 (4) 驱动 API 链接要 -lcuda（nvcc 不会自动带）。
+
+## 第十五轮：M-PROD Phase A 量产化加固——watchdog / systemd 监督 / fail-visible 信箱（2026-10-05 交付）
+
+按用户批准的量产化路线（2026-10-03）交付第一阶段三件事：**①节点内
+watchdog**（TRT hang/阶段卡死从"静默挂死"变"FATAL 退出→systemd 拉起"）、
+**②systemd 监督**（模板单元+重启策略+熔断，按多模型共置模板设计）、
+**③信箱 v3 fail-visible**（下游要么新结果、要么明确知道旧化了多少）。
+
+### ① 节点内 watchdog（sp_watch.h）
+
+20ms 监视线程，每阶段环形记录最近耗时，deadline = **max(3×p50, 2×p99,
+2000ms)**（2s 地板：iGPU 与其他进程共卡，post 段实测过 503ms 单次抖动，
+500ms 地板误杀）；采集/IO 段与 init 窗口（watch_start 后第一个 touch 前）
+不设防（闪存 GC 写停 0.5-2s 是常态）。超时 `FATAL code=13 stage=<名>
+stalled_ms= dl_ms= seq=` 后 `_exit(13)`，刻意不做任何清理（CUDA context
+可能已坏，清理会二次挂死）。测试钩子 `SP_WD_TEST_STALL=<stage_id>` 在
+帧 5 对该段睡 5s，专供故障注入。
+
+### ② systemd 监督（deploy/systemd/）
+
+模板单元 `sp-filesrc@.service` / `sp-modelnode@.service`（%i=环名）：
+Restart=on-failure + RestartSec=1s，StartLimit 120s×5 **在 [Unit] 段**
+（放 [Service] 被 systemd 245 静默忽略——连杀 8 次不熔断的根因），
+日志 append:/var/log/sp/{filesrc,node}-%i.log + logrotate（日切 50M×7
+copytruncate），目录由 tmpfiles.d 保证。env 经 `/etc/sp/%i.env`
+（EnvironmentFile 每次 start 重读 → 改参数 restart 即可）。node
+Requires+After filesrc（不反向拉活：--loop 下源枯竭 node 必须 exit 20
+留在重启环里等 filesrc 修复）。常驻 env 三件套：`--loop --frames
+1000000 --no-dump`（缺一：钳 81 帧 rc0 退 / dump 7.3MB/帧写满盘）。
+SIGTERM 处理后两进程 stop ~0.9s（原 SIGTERM 不响应要吃满 TimeoutStopSec
+30s）。安装/健康断言/卸载：`deploy/_prod_install.py`（tmpfiles →
+daemon-reload → enable --now → 75s 内 probe 信箱 NOMINAL + 单元态检查）。
+
+### ③ 信箱 v3 fail-visible（sp_result.h v3 / sp_resultmon）
+
+消息尾段追加 status/reason/wd_stage/last_valid_seq/frame_age_ms/
+resets_60s/nan_hits/div_hits（Phase A 恒 NOMINAL，DEGRADED/SELFTEST 是
+Phase B 钩子）。**frame_age_ms 是发布时冻结的处理时延，不是读时年龄**——
+死节点信箱永远显示 NOMINAL+207ms；resultmon v3 行加 **lage=**（读时活
+年龄 now−ts_capture_ns，死信箱线性增长）——下游单读判活/告警的唯一
+可靠信号。ts_capture_ns 用节点 acquire 墙钟（manifest ts_ns 是 2018
+采集纪元，相减会钳 65535）。
+
+### 顺带修复的量产级缺陷
+
+- **环跨进程锁换自研 BusLock**（kVersion 4）：robust mutex 属主死亡移交
+  在长跑板上不可靠（kill -9 持锁者 → 双进程永久 futex 等待、EOWNERDEAD
+  不来，gdb 双方 `__pthread_mutex_lock_full`）；新锁属主 pid+starttime
+  落 shm，判死后 CAS 接管，等待=解锁+10ms 轮询，全环无 condvar
+- **持久环生命周期**：kill -9 的消费者 cid 永久占槽 → register 时心跳
+  >10s 判死接管（释放槽引用）；中流接入 seq 基线 resync（期望=基线+
+  submitted+1）+ manifest 按 (seq−1)%nman 配对（k%nman 中途接入配错帧）
+- **退出码契约**：node 0/10 init/11 engines/12 resources/13 watchdog/
+  20 源枯竭；filesrc 0/10/20；全部经 fatal_exit 统一打
+  `FATAL code= stage= seq= detail=`
+
+### 板端门禁（不回归）
+
+| 指标 | Phase A | m7fix 基线 | 判定 |
+|---|---|---|---|
+| e2e (ms) | 48.06 | 48.35 | ✓（bb2 14.98/hd 19.89/mp 8.85）|
+| map mAP | 0.7463 | 0.7485 | ✓ 跨运行抖动类内 |
+| EPA car/ped | 0.6039/0.5080 | 0.6048/0.5023 | ✓ |
+| planning L2 | 0.7398 | 0.7377 | ✓ |
+| obj_box_col | 0.161% | 0.161% | ✓ |
+
+### 故障注入验收（`deploy/_prod_ft_a.py`，4/4 PASS + 恢复全过）
+
+| 用例 | 注入 | 验收证据 |
+|---|---|---|
+| FT1 | kill -9 node MainPID | 信箱冻结 6 次探测（seq 恒 8209/9416，lage 419→5304ms 增长）→ **6.1s** 新进程发布（lage 跌回 ~330ms）< 15s 线 |
+| FT2 | SP_WD_TEST_STALL=2 | log `FATAL code=13 stage=hd stalled_ms=2001 dl_ms=2000` + journal status=13 → systemd 拉起 4.3s 回 NOMINAL |
+| FT3 | env manifest 路径错 | filesrc `FATAL code=10 stage=init`（manifest missing）→ **5.2s 熔断 failed**（5×退出+1s）；node 侧 inactive 不悬空 |
+| FT4 | 循环 kill -9 node | 第 5 杀触发 StartLimit → unit 保持 failed、pid 无（不再无限重启）|
+
+恢复判据 = 连续两次探测 seq 递进 + 末次 lage<1.5s（教训见"遇到的主要坑"：
+单读 seq>pre 被 kill 前 1.4s 窗里旧进程残帧冻结值骗过 1.8s 假恢复）。
+
+### 产物
+
+`deploy/prepost/`：sp_watch.h（新）、sp_bus.h/.cpp（BusLock v4）、
+sp_result.h（v3）、sp_resultmon.cpp（v3+lage）、sp_modelnode.cpp
+（watchdog/退出码/resync/快停）、sp_filesrc.cpp（attach-or-create/
+exit10/快停）；`deploy/systemd/`：2 单元 + m3.env + sp.conf +
+sp-logrotate；`deploy/_prod_install.py`（安装/健康/卸载）、
+`_prod_ft_a.py`（FT 套件）、`_bx.py`（板上任意命令）、
+`_mprod_mkmap.py`（map 评测组装）+ evaldata/mini_mproda_map。
+板上面貌：`systemctl status sp-modelnode@m3` 常驻，48.06ms/帧，
+FATAL/熔断/冻结全部可见。
+
+### Phase B 预告（下一阶段）
+
+④ 状态发散/NaN 运行时探测 + 自动模板复位（resets_60s/nan_hits/div_hits
+已留计数位，DEGRADED_RESET/DEGRADED_LATCH 状态位已留语义）+
+--selftest 开机自检（帧 0 金标 hash 门禁，失败阻止 ACTIVE）。

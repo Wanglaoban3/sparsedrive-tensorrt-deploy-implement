@@ -36,6 +36,66 @@ int64_t now_ms() {
   return int64_t(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
 }
 
+// ---- 跨进程自研锁 (BusLock, sp_bus.h) ----
+// 平台实测: glibc robust mutex 的属主死亡移交在长跑 Orin 上偶发失效
+// (FT1: 持锁者 kill -9 后双进程永久 futex 等待, EOWNERDEAD 不来)。
+// 自管方案不赌内核: 属主 pid+starttime 落 shm, /proc 判死即 CAS 接管。
+// 无争用 = 一次 CAS; 争用 = 2ms 轮询 (临界区 µs 级, 帧间隔 ≥40ms)。
+// 等待条件 (空槽/新帧) 一律解锁后 10ms 轮询, 不用 condvar。
+static uint64_t proc_starttime(uint32_t pid) {
+  char p[64];
+  snprintf(p, sizeof(p), "/proc/%u/stat", pid);
+  FILE* f = fopen(p, "r");
+  if (!f) return 0;  // task 不存在
+  char buf[1024];
+  const char* line = fgets(buf, sizeof(buf), f) ? buf : nullptr;
+  fclose(f);
+  if (!line) return 0;
+  const char* q = strrchr(line, ')');
+  if (!q) return 0;
+  // ')' 后字段从 state(3) 起, starttime=22 → 跳 19 个读 1 个
+  long long st = 0;
+  if (sscanf(q + 2,
+             "%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s "
+             "%*s %*s %*s %lld",
+             &st) != 1)
+    return 0;
+  return (uint64_t)st;
+}
+
+static inline void lock_lk(BusLock* lk) {
+  static uint64_t my_start = proc_starttime((uint32_t)getpid());
+  const uint32_t me = (uint32_t)getpid();
+  for (;;) {
+    uint32_t exp = 0;
+    if (lk->owner.compare_exchange_strong(exp, me)) {
+      lk->start.store(my_start, std::memory_order_release);
+      return;
+    }
+    uint32_t cur = lk->owner.load(std::memory_order_acquire);
+    if (cur != 0 && cur != me) {
+      uint64_t own_start = lk->start.load(std::memory_order_acquire);
+      uint64_t now_st = proc_starttime(cur);
+      if (now_st == 0 || (own_start != 0 && now_st != own_start)) {
+        // 属主已死或 pid 已被复用: 强制接管 (CAS 保证只有一个胜利者)
+        uint32_t exp2 = cur;
+        lk->owner.compare_exchange_strong(exp2, 0);
+      }
+    }
+    struct timespec ts = {0, 2 * 1000 * 1000};
+    nanosleep(&ts, nullptr);
+  }
+}
+
+static inline void unlock_lk(BusLock* lk) {
+  lk->owner.store(0, std::memory_order_release);
+}
+
+static inline void poll_sleep_ms(int ms) {
+  struct timespec ts = {ms / 1000, (ms % 1000) * 1000 * 1000L};
+  nanosleep(&ts, nullptr);
+}
+
 int64_t now_real_ns() {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
@@ -97,9 +157,13 @@ Bus* Bus::open(const char* name, uint32_t width, uint32_t height, bool create,
   struct stat st;
   bool do_init = create;
   if (create && fstat(fd, &st) == 0 && st.st_size == (off_t)map_len) {
-    // Existing ring with matching geometry: attach instead of re-init, so a
-    // crashed publisher does not wipe consumer state mid-run.
-    do_init = false;
+    // 同尺寸旧环: magic+version 都匹配才 attach (崩溃的发布端不清消费者
+    // 状态); 版本不匹配 (如锁属性升级) 就地重建。
+    RingMeta head;
+    if (pread(fd, &head, sizeof(head), 0) == (ssize_t)sizeof(head) &&
+        head.magic == kMagic && head.version == kVersion) {
+      do_init = false;
+    }
   }
   if (do_init) {
     if (ftruncate(fd, map_len) != 0) {
@@ -130,15 +194,7 @@ Bus* Bus::open(const char* name, uint32_t width, uint32_t height, bool create,
     m->cam_bytes = cam_bytes;
     m->frame_bytes = cam_bytes * kMaxCams;
     m->slot_stride = slot_stride;
-    pthread_mutexattr_t ma;
-    pthread_mutexattr_init(&ma);
-    pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED);
-    pthread_mutex_init(&m->mu, &ma);
-    pthread_condattr_t ca;
-    pthread_condattr_init(&ca);
-    pthread_condattr_setpshared(&ca, PTHREAD_PROCESS_SHARED);
-    pthread_cond_init(&m->cv_free, &ca);
-    pthread_cond_init(&m->cv_frame, &ca);
+    // BusLock 零值即解锁态 (memset 已保证); 无需 pthread 初始化
     m->pub_idx = 0;
     m->latest_seq = 0;
     m->n_consumers = 0;
@@ -172,20 +228,13 @@ Bus::~Bus() {
 uint8_t* Bus::claim_of(int32_t* slot_idx, int64_t timeout_ms) {
   const int64_t lease = lease_ms_from_env();
   const int64_t deadline = now_ms() + timeout_ms;
-  pthread_mutex_lock(&m_->mu);
   for (;;) {
+    lock_lk(&m_->lk);
     SlotHdr& s = *slot(m_->pub_idx);
     if (s.ref.load() == 0) {
       s.meta.seq = 0;  // invalidate stale seq before refilling
       const int32_t idx = m_->pub_idx;
-#ifdef SP_BUS_DEBUG
-      fprintf(stderr, "dbg claim idx=%d payload=%p meta=%p delta=%ld "
-              "stride=%lu frame=%u\n", idx, (void*)payload_of(idx),
-              (void*)slot(idx), (long)((uint8_t*)payload_of(idx) -
-              (uint8_t*)slot(idx)), (unsigned long)m_->slot_stride,
-              m_->frame_bytes);
-#endif
-      pthread_mutex_unlock(&m_->mu);
+      unlock_lk(&m_->lk);
       if (slot_idx) *slot_idx = idx;
       return payload_of(idx);
     }
@@ -193,22 +242,14 @@ uint8_t* Bus::claim_of(int32_t* slot_idx, int64_t timeout_ms) {
     if (s.ref.load() == 0) {
       s.meta.seq = 0;
       const int32_t idx = m_->pub_idx;
-      pthread_mutex_unlock(&m_->mu);
+      unlock_lk(&m_->lk);
       if (slot_idx) *slot_idx = idx;
       return payload_of(idx);
     }
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += 100 * 1000000;  // 100 ms chunk
-    if (ts.tv_nsec >= 1000000000) {
-      ts.tv_sec += 1;
-      ts.tv_nsec -= 1000000000;
-    }
-    pthread_cond_timedwait(&m_->cv_free, &m_->mu, &ts);
-    if (timeout_ms >= 0 && now_ms() >= deadline) break;
+    unlock_lk(&m_->lk);
+    poll_sleep_ms(10);
+    if (timeout_ms >= 0 && now_ms() >= deadline) return nullptr;
   }
-  pthread_mutex_unlock(&m_->mu);
-  return nullptr;
 }
 
 void Bus::commit(FrameMeta meta) {
@@ -220,14 +261,13 @@ void Bus::commit(FrameMeta meta) {
   meta.frame_bytes = m_->frame_bytes;
   if (meta.group_ts_ns == 0) meta.group_ts_ns = now_real_ns();
   meta.checksum = sampled_checksum(payload_of(idx), m_->frame_bytes);
-  pthread_mutex_lock(&m_->mu);
+  lock_lk(&m_->lk);
   s.meta = meta;
   s.meta.seq = m_->latest_seq + 1;
   m_->latest_seq = s.meta.seq;
   m_->published_count += 1;
   m_->pub_idx = (idx + 1) % kRingDepth;
-  pthread_cond_broadcast(&m_->cv_frame);
-  pthread_mutex_unlock(&m_->mu);
+  unlock_lk(&m_->lk);
 }
 
 void Bus::commit_dma(FrameMeta meta) {
@@ -239,14 +279,13 @@ void Bus::commit_dma(FrameMeta meta) {
   meta.frame_bytes = m_->frame_bytes;
   if (meta.group_ts_ns == 0) meta.group_ts_ns = now_real_ns();
   // 校验和由发布端对 host 侧源数据自算 (payload 不落 shm, 无法重算)
-  pthread_mutex_lock(&m_->mu);
+  lock_lk(&m_->lk);
   s.meta = meta;
   s.meta.seq = m_->latest_seq + 1;
   m_->latest_seq = s.meta.seq;
   m_->published_count += 1;
   m_->pub_idx = (idx + 1) % kRingDepth;
-  pthread_cond_broadcast(&m_->cv_frame);
-  pthread_mutex_unlock(&m_->mu);
+  unlock_lk(&m_->lk);
 }
 
 void Bus::set_dma_info(uint32_t n_slots, uint64_t slot_bytes) {
@@ -256,38 +295,59 @@ void Bus::set_dma_info(uint32_t n_slots, uint64_t slot_bytes) {
 }
 
 int32_t Bus::register_consumer() {
-  pthread_mutex_lock(&m_->mu);
+  // 持久环上 kill -9 的消费者没有 unregister 机会, cid 会被永久占住。
+  // 活消费者每帧(~200ms@5fps)及 acquire 等待中都心跳, 10s 无心跳 + 残留
+  // 槽引用未动 = 前主已死, 接管该 cid 并释放其引用 (计数不变, 槽位易主)。
+  static const int64_t kCidTakeoverMs = 10000;
+  lock_lk(&m_->lk);
   int32_t cid = -1;
+  bool took_over = false;
   for (int i = 0; i < kMaxConsumers; ++i) {
     if (!m_->cons[i].active) {
       m_->cons[i].active = 1;
-      m_->cons[i].pid = (int32_t)getpid();
-      m_->cons[i].held_slot = -1;
-      m_->cons[i].hb_ms = now_ms();
+      cid = i;
+      break;
+    }
+    if (now_ms() - m_->cons[i].hb_ms.load() > kCidTakeoverMs) {
+      if (m_->cons[i].held_slot >= 0) {
+        SlotHdr& s = *slot(m_->cons[i].held_slot);
+        if (s.ref.load() > 0) s.ref.fetch_sub(1);
+        m_->forced_recycles += 1;
+      }
+      fprintf(stderr,
+              "bus: cid=%d taken over from stale consumer pid=%d "
+              "(hb %lldms old)\n",
+              i, m_->cons[i].pid,
+              (long long)(now_ms() - m_->cons[i].hb_ms.load()));
+      took_over = true;
       cid = i;
       break;
     }
   }
-  if (cid >= 0) m_->n_consumers += 1;
-  pthread_mutex_unlock(&m_->mu);
+  if (cid >= 0) {
+    m_->cons[cid].pid = (int32_t)getpid();
+    m_->cons[cid].held_slot = -1;
+    m_->cons[cid].hb_ms = now_ms();
+    if (!took_over) m_->n_consumers += 1;
+  }
+  unlock_lk(&m_->lk);
   return cid;
 }
 
 void Bus::unregister_consumer(int32_t cid) {
   if (cid < 0) return;
-  pthread_mutex_lock(&m_->mu);
+  lock_lk(&m_->lk);
   ConsumerEntry& c = m_->cons[cid];
   if (c.active) {
     if (c.held_slot >= 0) {
       SlotHdr& s = *slot(c.held_slot);
       if (s.ref.load() > 0) s.ref.fetch_sub(1);
-      if (s.ref.load() == 0) pthread_cond_broadcast(&m_->cv_free);
       c.held_slot = -1;
     }
     c.active = 0;
     m_->n_consumers -= 1;
   }
-  pthread_mutex_unlock(&m_->mu);
+  unlock_lk(&m_->lk);
 }
 
 void Bus::heartbeat(int32_t cid) {
@@ -299,8 +359,8 @@ int Bus::acquire(int32_t cid, uint64_t last_seq, FrameView* out,
                  int64_t timeout_ms) {
   const int64_t deadline =
       timeout_ms < 0 ? INT64_MAX : now_ms() + timeout_ms;
-  pthread_mutex_lock(&m_->mu);
   for (;;) {
+    lock_lk(&m_->lk);
     // smallest published seq > last_seq
     uint64_t best = 0;
     int best_idx = -1;
@@ -322,40 +382,30 @@ int Bus::acquire(int32_t cid, uint64_t last_seq, FrameView* out,
       for (int c = 0; c < kMaxCams; ++c) {
         out->cam[c] = payload_of(best_idx) + c * m_->cam_bytes;
       }
-      pthread_mutex_unlock(&m_->mu);
+      unlock_lk(&m_->lk);
       return 0;
     }
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += 100 * 1000000;
-    if (ts.tv_nsec >= 1000000000) {
-      ts.tv_sec += 1;
-      ts.tv_nsec -= 1000000000;
-    }
-    pthread_cond_timedwait(&m_->cv_frame, &m_->mu, &ts);
+    unlock_lk(&m_->lk);
+    poll_sleep_ms(10);  // 新帧轮询 (原 condvar 100ms chunk, 现更及时)
     heartbeat(cid);
-    if (now_ms() >= deadline) break;
+    if (now_ms() >= deadline) return 1;
   }
-  pthread_mutex_unlock(&m_->mu);
-  return 1;
 }
 
 void Bus::release(FrameView* v) {
-  pthread_mutex_lock(&m_->mu);
+  lock_lk(&m_->lk);
   SlotHdr& s = *slot(v->slot_idx);
   if (s.ref.load() > 0) s.ref.fetch_sub(1);
   if (m_->cons[v->consumer_id].held_slot == v->slot_idx)
     m_->cons[v->consumer_id].held_slot = -1;
-  if (s.ref.load() == 0) pthread_cond_broadcast(&m_->cv_free);
-  pthread_mutex_unlock(&m_->mu);
+  unlock_lk(&m_->lk);
   v->slot_idx = -1;
 }
 
-// Caller holds m_->mu. Steals references of consumers whose heartbeat is
+// Caller holds lk. Steals references of consumers whose heartbeat is
 // older than the lease and that hold `slot_idx`.
 void Bus::force_stale_locked(int32_t slot_idx, int64_t now_ms_v,
                              int64_t lease_ms) {
-  bool changed = false;
   for (int i = 0; i < kMaxConsumers; ++i) {
     ConsumerEntry& c = m_->cons[i];
     if (!c.active || c.held_slot != slot_idx) continue;
@@ -363,11 +413,8 @@ void Bus::force_stale_locked(int32_t slot_idx, int64_t now_ms_v,
       c.held_slot = -1;
       if ((*slot(slot_idx)).ref.load() > 0) (*slot(slot_idx)).ref.fetch_sub(1);
       m_->forced_recycles += 1;
-      changed = true;
     }
   }
-  if (changed && (*slot(slot_idx)).ref.load() == 0)
-    pthread_cond_broadcast(&m_->cv_free);
 }
 
 }  // namespace sp
