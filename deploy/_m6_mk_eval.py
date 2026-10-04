@@ -5,11 +5,13 @@ plan_cls,plan_reg,plan_status,history_anchor,history_period,
 history_ego_anchor,history_ego_period} + mini_meta.npz."""
 import os
 import shutil
+import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(ROOT, "work_dirs", "preproc_ref", "m6fix")
+TAG = sys.argv[1] if len(sys.argv) > 1 else "m6fix"
+SRC = os.path.join(ROOT, "work_dirs", "preproc_ref", TAG)
 DST = os.path.join(ROOT, "work_dirs", "sparsedrive_small_stage2",
-                   "evaldata", "mini_m6fix_mp")
+                   "evaldata", "mini_%s_mp" % TAG)
 META = os.path.join(ROOT, "work_dirs", "sparsedrive_small_stage2",
                     "evaldata", "mini_sp2_81", "mini_meta.npz")
 DIRECT = ["det_cls", "det_bbox", "det_quality", "motion_cls", "motion_reg",

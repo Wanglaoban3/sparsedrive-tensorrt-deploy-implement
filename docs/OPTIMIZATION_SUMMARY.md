@@ -913,3 +913,42 @@ accel+rot_rate+vel+steer 不含 cmd，真 cmd 部署上来自车辆接口，下�
 复算 —— mode 全部一致（15/17），maxdiff ≤ 5e-4（%.3f 文本舍入内），
 t_mp 8.78ms 在报。排障记档：mon 名字自带 sp_res_ 前缀（传错静默空等）、
 重定向文件块缓冲被 pkill -9 丢弃（stdbuf -oL + SIGTERM 双保险）。
+
+
+## 第十三轮：M7 双流重叠实测负收益（2026-10-03 定案，已优雅退出）
+
+**方案**：sp_modelnode 加 `--dual`——bb2(k) 移到独立流 eng_streamB，
+hd(k)+mp(k) 留 eng_stream（H 流），跨流事件定序：B 流守卫 = preproc 完成
+(ev_preB) + 边界槽 p 上一读方(k-2 帧)输出 D2H 完成(ev_post，防覆写仍在读
+的 col_feats)；H 流守卫 = 输出槽复用(ev_post) + 跨流 ev_b2(col_feats 就绪)。
+逐帧交错后 GPU 侧自然重叠 bb2(k+1) ∥ hd(k)+mp(k)，帧周期 ≈ max(bb2, hd+mp)。
+graph 按流各捕（gB 捕在 B 流，gH 捕在 H 流），warmup 双流各预热。
+
+**实测（Orin X iGPU, 81 帧）**：
+
+| 模式 | fps | bb2 | hd+fb | mp | pre | e2e@5fps |
+|---|---|---|---|---|---|---|
+| 单流 pipe+graph | 22.48 | 15.42 | 19.90 | 9.19 | 6.11 | 48.35ms |
+| **双流 --dual** | **23.16** | 16.33 | 32.71 | 17.67 | 19.02 | 48.33ms |
+
+**结论：+3%，远低于 25fps 目标，交付维持单流**。原因：iGPU SM 无余量，
+两 lane 抢同一批 SM 互相膨胀（hd 19.9→32.7、mp 8.8→17.7、前处理 4.3→19ms），
+每帧 ~44ms 的 SM 总工作量才是吞吐天花板（1/44ms≈22.7fps），并发不创造
+SM-秒。计划中的"上限 max(15.8,32.7)≈30fps"隐含了"lane 不争用"假设，
+对 iGPU 不成立。**--dual 保留为实验开关**（精度已验证无损），换硬件/换 TRT
+若争用 profile 变化可复测。
+
+**精度门禁（dual5 全过）**：det mAP 0.4177（=M5/M6）、map 0.7485（基线带
+0.7478-0.7481）、EPA 0.6048/0.5023、L2 0.7377、obj_box_col 0.161%。
+
+**判别实验（重要方法学）**：dual dump 与 M6a 基线逐字节比对失败
+（1532/1620），一度疑双流引入数值差异；**用当前二进制原模式（串行）重跑
+对照，与基线同样差 1532** —— 引擎链路 run-to-run 本就非 bit 确定（f0
+det_cls logit 差 ~1e-2，TRT tactic 归约/原子序 + 递归链放大），跨 run
+bit 比对必然失败，只有容差与 mAP/EPA 口径有效。已记入 AGENTS 精度坑。
+
+**M7b（e_mp graph）按判据跳过**：节点 mp 段 8.85ms vs 引擎单跑 8.74ms，
+发射开销 ~0.11ms < 1ms 阈值，graph 化无肉。
+
+**遗留方向**：吞吐要破 22.7fps 天花板只有减小每帧 SM 工作量——DLA offload
+int8 bb2（需验证 DLA INT8 conv 支持与 plugin 边界）或升 TRT 重 tactical。

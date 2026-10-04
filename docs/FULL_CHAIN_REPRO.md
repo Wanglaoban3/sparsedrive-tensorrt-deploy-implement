@@ -43,7 +43,7 @@ sparsedrive_int8_v3_fold5.onnx   ← trunk int8 + head float(显式fp16), QDQ �
 | e_hd | 19.9ms | graph×2；8 个递归状态 |
 | e_mp | 8.85ms | 单时序引擎 fp16；9 状态 |
 | 节点三级端到端 | ~48.1ms | 含前处理/队列开销 |
-| M7 目标 | bb2(k+1)∥hd(k)+mp(k) | 上限 max(15.8, 32.7)≈32.7ms ≈30fps |
+| M7 双流（已定案） | 23.16 vs 22.48 fps | iGPU SM 争用，无收益，交付维持单流 |
 
 **精度（mini 81 帧 = boston 40 + queenstown 41，场景边界 k=40）**
 
@@ -252,6 +252,13 @@ motion/plan/最终轨迹 append）→ `sp_resultmon`（读取解码打印）。
 信箱携带完整 plan_cls/reg 供下游重选。门禁三件套（`_m5_rerun.py` /
 `_m6_ref.py` + `_m6_cmp.py` / `_m6b_gate.py`）：闭环 mAP/EPA 不劣化 +
 离线参考同源 A/B + 信箱解码 12/12 逐位一致。
+
+M7 双流实验（`--dual`，2026-10-03 定案）：bb2 独立流 ∥ hd+mp，精度无损
+（det 0.4177 / map 0.7485 / EPA 0.6048/0.5023）但 iGPU SM 争用吞掉重叠
+收益（23.16 vs 22.48fps），**交付维持单流**；开关保留，详见
+OPTIMIZATION_SUMMARY 第十三轮。方法学：跨 run 的 bit 比对必然失败
+（TRT tactic 非确定），判别新旧路径差异要用"当前二进制原模式重跑"做对照
+（`_m7a_gate.py` / `_m7a_bit2.py` / `_m7a_cmp.py`）。
 
 ## 10. 坑索引（每条详情见 AGENTS.md 对应小节 / OPTIMIZATION_SUMMARY"遇到的主要坑"）
 

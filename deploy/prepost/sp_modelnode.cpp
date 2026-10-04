@@ -280,8 +280,8 @@ int main(int argc, char** argv) {
             "usage: %s <ring> <engine|bb2.engine> <plugin> <manifest.jsonl> "
             "<out_dir> [--hd hd.engine] [--mp mp.engine] [--frames N] "
             "[--warmup W] [--dump-img N] [--img-from P] [--serial] [--graph] "
-            "[--loop] [--no-dump] [--det-thr F] [--map-thr F] [--det-topk N] "
-            "[--mailbox NAME] [--cmd N]\n",
+            "[--dual] [--loop] [--no-dump] [--det-thr F] [--map-thr F] "
+            "[--det-topk N] [--mailbox NAME] [--cmd N]\n",
             argv[0]);
     return 2;
   }
@@ -297,6 +297,7 @@ int main(int argc, char** argv) {
   int dump_img_n = 0;   // 前 N 帧落盘实际喂给引擎的 img (对质用)
   const char* img_from = nullptr;  // 隔离模式: 目录根/模板/单文件
   bool serial = false, use_graph = false, loop = false, no_dump = false;
+  bool dual = false;  // M7a: bb2 独立流与 hd+mp 重叠
   float det_thr = 0.0f, map_thr = 0.0f;  // Q2: 默认=离线评测口径(全保留)
   int det_topk = 300;
   int plan_cmd = 2;  // M6b: final_plan 便捷解码的 cmd (2=直行; 真 cmd 车辆给)
@@ -311,6 +312,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--img-from") && i + 1 < argc)
       img_from = argv[++i];
     else if (!strcmp(argv[i], "--serial")) serial = true;
+    else if (!strcmp(argv[i], "--dual")) dual = true;
     else if (!strcmp(argv[i], "--graph")) use_graph = true;
     else if (!strcmp(argv[i], "--loop")) loop = true;
     else if (!strcmp(argv[i], "--no-dump")) no_dump = true;
@@ -327,6 +329,14 @@ int main(int argc, char** argv) {
   }
   if (mailbox_name.empty()) mailbox_name = std::string("sp_result_") + ring;
   if (det_topk > res::kDetCap) det_topk = res::kDetCap;
+  if (dual && serial) {
+    printf("modelnode: --dual 与 --serial 互斥, 退回串行\n");
+    dual = false;
+  }
+  if (dual && !hd_path) {
+    printf("modelnode: --dual 需要 --hd 拆分链, 忽略\n");
+    dual = false;
+  }
   signal(SIGINT, on_sig);
   signal(SIGTERM, on_sig);
 
@@ -341,8 +351,8 @@ int main(int argc, char** argv) {
   const long nman = (long)man.frames.size();
   if (!loop && (n_frames < 0 || n_frames > nman)) n_frames = nman;
   if (n_frames < 0) n_frames = nman;
-  printf("modelnode: mode=%s%s run=%ld frames\n", serial ? "serial" : "pipe",
-         use_graph ? "+graph" : "", n_frames);
+  printf("modelnode: mode=%s%s%s run=%ld frames\n", serial ? "serial" : "pipe",
+         use_graph ? "+graph" : "", dual ? "+dual" : "", n_frames);
 
   // ---- bus attach (consumer, CUDA Mapped 注册; 等发布端建环) ----
   char err[256];
@@ -380,6 +390,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   cudaStream_t pre_stream, eng_stream, post_stream;
+  cudaStream_t eng_streamB = nullptr;  // M7a: bb2 专用流 (--dual)
   cudaStreamCreate(&pre_stream);
   cudaStreamCreate(&eng_stream);
   cudaStreamCreate(&post_stream);
@@ -387,7 +398,12 @@ int main(int argc, char** argv) {
   if (os_flag && atoi(os_flag)) {
     eng_stream = pre_stream;  // 排查用: 前处理与引擎同流
     printf("modelnode: ONE-STREAM mode\n");
+    if (dual) {
+      printf("modelnode: SP_ONE_STREAM 与 --dual 冲突, 退回单流\n");
+      dual = false;
+    }
   }
+  if (dual) cudaStreamCreate(&eng_streamB);
 
   // 双缓冲: img/参数按奇偶各 kPar 份; H2D 源用 pinned 暂存
   // (异步 H2D 不能读栈上临时值 —— 提交后 CPU 立即返回, 栈会失效)
@@ -864,7 +880,7 @@ int main(int argc, char** argv) {
       cudaMemset(d_proj[p], 0, 6 * 16 * 4);
       cudaMemset(d_tmat[p], 0, 16 * 4);
       cudaMemset(d_dt[p], 0, 4);
-      if (use_hd && !ctxBB[p]->enqueueV3(eng_stream)) {
+      if (use_hd && !ctxBB[p]->enqueueV3(dual ? eng_streamB : eng_stream)) {
         fprintf(stderr, "modelnode: warmup bb2 enqueue FAILED\n");
         return 1;
       }
@@ -879,6 +895,7 @@ int main(int argc, char** argv) {
         }
       }
       cudaStreamSynchronize(eng_stream);
+      if (dual) cudaStreamSynchronize(eng_streamB);
     }
     printf("modelnode: warmup %d done\n", warmup);
   }
@@ -890,16 +907,16 @@ int main(int argc, char** argv) {
   cudaGraphExec_t gH[kPar] = {nullptr, nullptr};
   if (use_graph) {
     for (int p = 0; p < kPar; ++p) {
-      cudaStreamSynchronize(eng_stream);
-      cudaStreamBeginCapture(eng_stream, cudaStreamCaptureModeGlobal);
-      bool ok = use_hd ? ctxBB[p]->enqueueV3(eng_stream)
-                       : ctx[p]->enqueueV3(eng_stream);
+      cudaStream_t sB = dual ? eng_streamB : eng_stream;
+      cudaStreamSynchronize(sB);
+      cudaStreamBeginCapture(sB, cudaStreamCaptureModeGlobal);
+      bool ok = use_hd ? ctxBB[p]->enqueueV3(sB) : ctx[p]->enqueueV3(sB);
       if (ok && !use_hd)
         for (auto& st : states)
           cudaMemcpyAsync(st.in->dev[0], st.out->dev[p], st.in->bytes,
-                          cudaMemcpyDeviceToDevice, eng_stream);
+                          cudaMemcpyDeviceToDevice, sB);
       cudaGraph_t g = nullptr;
-      if (cudaStreamEndCapture(eng_stream, &g) != cudaSuccess || !ok) {
+      if (cudaStreamEndCapture(sB, &g) != cudaSuccess || !ok) {
         printf("modelnode: graph capture FAILED (p=%d), fallback non-graph\n",
                p);
         use_graph = false;
@@ -1276,16 +1293,27 @@ int main(int argc, char** argv) {
     }
 
     // ---- infer submit (异步; 等前处理 + 等 parity 的输出 D2H 完成) ----
-    cudaStreamWaitEvent(eng_stream, ev_preB[p], 0);
-    cudaStreamWaitEvent(eng_stream, ev_post[p], 0);  // 上次用 out[p] 的 D2H
-    cudaEventRecord(ev_inf0[p], eng_stream);
+    // M7a 双流 (--dual): bb2 走 B 流 (eng_streamB), hd+mp 留 H 流
+    // (eng_stream). 事件定序:
+    //   B 流: 等 preproc 完成 (ev_preB) + 边界槽 p 上一读方 (k-2 帧) 输出
+    //         D2H 完成 (ev_post, 防覆写仍在读的 col_feats) → bb2 → ev_b2.
+    //   H 流: 等输出槽复用守卫 (ev_post) + 跨流 ev_b2 (col_feats 就绪) →
+    //         hd → 感知状态反馈 → mp → ev_inf1.
+    // 逐帧交错后 GPU 侧自然重叠: bb2(k+1) ∥ hd(k)+mp(k), 帧周期
+    // ≈ max(bb2, hd+mp). 非双流路径与 M5 单流事件序完全一致.
+    cudaStream_t sB = dual ? eng_streamB : eng_stream;
+    cudaStreamWaitEvent(sB, ev_preB[p], 0);
+    cudaStreamWaitEvent(sB, ev_post[p], 0);  // 槽 p 复用守卫 (B=边界, H=输出)
+    cudaEventRecord(ev_inf0[p], sB);
     bool ok = true;
     if (use_hd) {
       // M5: bb2 → (事件) → hd+感知反馈, 分段计时
-      if (use_graph) ok = cudaGraphLaunch(gB[p], eng_stream) == cudaSuccess;
-      else ok = ctxBB[p]->enqueueV3(eng_stream);
-      cudaEventRecord(ev_b2[p], eng_stream);
+      if (use_graph) ok = cudaGraphLaunch(gB[p], sB) == cudaSuccess;
+      else ok = ctxBB[p]->enqueueV3(sB);
+      cudaEventRecord(ev_b2[p], sB);
       if (ok) {
+        cudaStreamWaitEvent(eng_stream, ev_post[p], 0);  // out[p] 复用守卫
+        cudaStreamWaitEvent(eng_stream, dual ? ev_b2[p] : ev_preB[p], 0);
         if (use_graph) ok = cudaGraphLaunch(gH[p], eng_stream) == cudaSuccess;
         else {
           ok = ctx[p]->enqueueV3(eng_stream);
@@ -1296,6 +1324,7 @@ int main(int argc, char** argv) {
         }
       }
     } else {
+      cudaStreamWaitEvent(eng_stream, ev_post[p], 0);
       if (use_graph) ok = cudaGraphLaunch(gB[p], eng_stream) == cudaSuccess;
       else {
         ok = ctx[p]->enqueueV3(eng_stream);
