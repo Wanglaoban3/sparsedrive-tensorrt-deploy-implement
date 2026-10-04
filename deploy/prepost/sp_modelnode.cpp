@@ -59,9 +59,19 @@
 #include "sp_bus.h"
 #include "sp_dmapool.h"
 #include "sp_result.h"
+#include "sp_safety.h"
 #include "sp_watch.h"
 
 using namespace sp;
+
+// sp_safety.cu (nvcc 编译, 链接期汇合)
+namespace sp {
+namespace saf {
+void absmax_zero_async(int* dev_out, cudaStream_t s);
+void absmax_async(const float* p, size_t n, int* dev_out, cudaStream_t s);
+void inject_nan_async(float* p, int n, cudaStream_t s);
+}  // namespace saf
+}  // namespace sp
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_sig(int) { g_stop = 1; }
@@ -263,6 +273,21 @@ static double pct(std::vector<double>& v, double q) {
   return s[std::min(i, s.size() - 1)];
 }
 
+// B2: 工件指纹 —— md5sum(coreutils) 经 popen, 仅 init 期调用.
+static std::string md5sum_file(const char* path) {
+  char cmd[640];
+  snprintf(cmd, sizeof(cmd), "md5sum -b '%s' 2>/dev/null", path);
+  FILE* f = popen(cmd, "r");
+  if (!f) return "";
+  char buf[160] = {0};
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  pclose(f);
+  if (!n) return "";
+  char* sp = strchr(buf, ' ');
+  if (sp) *sp = 0;
+  return std::string(buf);
+}
+
 enum { kPar = 2 };  // 流水线深度 = 缓冲奇偶份数
 
 struct Bind {
@@ -283,7 +308,8 @@ int main(int argc, char** argv) {
             "<out_dir> [--hd hd.engine] [--mp mp.engine] [--frames N] "
             "[--warmup W] [--dump-img N] [--img-from P] [--serial] [--graph] "
             "[--dual] [--loop] [--no-dump] [--det-thr F] [--map-thr F] "
-            "[--det-topk N] [--mailbox NAME] [--cmd N] [--dma]\n",
+            "[--det-topk N] [--mailbox NAME] [--cmd N] [--dma] "
+            "[--selftest] [--selftest-dump DIR] [--golden DIR]\n",
             argv[0]);
     return 2;
   }
@@ -305,6 +331,9 @@ int main(int argc, char** argv) {
   int det_topk = 300;
   int plan_cmd = 2;  // M6b: final_plan 便捷解码的 cmd (2=直行; 真 cmd 车辆给)
   std::string mailbox_name;
+  bool use_selftest = false;      // B2: 开机自检 (金标容差 + 指纹)
+  const char* selftest_dump = nullptr;  // B2 工具模式: 帧0张量落盘 (金标生成)
+  std::string golden_dir;               // B2: 金标目录 (默认 golden/<ring>)
   for (int i = 6; i < argc; ++i) {
     if (!strcmp(argv[i], "--frames") && i + 1 < argc) n_frames = atol(argv[++i]);
     else if (!strcmp(argv[i], "--warmup") && i + 1 < argc) warmup = atoi(argv[++i]);
@@ -320,6 +349,11 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--graph")) use_graph = true;
     else if (!strcmp(argv[i], "--loop")) loop = true;
     else if (!strcmp(argv[i], "--no-dump")) no_dump = true;
+    else if (!strcmp(argv[i], "--selftest")) use_selftest = true;
+    else if (!strcmp(argv[i], "--selftest-dump") && i + 1 < argc)
+      selftest_dump = argv[++i];
+    else if (!strcmp(argv[i], "--golden") && i + 1 < argc)
+      golden_dir = argv[++i];
     else if (!strcmp(argv[i], "--det-thr") && i + 1 < argc)
       det_thr = (float)atof(argv[++i]);
     else if (!strcmp(argv[i], "--map-thr") && i + 1 < argc)
@@ -332,6 +366,8 @@ int main(int argc, char** argv) {
       mailbox_name = argv[++i];
   }
   if (mailbox_name.empty()) mailbox_name = std::string("sp_result_") + ring;
+  if (golden_dir.empty())
+    golden_dir = std::string("/opt/m0/trt-dev/golden/") + ring;
   if (det_topk > res::kDetCap) det_topk = res::kDetCap;
   if (dual && serial) {
     printf("modelnode: --dual 与 --serial 互斥, 退回串行\n");
@@ -626,7 +662,10 @@ int main(int argc, char** argv) {
       if (!b.is_input && b.name == next) st.out = &b;
     if (!st.out) fatal_exit(11, "init", "no output %s", next.c_str());
   }
-  // 状态零填 (首帧): f32 → 0; i32 → -1 (id) / 0 (count)
+  // 状态零填 (首帧): f32 → 0; i32 → -1 (id) / 0 (count).
+  // 同时留设备侧复位模板 d_rst —— B1 探测器单帧异常时整体复位回该模板
+  // (与 mp 侧 d_mrst 同一机制, "复用 k=0/40 零状态口径").
+  std::vector<void*> d_rst;  // hd 状态复位模板, 与 states 一一对应
   for (auto& st : states) {
     bool is_id = st.in->name == "prev_det_id";  // 链路二零状态: id 全 -1
     bool is_cnt = st.in->name == "prev_id_count";
@@ -638,6 +677,10 @@ int main(int argc, char** argv) {
       memset(z.data(), 0, z.size());
     }
     cudaMemcpy(st.in->dev[0], z.data(), st.in->bytes, cudaMemcpyHostToDevice);
+    void* rst = nullptr;
+    cudaMalloc(&rst, st.in->bytes);
+    cudaMemcpy(rst, z.data(), st.in->bytes, cudaMemcpyHostToDevice);
+    d_rst.push_back(rst);
     if (is_id)
       printf("modelnode: zero state %s -> all -1 (%zu B)\n",
              st.in->name.c_str(), st.in->bytes);
@@ -873,6 +916,34 @@ int main(int argc, char** argv) {
     }
   };
 
+  // ---- 结果信箱 (提前到自检前创建: 自检失败要发 1Hz SELFTEST_FAIL 心跳) --
+  char rerr[256];
+  res::Mailbox* mailbox = res::Mailbox::create(mailbox_name.c_str(), rerr,
+                                               sizeof(rerr));
+  if (!mailbox) {
+    fatal_exit(12, "init", "mailbox: %s", rerr);
+  }
+  printf("modelnode: mailbox sp_res_%s ready\n", mailbox_name.c_str());
+
+  // ---- B1: 安全探测器 (状态机 + 设备 absmax 标量 + 注入钩子) ----
+  const saf::Config saf_cfg = saf::load_config();
+  saf::Safety safety(saf_cfg);
+  int* d_saf[kPar] = {nullptr, nullptr};  // absmax 标量, 按 parity 各一份:
+  float* h_saf[kPar] = {nullptr, nullptr}; // complete_frame(k-2) 读 parity p
+                                           // 时, 帧 k 尚未提交覆写 (迭代内
+                                           // 先收割后提交), 单标量会被跨帧
+                                           // 覆写所以必须双份
+  if (saf_cfg.en) {
+    for (int q = 0; q < kPar; ++q) {
+      cudaMalloc(&d_saf[q], 4);
+      cudaMallocHost(&h_saf[q], 4);
+    }
+  }
+  long inject_n = -1, inject_period = 0;  // SP_INJECT_NAN 测试钩子 (默认关)
+  if (const char* e = getenv("SP_INJECT_NAN")) inject_n = atol(e);
+  if (const char* e = getenv("SP_INJECT_NAN_PERIOD"))
+    inject_period = atol(e);
+
   // ---- events: 每 parity 一组, 读上一轮再复用 ----
   cudaEvent_t ev_preA[kPar], ev_preB[kPar], ev_inf0[kPar], ev_inf1[kPar],
       ev_post[kPar], ev_b2[kPar], ev_hd[kPar];
@@ -909,6 +980,224 @@ int main(int argc, char** argv) {
       if (dual) cudaStreamSynchronize(eng_streamB);
     }
     printf("modelnode: warmup %d done\n", warmup);
+  }
+
+  // ---- B2: 开机自检 (--selftest) / 帧0金标采集 (--selftest-dump) ----
+  // 自检 = 金标工件指纹(md5) + 帧0 全链推理 + 小输出张量容差比较 (跨 run
+  // 非 bit 确定 —— M7 定案, 严禁 hash). 自检帧走与非图主链完全相同的
+  // eager 路径 (bb2→hd→反馈→mp), 输入 = manifest 帧0 的 6 路 NV12 直接
+  // 读盘 (root=manifest 目录), 与环内字节同源. 运行完必须把时序状态恢复
+  // 零状态 (否则真帧0 的首帧口径被污染).
+  bool selftest_fail_pub = false;  // OVERRIDE 时继续发布, 但状态标 SELFTEST_FAIL
+  std::vector<Bind*> self_cmp;
+  {
+    static const char* cmp_names[] = {
+        "det_cls", "det_quality", "det_bbox", "map_cls", "map_pts",
+        "motion_cls", "plan_cls", "plan_reg", "plan_status"};
+    for (const char* nm : cmp_names) {
+      for (Bind* b : outs)
+        if (b->name == nm) { self_cmp.push_back(b); break; }
+      if (use_mp)
+        for (Bind* b : outs_mp)
+          if (b->name == nm &&
+              (self_cmp.empty() || self_cmp.back()->name != nm)) {
+            self_cmp.push_back(b);
+            break;
+          }
+    }
+  }
+  // 状态恢复零态 (自检帧后 / 也供 init 复查): eng_stream 异步 D2D + 同步
+  auto zero_states_all = [&]() {
+    for (size_t i = 0; i < states.size(); ++i)
+      cudaMemcpyAsync(states[i].in->dev[0], d_rst[i], states[i].in->bytes,
+                      cudaMemcpyDeviceToDevice, eng_stream);
+    for (size_t i = 0; i < mstates.size(); ++i)
+      cudaMemcpyAsync(mstates[i].in->dev[0], d_mrst[i], mstates[i].in->bytes,
+                      cudaMemcpyDeviceToDevice, eng_stream);
+    cudaStreamSynchronize(eng_stream);
+  };
+  // 帧0 全链 eager 推理, 完成后被比较张量已 D2H 到 host[0]. false=运行失败
+  auto selftest_frame0 = [&]() -> bool {
+    std::string root = manifest_path;
+    size_t sl = root.find_last_of('/');
+    root = sl == std::string::npos ? "." : root.substr(0, sl);
+    const size_t cam_bytes = (size_t)man.pp.src_w * man.pp.src_h * 3 / 2;
+    std::vector<char> nv12(cam_bytes * 6);
+    for (int c = 0; c < 6; ++c) {
+      std::string pf = root + "/" + man.frames[0].cam_path[c];
+      FILE* g = fopen(pf.c_str(), "rb");
+      if (!g) {
+        fprintf(stderr, "selftest: open %s failed\n", pf.c_str());
+        return false;
+      }
+      size_t rd = fread(nv12.data() + c * cam_bytes, 1, cam_bytes, g);
+      fclose(g);
+      if (rd != cam_bytes) {
+        fprintf(stderr, "selftest: short read %s (%zu/%zu)\n", pf.c_str(), rd,
+                cam_bytes);
+        return false;
+      }
+    }
+    float* d_self = nullptr;
+    if (cudaMalloc(&d_self, nv12.size()) != cudaSuccess) return false;
+    uint8_t* d_self_u = (uint8_t*)d_self;
+    float proj[96];
+    make_projection(man, 0, proj);
+    float tmat[16];
+    for (int i = 0; i < 16; ++i) tmat[i] = i % 5 == 0 ? 1.f : 0.f;
+    float dt = 0.5f;
+    cudaMemcpyAsync(d_self_u, nv12.data(), nv12.size(), cudaMemcpyHostToDevice,
+                    eng_stream);
+    cudaMemcpyAsync(d_proj[0], proj, 96 * 4, cudaMemcpyHostToDevice,
+                    eng_stream);
+    cudaMemcpyAsync(d_tmat[0], tmat, 16 * 4, cudaMemcpyHostToDevice,
+                    eng_stream);
+    cudaMemcpyAsync(d_dt[0], &dt, 4, cudaMemcpyHostToDevice, eng_stream);
+    pre.run(d_self_u, cam_bytes, d_img[0], eng_stream);
+    bool ok = use_hd ? ctxBB[0]->enqueueV3(eng_stream) &&
+                         ctx[0]->enqueueV3(eng_stream)
+                     : ctx[0]->enqueueV3(eng_stream);
+    if (ok)
+      for (auto& st : states)
+        cudaMemcpyAsync(st.in->dev[0], st.out->dev[0], st.in->bytes,
+                        cudaMemcpyDeviceToDevice, eng_stream);
+    if (ok && use_mp) {
+      for (size_t si = 0; si < mstates.size(); ++si)
+        cudaMemcpyAsync(mstates[si].in->dev[0], d_mrst[si],
+                        mstates[si].in->bytes, cudaMemcpyDeviceToDevice,
+                        eng_stream);
+      ok = mp_bind_all(0) && ctxM->enqueueV3(eng_stream);
+      if (ok)
+        for (auto& st : mstates)
+          cudaMemcpyAsync(st.in->dev[0], st.out->dev[0], st.in->bytes,
+                          cudaMemcpyDeviceToDevice, eng_stream);
+    }
+    if (ok) cudaStreamSynchronize(eng_stream);
+    cudaFree(d_self);
+    if (!ok || cudaGetLastError() != cudaSuccess) return false;
+    for (Bind* b : self_cmp)
+      cudaMemcpy(b->host[0], b->dev[0], b->bytes, cudaMemcpyDeviceToHost);
+    return true;
+  };
+  if (selftest_dump || use_selftest) {
+    printf("modelnode: selftest frame0 run (cmp=%zu tensors)\n",
+           self_cmp.size());
+    if (!selftest_frame0())
+      fatal_exit(12, "selftest", "frame0 pipeline run failed");
+    if (selftest_dump) {
+      char cmd[640];
+      snprintf(cmd, sizeof(cmd), "mkdir -p %s/frame0", selftest_dump);
+      if (system(cmd) != 0) fatal_exit(10, "selftest", "mkdir golden failed");
+      for (Bind* b : self_cmp) {
+        std::string pf = std::string(selftest_dump) + "/frame0/" + b->name +
+                         ".bin";
+        FILE* g = fopen(pf.c_str(), "wb");
+        fwrite(b->host[0], 1, b->bytes, g);
+        fclose(g);
+      }
+      printf("GOLDEN_DUMP_DONE %s (%zu tensors)\n", selftest_dump,
+             self_cmp.size());
+      return 0;  // 工具模式: 落盘即出
+    }
+    // ---- 指纹校验 (meta.txt: key=value; 金标过期防护) ----
+    std::string meta_path = golden_dir + "/meta.txt";
+    FILE* mf = fopen(meta_path.c_str(), "r");
+    if (!mf) fatal_exit(15, "selftest", "open %s failed", meta_path.c_str());
+    struct FP { std::string key, path; } fps[] = {
+        {"bb2_md5", engine_path},
+        {"main_md5", use_hd ? hd_path : engine_path},
+        {"mp_md5", use_mp ? mp_path : engine_path},
+        {"plugin_md5", plugin_so},
+    };
+    int fp_bad = 0, fp_chk = 0;
+    char ln[512];
+    while (fgets(ln, sizeof(ln), mf)) {
+      char key[64], val[160];
+      if (sscanf(ln, "%63s = %159s", key, val) != 2) continue;
+      for (auto& fp : fps) {
+        if (key != fp.key || fp.path.empty()) continue;
+        ++fp_chk;
+        std::string got = md5sum_file(fp.path.c_str());
+        if (got.empty() || got != val) {
+          fprintf(stderr, "selftest: fingerprint %s MISMATCH (%s)\n", key,
+                  got.empty() ? "unreadable" : got.c_str());
+          ++fp_bad;
+        }
+      }
+    }
+    fclose(mf);
+    if (fp_chk == 0)
+      fatal_exit(15, "selftest", "meta.txt has no fingerprint entries");
+    if (fp_bad) fatal_exit(15, "selftest", "fingerprint mismatch n=%d "
+                                          "(金标过期, 重新 gen)", fp_bad);
+    // ---- 容差比较 ----
+    saf::GoldenTol gt;
+    if (!saf::load_tol(golden_dir.c_str(), &gt))
+      fatal_exit(15, "selftest", "load tol.txt failed (%s)", golden_dir.c_str());
+    int rc = 0;
+    for (size_t t = 0; t < gt.names.size(); ++t) {
+      Bind* b = nullptr;
+      for (Bind* x : self_cmp)
+        if (x->name == gt.names[t]) { b = x; break; }
+      if (!b) {
+        fprintf(stderr, "selftest: golden tensor %s not bound\n",
+                gt.names[t].c_str());
+        rc = 2;
+        break;
+      }
+      double worst = 0;
+      size_t at = 0;
+      int bad = saf::compare_bin(golden_dir.c_str(), gt.names[t], b->host[0],
+                                 b->bytes, gt.tol[t], &worst, &at);
+      if (bad < 0) {
+        fprintf(stderr, "selftest: golden bin %s missing/short\n",
+                gt.names[t].c_str());
+        rc = 2;
+        break;
+      }
+      printf("selftest: %-12s tol=%.4g worst=%.4g bad=%d\n", gt.names[t].c_str(),
+             gt.tol[t], worst, bad);
+      if (bad > 0) rc = 1;
+    }
+    zero_states_all();  // 自检帧污染的时序状态恢复零态 (成功失败都要)
+    if (rc == 2) fatal_exit(15, "selftest", "golden infrastructure broken");
+    if (rc == 1) {
+      const char* ov = getenv("SP_SELFTEST_OVERRIDE");
+      if (ov && atoi(ov)) {
+        printf("modelnode: SELFTEST FAIL but SP_SELFTEST_OVERRIDE=1, "
+               "DEGRADED continue (信箱标 SELFTEST_FAIL)\n");
+        selftest_fail_pub = true;
+      } else {
+        // 阻止 ACTIVE (spec §3 决策3): 节点存活, 1Hz SELFTEST_FAIL 心跳,
+        // det/map 清零, last_valid_seq=0; 等人工放行/修复. SIGTERM 即退 0.
+        printf("modelnode: SELFTEST FAIL → 存活 + 1Hz SELFTEST_FAIL 心跳, "
+               "不发布有效结果 (SP_SELFTEST_OVERRIDE=1 可放行)\n");
+        fflush(stdout);
+        while (!g_stop) {
+          res::ResultMsg hm;
+          memset(&hm, 0, sizeof(hm));
+          hm.magic = res::kMagic;
+          hm.version = res::kVer;
+          hm.header_size = (uint16_t)offsetof(res::ResultMsg, det);
+          hm.ts_capture_ns = now_real_ns();
+          hm.config_hash = cfg_hash;
+          snprintf(hm.plugin_path, res::kPluginPathMax, "%s", plugin_so);
+          hm.status = res::kStatusSelftestFail;
+          hm.reason = res::kReasonSelftest;
+          hm.last_valid_seq = 0;
+          hm.crc = res::msg_crc(hm, crc32);  // det/map 全零的 crc ≠ 0, 不算
+                                             // 会被读端 crc 校验整帧拒收
+          mailbox->publish(hm);
+          struct timespec ts = {1, 0};
+          nanosleep(&ts, nullptr);
+        }
+        printf("modelnode: SIGTERM in selftest-fail heartbeat, exit 0\n");
+        return 0;
+      }
+    } else {
+      printf("modelnode: SELFTEST PASS (%zu tensors, golden %s)\n",
+             gt.names.size(), golden_dir.c_str());
+    }
   }
 
   // ---- CUDA graph: 推理+反馈按 parity 各捕获 (M4 实测项) ----
@@ -998,14 +1287,7 @@ int main(int argc, char** argv) {
     fprintf(flog, "seq\tpre_ms\tinfer_ms\tpost_ms\tgpu_ms\tsvc_ms\tacq_ms"
                   "\tready_ns\tbb2_ms\thd_ms\tmp_ms\n");
 
-  // ---- 结果信箱 + JSON 旁路 ----
-  char rerr[256];
-  res::Mailbox* mailbox = res::Mailbox::create(mailbox_name.c_str(), rerr,
-                                               sizeof(rerr));
-  if (!mailbox) {
-    fatal_exit(12, "init", "mailbox: %s", rerr);
-  }
-  printf("modelnode: mailbox sp_res_%s ready\n", mailbox_name.c_str());
+  // ---- JSON 旁路 ----
   FILE* fjson = nullptr;
   if (!no_dump) {
     fjson = fopen((out_dir + "/result.jsonl").c_str(), "w");
@@ -1017,6 +1299,11 @@ int main(int argc, char** argv) {
   std::vector<int64_t> f_ts(n_frames, 0);
   std::vector<int64_t> f_acq_ns(n_frames, 0);  // acquire 墙钟 (frame_age 基准)
   std::vector<uint32_t> f_scene(n_frames, 0), f_flags(n_frames, 0);
+  // B1: 最近一次 NOMINAL 结果快照 (LATCH 时持续发布它 + 真实旧化)
+  res::ResultMsg last_valid_msg;
+  memset(&last_valid_msg, 0, sizeof(last_valid_msg));
+  bool have_valid = false;
+  float plan_worst_a = 0, plan_worst_k = 0;  // plan 检查诊断量 (校准)
 
   std::vector<double> s_pre, s_inf, s_post, s_svc, s_dec, s_json;
   std::vector<double> s_b2, s_hdms, s_mp;
@@ -1124,17 +1411,138 @@ int main(int argc, char** argv) {
         msg.t_mp = mp_ms;
         msg.cmd = (uint32_t)plan_cmd;
       }
+      // ---- B1: 运行时异常探测 (宿主侧检查; 状态 absmax 见提交路径) ----
+      int hits = 0;
+      if (saf_cfg.en) {
+        if (can_decode) {
+          hits |= saf::scan_nonfinite((const float*)b_det_cls->host[p],
+                                      b_det_cls->bytes / 4);
+          hits |= saf::scan_nonfinite((const float*)b_det_bbox->host[p],
+                                      b_det_bbox->bytes / 4);
+          // 检出合理性 (DetOut 是 struct 数组, 不能按平铺 float 扫)
+          for (int i = 0; i < nd && !(hits & (saf::kHitRange | saf::kHitNan));
+               ++i) {
+            if (!std::isfinite(dets[i].x) || !std::isfinite(dets[i].y) ||
+                !std::isfinite(dets[i].w) || !std::isfinite(dets[i].l) ||
+                !std::isfinite(dets[i].h)) {
+              hits |= saf::kHitNan;
+            } else if (fabsf(dets[i].x) > 100.f || fabsf(dets[i].y) > 100.f ||
+                       dets[i].w <= 0.f || dets[i].w > 20.f ||
+                       dets[i].l <= 0.f || dets[i].l > 20.f ||
+                       dets[i].h <= 0.f || dets[i].h > 20.f) {
+              hits |= saf::kHitRange;
+            }
+          }
+          hits |= safety.check_ndet(nd);
+        }
+        if (use_mp) {
+          for (auto* b : outs_mp) {
+            if (b->name == "motion_reg" || b->name == "plan_reg" ||
+                b->name == "plan_status")
+              hits |= saf::scan_nonfinite((const float*)b->host[p],
+                                          b->bytes / 4);
+          }
+          // plan 运动学检查只对置信模式 (conf≥0.5) 生效 —— 低置信 argmax
+          // 的 plan_reg 是噪声不是发散 (板端实测误报根因: conf=0 帧姿态
+          // 超界属正常分布, 曾致复位误报→LATCH 误熔断)
+          int best = plan_cmd * 6;
+          float bv = msg.plan_cls[best];
+          for (int m2 = 1; m2 < 6; ++m2)
+            if (msg.plan_cls[plan_cmd * 6 + m2] > bv)
+              bv = msg.plan_cls[plan_cmd * 6 + m2];
+          if (bv >= 0.5f) {
+            float wa = 0, wk = 0;
+            hits |= saf::check_plan((const float*)msg.final_plan,
+                                    res::kPlanPts, 0.5f, &wa, &wk);
+            plan_worst_a = wa;
+            plan_worst_k = wk;
+          }
+        }
+        float am = h_saf[p] ? saf::int_as_float(((int*)h_saf[p])[0]) : 0.f;
+        if (std::isnan(am) || std::isinf(am) || am > saf_cfg.absmax)
+          hits |= saf::kHitState;
+      }
+      saf::Verdict vd = safety.frame(hits, watch_now_ms());
+      if (vd.latch) {
+        // 60s 窗复位超阈 → LATCH: 持续发布 last_valid + 真实旧化,
+        // 宽限 SP_DIV_GRACE_MS 后 exit 14 (systemd 拉起 → 自检 → 正常;
+        // 120s 内再 latch 由 StartLimit 熔断转人工)
+        uint32_t lv = have_valid ? (uint32_t)last_valid_msg.seq : 0;
+        fprintf(stderr,
+                "safety: LATCH resets=%u>%d in window at seq=%lu hits=%s "
+                "nan=%u div=%u last_valid=%u → 宽限 %.0fms\n",
+                safety.resets_60s, saf_cfg.latch_n,
+                (unsigned long)f_seq[j], saf::hit_name(hits),
+                safety.nan_hits, safety.div_hits, lv, saf_cfg.grace_ms);
+        res::ResultMsg lm = last_valid_msg;
+        if (!have_valid) {
+          memset(&lm, 0, sizeof(lm));
+          lm.magic = res::kMagic;
+          lm.version = res::kVer;
+          lm.header_size = (uint16_t)offsetof(res::ResultMsg, det);
+          lm.ts_capture_ns = now_real_ns();
+          lm.config_hash = cfg_hash;
+        }
+        lm.crc = res::msg_crc(lm, crc32);  // crc 只盖 det/map 区, 循环内改
+                                           // 状态/年龄不影响; !have_valid 时
+                                           // 全零 crc ≠ 0 必须补算
+        int64_t t0 = watch_now_ms();
+        while (!g_stop &&
+               (watch_now_ms() - t0) < (int64_t)saf_cfg.grace_ms) {
+          lm.status = res::kStatusDegLatch;
+          lm.reason = (uint8_t)vd.reason;
+          lm.resets_60s = safety.resets_60s;
+          lm.nan_hits = safety.nan_hits;
+          lm.div_hits = safety.div_hits;
+          int64_t a = (now_real_ns() - lm.ts_capture_ns) / 1000000;
+          lm.frame_age_ms =
+              (uint16_t)(a < 0 ? 0 : (a > 65535 ? 65535 : a));
+          mailbox->publish(lm);
+          watch_touch(kWsIo);  // 宽限环 = 我方控制路径, 不设防
+          struct timespec ts = {0, 200 * 1000000L};
+          nanosleep(&ts, nullptr);
+        }
+        fatal_exit(14, "latch", "resets=%u nan=%u div=%u", safety.resets_60s,
+                   safety.nan_hits, safety.div_hits);
+      }
+      if (vd.do_reset) {
+        // 模板复位 (eng_stream 异步 D2D, 排在已提交工作之后自然定序):
+        // 流水线深 2 → 脏状态还会喂最多 2 帧 (各自被探测+计数), 之后干净
+        for (size_t i = 0; i < states.size(); ++i)
+          cudaMemcpyAsync(states[i].in->dev[0], d_rst[i], states[i].in->bytes,
+                          cudaMemcpyDeviceToDevice, eng_stream);
+        for (size_t i = 0; i < mstates.size(); ++i)
+          cudaMemcpyAsync(mstates[i].in->dev[0], d_mrst[i],
+                          mstates[i].in->bytes, cudaMemcpyDeviceToDevice,
+                          eng_stream);
+        printf("safety: RESET seq=%lu hits=%s nan=%u div=%u win60s=%u "
+               "plan_a=%.1f plan_k=%.2f\n",
+               (unsigned long)f_seq[j], saf::hit_name(hits), safety.nan_hits,
+               safety.div_hits, safety.resets_60s, plan_worst_a,
+               plan_worst_k);
+      }
       msg.crc = res::msg_crc(msg, crc32);
-      // ---- v3 fail-visible (M-PROD A4): Phase A 恒 NOMINAL, 年龄照实填.
-      // age = 发布时刻 - 捕获时刻 (CLOCK_REALTIME, group_ts_ns 同源).
-      msg.status = res::kStatusNominal;
-      msg.reason = res::kReasonNone;
+      // ---- v3 fail-visible (M-PROD B): 处置状态 + 健康计数照实填.
+      // age = 发布时刻 - 捕获时刻 (CLOCK_REALTIME, acquire 同源).
+      msg.status = selftest_fail_pub
+                       ? (uint8_t)res::kStatusSelftestFail
+                       : (vd.do_reset ? (uint8_t)res::kStatusDegReset
+                                      : (uint8_t)res::kStatusNominal);
+      msg.reason = vd.do_reset ? (uint8_t)vd.reason : res::kReasonNone;
       msg.wd_stage = (uint8_t)watch_cur_stage();
       msg.last_valid_seq = (uint32_t)f_seq[j];
+      // 健康计数照实填 (信箱可见的累计值; 此前漏填 → v3 恒 0, FTB2 暴露)
+      msg.resets_60s = (uint16_t)safety.resets_60s;
+      msg.nan_hits = safety.nan_hits;
+      msg.div_hits = safety.div_hits;
       int64_t age_ms = (now_real_ns() - msg.ts_capture_ns) / 1000000;
       msg.frame_age_ms = (uint16_t)(age_ms < 0 ? 0
                                     : (age_ms > 65535 ? 65535 : age_ms));
       mailbox->publish(msg);
+      if (msg.status == res::kStatusNominal) {
+        last_valid_msg = msg;
+        have_valid = true;
+      }
       double t_d1 = now_ns();
       if (fjson) {
         fprintf(fjson,
@@ -1403,6 +1811,20 @@ int main(int argc, char** argv) {
                           mstates[si].in->bytes, cudaMemcpyDeviceToDevice,
                           eng_stream);
       }
+      // B1 测试钩子 SP_INJECT_NAN: 第 n 帧往 mp 状态注入 NaN (可配周期,
+      // 触发 LATCH→exit14 路径); 默认关.
+      if (saf_cfg.en && inject_n >= 0 && k >= inject_n &&
+          (inject_period <= 0 || (k - inject_n) % inject_period == 0)) {
+        for (auto& st : mstates)
+          if (st.in->dt == nvinfer1::DataType::kFLOAT) {
+            long cap = (long)(st.in->bytes / 4);
+            saf::inject_nan_async((float*)st.in->dev[0],
+                                  (int)(cap < 1024 ? cap : 1024), eng_stream);
+          }
+        if (k == inject_n)
+          printf("modelnode: TEST inject NaN into mp states at frame %ld\n",
+                 k);
+      }
       ok = mp_bind_all(p) && ctxM->enqueueV3(eng_stream);
       if (ok)
         for (auto& st : mstates)
@@ -1411,6 +1833,21 @@ int main(int argc, char** argv) {
     }
     if (!ok) {
       fatal_exit(12, "run", "enqueue FAILED at frame %ld", k);
+    }
+    // B1: 状态发散探测 —— 反馈后的全部 f32 状态做设备侧 absmax (NaN→inf),
+    // 单标量 D2H; 与后续 D2H/post 同流定序, complete_frame 读时必就绪.
+    if (saf_cfg.en) {
+      saf::absmax_zero_async(d_saf[p], eng_stream);
+      for (auto& st : states)
+        if (st.in->dt == nvinfer1::DataType::kFLOAT)
+          saf::absmax_async((const float*)st.in->dev[0], st.in->bytes / 4,
+                            d_saf[p], eng_stream);
+      for (auto& st : mstates)
+        if (st.in->dt == nvinfer1::DataType::kFLOAT)
+          saf::absmax_async((const float*)st.in->dev[0], st.in->bytes / 4,
+                            d_saf[p], eng_stream);
+      cudaMemcpyAsync(h_saf[p], d_saf[p], 4, cudaMemcpyDeviceToHost,
+                      eng_stream);
     }
     cudaEventRecord(ev_inf1[p], eng_stream);
 

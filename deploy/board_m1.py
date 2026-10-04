@@ -43,8 +43,8 @@ SRCS = ["sp_bus.h", "sp_bus.cpp", "image_source.h", "file_source.h",
         "sp_filesrc.cpp", "sp_kernels.h", "sp_kernels.cu",
         "preproc.h", "preproc.cu", "sp_preproc_test.cpp",
         "postproc.h", "sp_result.h", "sp_resultmon.cpp",
-        "sp_dmapool.h", "sp_dmapool.cpp", "sp_watch.h",
-        "sp_modelnode.cpp"]
+        "sp_dmapool.h", "sp_dmapool.cpp", "sp_watch.h", "sp_safety.h",
+        "sp_safety.cu", "sp_modelnode.cpp"]
 
 
 def connect():
@@ -97,6 +97,7 @@ g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_pub.cpp sp_bus.o -o sp_pub -lrt
 g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_inspect.cpp sp_bus.o -o sp_inspect -lrt
 nvcc -O3 -arch=sm_87 -c sp_kernels.cu -o sp_kernels.o
 nvcc -O3 -arch=sm_87 -c preproc.cu -o preproc.o
+nvcc -O3 -arch=sm_87 -c sp_safety.cu -o sp_safety.o
 if [ -f /usr/local/cuda/include/cuda_runtime.h ]; then
   g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_sub.cpp sp_bus.o sp_kernels.o \
       -o sp_sub -lrt -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lcudart
@@ -114,7 +115,8 @@ g++ -O2 -std=c++14 sp_preproc_test.cpp preproc.o \
     -L/usr/local/cuda/lib64 -lcudart
 g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_resultmon.cpp sp_bus.o \
     -o sp_resultmon -lrt
-g++ -O2 -std=c++14 sp_modelnode.cpp preproc.o sp_bus.o sp_dmapool.o \
+g++ -O2 -std=c++14 sp_modelnode.cpp preproc.o sp_safety.o sp_bus.o \
+    sp_dmapool.o \
     -o sp_modelnode -I/usr/local/cuda/include -I/usr/local/cuda/include \
     -L/usr/local/cuda/lib64 -lcudart -lcuda -lnvinfer -ldl -lrt -lpthread
 cp -f sp_pub sp_sub sp_inspect sp_filesrc sp_preproc_test sp_modelnode \

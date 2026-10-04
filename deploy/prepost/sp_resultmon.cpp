@@ -68,7 +68,8 @@ int main(int argc, char** argv) {
 
   ResultMsg m;
   memset(&m, 0, sizeof(m));
-  uint64_t seen_seq = 0, n_new = 0, n_torn = 0;
+  // seen_seq 初始 -1: 首读必打印 (SELFTEST_FAIL 心跳 seq=0 也要可见)
+  uint64_t seen_seq = (uint64_t)-1, n_new = 0, n_torn = 0;
   double t_end = dur > 0 ? mono_ms() + dur : 1e18;
   bool got = false;
   while (!g_stop && mono_ms() < t_end) {

@@ -583,6 +583,41 @@ StartLimitIntervalSec/StartLimitBurst 属 [Unit] 段；放 [Service] 只有一�
 reset-failed——且要对**所有**可能连环熔断的单元都 reset（filesrc 失效窗
 里 node exit20 循环重启会把自己也熔断）。
 
+### msg_crc 只盖 det/map 区，全零消息 crc≠0 必须显式算（Phase B）
+
+信箱消息 crc 只覆盖 det 容量区 + map 有效条数（不是整 struct）。SELFTEST
+心跳 / LATCH 无有效帧分支 memset 全零后直接发布，crc 留 0——但全零 det 区
+的 crc32 **不是 0**，读端校验必然 mismatch 整帧拒收 → 心跳在信箱上完全
+不可见（FTB1 probe 空的根因）。任何绕过正常 complete_frame 填充路径的
+发布点，发布前都要显式 `msg.crc = msg_crc(msg, crc32)`。同族坑：v3 健康
+计数（nan_hits/div_hits/resets_60s）发布时忘了填进 msg——信箱上恒 0 而
+节点日志里明明在涨，"信箱可见"的断言必须查 msg 字段不是节点内部变量。
+
+### 注入的 NaN 被引擎 fp16 链在状态边界吸收，探测走 state 通道（Phase B）
+
+SP_INJECT_NAN 往 mp 状态缓冲注 NaN（8 或 1024 个元素、单发或每帧），
+引擎输出**始终保持有限**——NaN 在 fp16 状态边界被吸收，反馈回去的状态
+变成极端有限值（>1e6）→ 探测走 state-absmax 发散通道（div），nan_hits
+恒 0。这是机制不是 bug：故障注入验收要认 "DEGRADED_RESET + RESET 日志 +
+探测帧 div/nan 任一 ≥1" 的通道组合证据，不能死磕 nan_hits。另注意计数
+是**进程累计**：SP_FPS=1 下 81 帧清单 ~81s 枯竭 → node exit20 重启清零，
+验收读计数要读探测帧不是恢复帧。
+
+### 门禁独立 run 用 pkill 清场会撞 systemd 复活的双发布端（Phase B）
+
+门禁/隔离 run 清场若只 `pkill -9 sp_filesrc/sp_modelnode`，systemd 的
+Restart=on-failure 会在 ~1s 后把发布端**拉回同一 ring**，与独立 run 的
+filesrc 形成双发布端：症状是独立 node 中途 `FATAL code=12 seq misalign`
+（撞外来 seq，恰好在场景边界附近暴露）或 filesrc `claim timeout`。
+清场必须 `systemctl stop` 双单元 + reset-failed，再 pkill 兜底。
+
+### 金标比较 NaN 差值盲区（Phase B）
+
+`fabs(a-b)` 两侧任一 NaN 时差值是 NaN，`d > tol` 恒 false → 往金标里
+篡改 NaN 字节自检照样 PASS（FTB1 第一轮 FAIL 根因）。容差比较必须显式
+`isnan(d) → 计超差`，"比较表达式对 NaN 恒 false" 是所有数值门禁的通杀
+陷阱。
+
 ---
 
 ## 最终引擎 profile 分布 (T6 + v8 插件, 38.99ms mean)
@@ -1119,3 +1154,84 @@ FATAL/熔断/冻结全部可见。
 ④ 状态发散/NaN 运行时探测 + 自动模板复位（resets_60s/nan_hits/div_hits
 已留计数位，DEGRADED_RESET/DEGRADED_LATCH 状态位已留语义）+
 --selftest 开机自检（帧 0 金标 hash 门禁，失败阻止 ACTIVE）。
+
+## 第十六轮：M-PROD Phase B——运行时发散探测/自动模板复位 + 开机自检金标门禁（2026-10-03 交付）
+
+量产化第二阶段两件事：**④运行时发散/NaN 探测 + 自动模板复位**（检测
+即处置：复位→标志→再犯熔断，不做无限复位循环）、**⑤开机自检**（帧 0
+金标容差 + 引擎/插件指纹，失败**阻止 ACTIVE**）。
+
+### ④ 运行时探测 + 处置状态机（sp_safety.h/.cu）
+
+每帧在完成帧收割处跑全部检查（µs 级宿主循环 + 每态一个设备 absmax
+kernel）：
+
+| 检查 | 对象 | 判据 |
+|---|---|---|
+| 非有限值 | det_cls/det_bbox/motion_reg/plan_reg/plan_status | 任一 NaN/Inf |
+| 检出几何 | 解码后 DetOut | \|x\|,\|y\|>100m；w,l,h∉(0,20m] |
+| 检出数漂移 | n_det 滚动 100 帧 | z-score>6（std≈0 跳过） |
+| plan 运动学 | final_plan 6 点 | \|a\|>15m/s² 或 \|κ\|>1.0，**conf≥0.5 才查** |
+| 状态发散 | 全部时序状态缓冲 | 设备 absmax 非有限或 >1e6 |
+
+plan 检查必须按置信门控：板端实测 conf=0 的 argmax plan_reg 是噪声，
+姿态超界属正常分布，无条件检查会在 scene-1 真实数据上 60s 攒 6 次
+复位误报 → LATCH 误熔断（GATE 前必须先做无注入 3min 稳态观察）。
+
+处置状态机：单帧异常 → 模板复位该帧状态（d_rst/d_mrst 异步 D2D 排
+eng_stream，流水线深 2 → 脏状态还会喂 ≤2 帧、各自被探测计数）+ 信箱
+status=DEGRADED_RESET；60s 窗复位 >5 → **LATCH**：持续发布 last_valid
++ 真实旧化（age 每 200ms 重算），2s 宽限（SP_DIV_GRACE_MS）后 exit 14
+交 systemd；120s 内 5 次由 StartLimit 熔断转人工。env 旋钮 SP_DIV_*。
+
+关键实测：注入的 NaN 被 mp 引擎 fp16 链在状态边界吸收（输出保持有限、
+反馈状态变极端值）→ 探测走 state-absmax 通道，nan_hits 不动——见
+"遇到的主要坑"。absmax 用 atomicMax(int 位型) 单标量 D2H；per-parity
+标量避免 submit(k) 覆盖 complete_frame(k-2) 正在读的结果。
+
+### ⑤ --selftest 开机自检（金标容差 + 指纹）
+
+warmup 后、graph 捕获前，eager 跑帧 0（=模板零态）流水线：读 manifest
+目录的 6 路 NV12，输出 9 张量与金标比容差；指纹 md5(bb2/main/mp 引擎 +
+插件) 对 meta.txt。金标标定 `_prod_golden.py gen`：独立进程 10 次
+`--selftest-dump`（attach 活 ring 不消费），tol = max(3×跨运行最大绝对
+偏差, 1e-3 地板)——**不存 hash**（M7：跨运行非位确定，hash 门禁必误报），
+指纹+容差双保险。
+
+退出语义（spec 决策 3）：基础设施坏（meta/tol/金标缺失）rc=2 →
+fatal_exit(15)；容差不过 rc=1 → **阻止 ACTIVE**：节点存活、1Hz
+SELFTEST_FAIL 心跳（seq=0/det 清零/last_valid=0）、不发布有效结果，
+SP_SELFTEST_OVERRIDE=1 放行（继续发布但每帧标 SELFTEST_FAIL）。
+自检帧跑完必须 zero_states_all（污染时序状态会带进正式循环）。
+
+### 故障注入验收（`deploy/_prod_ft_b.py`，3/3 PASS + 恢复全过 + OVERRIDE 过）
+
+| 用例 | 注入 | 验收证据 |
+|---|---|---|
+| FTB1 | 金标 det_cls 篡改 4B NaN → restart | probe 抓到 SELFTEST_FAIL/reason=4/**lage 33→344ms 心跳活年龄**、last_valid=0、节点 active；还原金标 5.5s 回 NOMINAL |
+| FTB2 | SP_FPS=1 + SP_INJECT_NAN=6 单发 | 信箱 DEGRADED_RESET（探测帧 div=1）+ RESET 日志×2 + **11.9s** 回 NOMINAL |
+| FTB3 | SP_INJECT_NAN=0 PERIOD=1 连发 | 60s 窗 6 复位 → LATCH 日志 + exit14 + journal status=14 → StartLimit 熔断 failed 保持 |
+| OVERRIDE | FTB1 注入 + SP_SELFTEST_OVERRIDE=1 | 信箱 SELFTEST_FAIL + last_valid=26179（有效结果继续发布、状态标明） |
+
+### 精度门禁（两次独立板端 run，不回归）
+
+| 指标 | mprodb | mprodc | Phase A (mproda) | m7fix 基线 | 判定 |
+|---|---|---|---|---|---|
+| map mAP | 0.7481 | 0.7483 | 0.7463 | 0.7485 | ✓ |
+| EPA car/ped | 0.6098/0.5089 | 0.6035/0.5028 | 0.6039/0.5080 | 0.6048/0.5023 | ✓ 区间重叠 |
+| planning L2 | 0.7481 | 0.7343 | 0.7398 | 0.7377 | ✓ 跨运行散布 ±0.007 |
+| obj_box_col | 0.242% | 0.161% | 0.161% | 0.161% | ✓ 同上 |
+
+（81 帧 mini 的 L2/col 跨运行散布 ~±0.01/±0.08pp——mprodb 单看 L2/col
+像劣化，第二次 run 即回基线类内；门禁结论必须两次独立 run 交叉。）
+
+### 产物
+
+`deploy/prepost/`：sp_safety.h/.cu（新）、sp_modelnode.cpp（B1 检查块/
+复位/LATCH/SP_INJECT_NAN/--selftest/--selftest-dump/--golden）、
+sp_resultmon.cpp（v3 健康计数真实填充）；`deploy/_prod_golden.py`
+（金标标定/篡改/校验）、`_prod_ft_b.py`（FTB 套件）、
+`_mprod_mkeval.py`（map+mp 评测组装泛化）、`_mprod_gate.py`
+（MPROD_TAG 参数化 + systemctl stop 清场）。板上
+/opt/m0/trt-dev/golden/m3/{frame0×9, tol.txt, meta.txt}（0444）。
+
