@@ -25,7 +25,8 @@ from projects.mmdet3d_plugin.datasets.nuscenes_3d_dataset import (  # noqa
 from eval_nuscenes import DET_ONLY_EVAL_MODE  # noqa: E402
 
 BASE = os.path.join(ROOT, "work_dirs", "sparsedrive_small_stage2")
-ENG = os.path.join(BASE, "evaldata", "mini_eng_v8")
+ENG = os.environ.get("EVAL_ENG_DIR", "") or os.path.join(
+    BASE, "evaldata", "mini_eng_v8")
 NUM_OUT = 300
 
 

@@ -1,0 +1,9 @@
+{
+  "img_bbox_NuScenes/mATE": 0.6254,
+  "img_bbox_NuScenes/mASE": 0.4496,
+  "img_bbox_NuScenes/mAOE": 0.5619,
+  "img_bbox_NuScenes/mAVE": 0.4031,
+  "img_bbox_NuScenes/mAAE": 0.2872,
+  "img_bbox_NuScenes/NDS": 0.4795933540956595,
+  "img_bbox_NuScenes/mAP": 0.4246122582134704
+}

@@ -258,7 +258,9 @@ def gen_sineembed_for_position(pos_tensor, hidden_dim=256):
     half_hidden_dim = hidden_dim // 2
     scale = 2 * math.pi
     dim_t = torch.arange(half_hidden_dim, dtype=torch.float32, device=pos_tensor.device)
-    dim_t = 10000 ** (2 * (dim_t // 2) / half_hidden_dim)
+    # exp(x*log(10000)) instead of 10000**x: the latter traces a CPU scalar
+    # constant that breaks ONNX constant folding (cuda/cpu mix)
+    dim_t = torch.exp((2 * (dim_t // 2) / half_hidden_dim) * math.log(10000.0))
     x_embed = pos_tensor[..., 0] * scale
     y_embed = pos_tensor[..., 1] * scale
     pos_x = x_embed[..., None] / dim_t

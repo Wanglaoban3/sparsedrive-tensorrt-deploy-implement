@@ -741,21 +741,31 @@ class MotionPlanningHead(BaseModule):
             # ==========================================================
             # 🚀 优化 4：用 Roll (环形队列) 替代全量 Slice+Concat
             # ==========================================================
-            new_history_feature = torch.roll(matched_history_feature, shifts=-1, dims=2)
+            # cat-shift instead of roll: bitwise identical for shift=-1 and
+            # avoids the ONNX Roll op (weak TRT support)
+            new_history_feature = torch.cat(
+                [matched_history_feature[:, :, 1:, :],
+                 matched_history_feature[:, :, :1, :]], dim=2)
             new_history_feature[:, :, -1, :] = det_instance_feature
-            
-            new_history_anchor = torch.roll(matched_history_anchor, shifts=-1, dims=2)
+
+            new_history_anchor = torch.cat(
+                [matched_history_anchor[:, :, 1:, :],
+                 matched_history_anchor[:, :, :1, :]], dim=2)
             new_history_anchor[:, :, -1, :] = det_anchors
-            
+
             new_period = torch.clamp(matched_period + 1, 0, queue_length)
-            
+
             mask_int = mask.to(history_ego_period.dtype).view(-1, 1)
             curr_history_ego_period = history_ego_period * mask_int
-            
-            new_history_ego_feature = torch.roll(history_ego_feature, shifts=-1, dims=2)
+
+            new_history_ego_feature = torch.cat(
+                [history_ego_feature[:, :, 1:, :],
+                 history_ego_feature[:, :, :1, :]], dim=2)
             new_history_ego_feature[:, :, -1, :] = ego_feature
-            
-            new_history_ego_anchor = torch.roll(history_ego_anchor, shifts=-1, dims=2)
+
+            new_history_ego_anchor = torch.cat(
+                [history_ego_anchor[:, :, 1:, :],
+                 history_ego_anchor[:, :, :1, :]], dim=2)
             new_history_ego_anchor[:, :, -1, :] = ego_anchor
             
             new_ego_period = torch.clamp(curr_history_ego_period + 1, 0, queue_length)

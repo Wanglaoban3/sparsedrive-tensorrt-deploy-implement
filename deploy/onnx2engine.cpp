@@ -129,11 +129,13 @@ int main(int argc, char** argv) {
     const char* calibData = nullptr;
     const char* calibCache = nullptr;
     const char* f32Substr = nullptr;
+    const char* f32NamesFile = nullptr;
     bool fp16 = false;
     bool int8 = false;
     bool strict = false;
     bool f32NotQ = false;
     bool noTf32 = false;
+    bool preferF32 = false;
     size_t wsMB = 256;
 
     for (int i = 1; i < argc; ++i) {
@@ -142,17 +144,19 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--strict")) strict = true;
         else if (!strcmp(argv[i], "--f32-notq")) f32NotQ = true;
         else if (!strcmp(argv[i], "--no-tf32")) noTf32 = true;
+        else if (!strcmp(argv[i], "--prefer-f32")) preferF32 = true;
         else if (!strcmp(argv[i], "--ws-mb") && i + 1 < argc) wsMB = strtoul(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--plugins") && i + 1 < argc) pluginSo = argv[++i];
         else if (!strcmp(argv[i], "--calib-data") && i + 1 < argc) calibData = argv[++i];
         else if (!strcmp(argv[i], "--calib-cache") && i + 1 < argc) calibCache = argv[++i];
         else if (!strcmp(argv[i], "--f32-substr") && i + 1 < argc) f32Substr = argv[++i];
+        else if (!strcmp(argv[i], "--f32-names") && i + 1 < argc) f32NamesFile = argv[++i];
         else if (!onnxPath) onnxPath = argv[i];
         else if (!outPath)  outPath  = argv[i];
     }
     if (!onnxPath || !outPath) {
         std::cerr << "用法: " << argv[0] << " model.onnx out.engine [--fp16] [--int8] [--strict]"
-                  " [--f32-notq] [--no-tf32] [--ws-mb 256] [--plugins lib.so]"
+                  " [--f32-notq] [--f32-names list.txt] [--no-tf32] [--ws-mb 256] [--plugins lib.so]"
                   " [--calib-data dir1,dir2] [--calib-cache f]\n";
         return 2;
     }
@@ -227,8 +231,99 @@ int main(int argc, char** argv) {
                 L->setOutputType(j, DataType::kFLOAT);
             ++nf32;
         }
-        config->setFlag(BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+        // 8.6 实测: kPREFER/kOBEY 这族 flag 会触发 "obedient candidate"
+        // 过滤路径, 大图上两种死法 (Myelin f16/f32 冲突 / QDQ int8 断言);
+        // 裸 setPrecision+setOutputType 本身就是 TRT 尊重的显式约束,
+        // 默认不再挂 flag, 需要时 --prefer-f32 显式打开
+        if (preferF32) {
+            config->setFlag(BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+            std::cout << "builder flags: PREFER_PRECISION_CONSTRAINTS\n";
+        }
         std::cout << "f32-substr: " << nf32 << " layers forced to FP32\n";
+    }
+
+    // --f32-names <file>: 按 ONNX 节点名精确列表强制 FP32 (每行一个名字,
+    // 忽略前导 '/')。用途: map 头单独退回 FP32 (det 头维持 fp16 tactic),
+    // 名字列表由 deploy/_gen_f32_names.py 从 v5_P1h.onnx 反向遍历 map 输出生成,
+    // 已排除 backbone/neck (保 INT8) 与显式 fp16 区域 (保 NVRTC 安全)。
+    // 纯浮点护栏同 f32-substr; 另跳过 Q/DQ 邻接层 (防打断 int8 折叠链)。
+    if (f32NamesFile) {
+        std::set<std::string> want;
+        std::ifstream lf(f32NamesFile);
+        if (!lf) {
+            std::cerr << "f32-names: cannot open " << f32NamesFile << "\n";
+            return 1;
+        }
+        std::string ln;
+        while (std::getline(lf, ln)) {
+            while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ')) ln.pop_back();
+            if (!ln.empty()) {
+                if (!ln.empty() && ln[0] == '/') ln.erase(ln.begin());
+                want.insert(ln);
+            }
+        }
+        std::set<std::string> dqOut, qIn;
+        for (int i = 0; i < network->getNbLayers(); ++i) {
+            auto* L = network->getLayer(i);
+            if (L->getType() != LayerType::kQUANTIZE) continue;
+            bool isQ = L->getNbOutputs() > 0 &&
+                       L->getOutput(0)->getType() == DataType::kINT8;
+            if (isQ) {
+                for (int j = 0; j < L->getNbInputs(); ++j)
+                    qIn.insert(L->getInput(j)->getName());
+            } else {
+                for (int j = 0; j < L->getNbOutputs(); ++j)
+                    dqOut.insert(L->getOutput(j)->getName());
+            }
+        }
+        int nf32 = 0, inZone = 0, notPure = 0;
+        std::vector<std::string> unmatchedSample;
+        for (int i = 0; i < network->getNbLayers(); ++i) {
+            auto* L = network->getLayer(i);
+            std::string nm = L->getName() ? L->getName() : "";
+            if (!nm.empty() && nm[0] == '/') nm.erase(nm.begin());
+            if (!want.count(nm)) continue;
+            // 数据搬运层 (Shuffle=Reshape/Transpose/Flatten/Squeeze/...)
+            // 不钉: 钉了输出类型会在 Myelin 融合区内部制造 f16/f32 冲突
+            // (e_T6m 实测 no obedient candidate / Flatten_3 mismatch),
+            // 只钉计算层, 边界由 TRT 插 reformat
+            if (L->getType() == LayerType::kSHUFFLE) { ++notPure; continue; }
+            bool pureFloat = L->getType() != LayerType::kCONSTANT &&
+                             L->getType() != LayerType::kCAST;
+            for (int j = 0; pureFloat && j < L->getNbOutputs(); ++j) {
+                DataType ot = L->getOutputType(j);
+                if (ot != DataType::kFLOAT && ot != DataType::kHALF)
+                    pureFloat = false;
+            }
+            if (!pureFloat) { ++notPure; continue; }
+            bool zone = false;
+            for (int j = 0; !zone && j < L->getNbInputs(); ++j)
+                if (dqOut.count(L->getInput(j)->getName())) zone = true;
+            for (int j = 0; !zone && j < L->getNbOutputs(); ++j)
+                if (qIn.count(L->getOutput(j)->getName())) zone = true;
+            if (zone) { ++inZone; continue; }
+            L->setPrecision(DataType::kFLOAT);
+            for (int j = 0; j < L->getNbOutputs(); ++j)
+                L->setOutputType(j, DataType::kFLOAT);
+            ++nf32;
+            want.erase(nm);
+            if (unmatchedSample.size() < 5) unmatchedSample.push_back(nm);
+        }
+        // 不加 kPREFER/kOBEY: 这族 flag 在 8.6 触发 "obedient candidate"
+        // 过滤路径, 实测两种死法 (QDQ 图卡 Myelin 融合, float 图卡
+        // backbone conv1 全战术无效)。裸 setPrecision + setOutputType
+        // 本身就是 TRT 尊重的显式约束
+        std::cout << "f32-names: " << nf32 << " layers forced to FP32 (skipped "
+                  << inZone << " qdq-zone, " << notPure << " not-pure-float; "
+                  << want.size() << " names unmatched)\n";
+        if (network->getNbLayers() > 0 && nf32 == 0) {
+            std::cout << "f32-names: sample layer names:";
+            for (int i = 0; i < 5 && i < network->getNbLayers(); ++i) {
+                const char* s = network->getLayer(i)->getName();
+                std::cout << " '" << (s ? s : "?") << "'";
+            }
+            std::cout << "\n";
+        }
     }
 
     // --f32-notq: 除 Q/DQ 邻接区域 (显式量化区) 外, 全部纯浮点层强制 FP32。
@@ -274,7 +369,14 @@ int main(int argc, char** argv) {
                 L->setOutputType(j, DataType::kFLOAT);
             ++nf32;
         }
-        config->setFlag(BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+        // 8.6 实测: kPREFER/kOBEY 这族 flag 会触发 "obedient candidate"
+        // 过滤路径, 大图上两种死法 (Myelin f16/f32 冲突 / QDQ int8 断言);
+        // 裸 setPrecision+setOutputType 本身就是 TRT 尊重的显式约束,
+        // 默认不再挂 flag, 需要时 --prefer-f32 显式打开
+        if (preferF32) {
+            config->setFlag(BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+            std::cout << "builder flags: PREFER_PRECISION_CONSTRAINTS\n";
+        }
         std::cout << "f32-notq: " << nf32 << " layers forced to FP32 ("
                   << dqOut.size() << " DQ, " << qIn.size() << " Q taps)\n";
     }
