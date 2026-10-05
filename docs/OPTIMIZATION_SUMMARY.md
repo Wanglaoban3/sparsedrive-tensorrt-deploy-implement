@@ -9,12 +9,12 @@
 |---|---|
 | 引擎 | `models/e_bb2.engine` (28 MB, md5 `f375467e...`) + `models/e_hd.engine` (104 MB, md5 `8c3a6257...`) |
 | 链接 | `run_engine2 e_bb2 e_hd <plugin> in_dir in_dir --dump out`（D2D 零拷贝，边界张量 `/Reshape_9_output_0`；N 引擎泛化版 `run_engines`） |
-| 插件 | `/usr/local/lib/libdfaplug_v8.so`（md5 `55df31bc...`，与单引擎交付同一插件） |
+| 插件 | **`/usr/local/lib/libdfaplug_v11.so`（2026-10-06 起，向量化 gather，见第十八轮）**；回退 `libdfaplug_v8.so`（md5 `55df31bc...`） |
 | 图源 | `sp_backbone2.onnx`（bb2 = backbone+FPN+format）+ `sp_head.onnx`（det+map heads） |
 | runner md5 | run_engine2 `60dff83b...`；run_engines `0b4da654...` |
-| 延迟 | **39.86 ms / 25.1 FPS**（单引擎 38.99 ms，+0.87 ms） |
-| mini det mAP | **0.4160** / NDS **0.4729**（单引擎 0.4203/0.4738，det -0.4pt） |
-| mini map mAP | **0.7481**（单引擎 0.6471 → **+10.1pt**；FP32 PyTorch 0.7512） |
+| 延迟 | **39.11 ms**（v11；v8 口径 39.86 ms；单引擎 38.99 ms） |
+| mini det mAP | **0.4157** / NDS **0.4724**（v8 0.4160/0.4729，单引擎 0.4203/0.4738，det -0.4pt） |
+| mini map mAP | **0.7462**（v8 0.7481；单引擎 0.6471 → **+9.9pt**；FP32 PyTorch 0.7512） |
 | 量化 | 与单引擎同配置同 scale（backbone/neck INT8 QDQ，head float 权重，DFA 权重 FP16） |
 | FP32 参照 (P100) | mini det mAP 0.4256 / NDS 0.4798；mini map mAP **0.7512** |
 | 原始基线 | 82.6 ms / 12.1 FPS / mAP 0.4178 → **2.08× 加速**（vs 39.86ms） |
@@ -31,8 +31,10 @@ map 0.6471，e_T6 md5 `7fbcdac1...`）未触碰；换 TRT 版本后可评估回�
 `mods/mini_pipeline_sp2.sh`。
 
 **注意**: 两引擎均按插件名/版本/命名空间 ("DeformableAggregation" v1)
-动态绑定插件，**换插件不用重编引擎**。v8 在条件不满足时自动回落 v3 内核
-（`DFA_V8_DEBUG=1` 可查实际路径）。
+动态绑定插件，**换插件不用重编引擎**。v11 为当前默认（v11→v8→v3 回落
+链；`DFA_V11_DEBUG=1` 可查实际路径与 workspace）；v8 在条件不满足时
+自动回落 v3 内核（`DFA_V8_DEBUG=1`）。多个插件 .so 在 /usr/local/lib
+并存安全（按路径显式 dlopen）。
 
 **P5 FlashAttention 实验（已完成，负结果不采用）**: det 侧 10 个大注意力
 站点换手写 FlashSDPA 插件内核，模块级 +6.1ms（可收割上限仅 ~2.75ms），
@@ -1234,4 +1236,81 @@ sp_resultmon.cpp（v3 健康计数真实填充）；`deploy/_prod_golden.py`
 `_mprod_mkeval.py`（map+mp 评测组装泛化）、`_mprod_gate.py`
 （MPROD_TAG 参数化 + systemctl stop 清场）。板上
 /opt/m0/trt-dev/golden/m3/{frame0×9, tol.txt, meta.txt}（0444）。
+
+## 第十八轮：DFA gather 向量化 v11 插件（2026-10-06 交付，门禁全过）
+（编号跳过十七，预留给暂停中的 M-PROD Phase C 收尾）
+
+来源：H:\projects\SparseDriveV2 部署调研（71.30→22.92ms 战役）。结论：
+其 MHA flash-tile 融合**不可迁移**（它们的 TRT 注意力链 ~0.2 TFLOPS
+——K=32 残废 + Gather 拆 QKV；我们 5 TFLOPS 流水线，其内核在我们形状
+上反而 ~10ms，P5 关闭结论独立复核成立）；唯一可收割 = **DFA gather
+向量化**（其 R3/R4：8ch/lane uint4 tap + block-coop staging + R8
+sumfusion anchor 求和入 gather）。我们已经有的：32B 重复 entry、
+ε-skip、plan 内联 softmax——欠缺的只是 gather 内存通道宽度。
+
+### v11 设计（deploy/dfaplug_v11.cu）
+
+- **EntryA 48B 每 anchor 去重**：`{int off[4]; uint4 wt8(8×half 组权
+  重, <eps→0); uint4 cw4(4×half 角权+pad)}`——v8 是每 anchor×group
+  重复 entry(32B)；wt=0 与剔除逐位等价（fmaf(+0,f,acc)=acc）；
+- **gather = warp/（anchor,SPLIT-块）**，lane 持 8 通道（uint4 16B
+  tap，warp 一次 512B 角点行），8|32 所以 lane 的通道必落在单组内；
+  组权用 **8 路编译期 select 链**（动态下标 half 数组会让 ptxas 把
+  uint4 降级 local memory：16B 栈帧、map gather 2× 慢——实测修掉后
+  0 栈 40 reg）；
+- **SPLIT 自适应**：nA≥512→2，否则 ceil(3072/nA) 夹 1..32（板上扫
+  split 实测定：map A=100 在 32 平台期 0.30ms，det A=900 在 2 最优
+  0.239ms）；split>1 → fp32 partial + 固定顺序 finalize（无原子，
+  误差类与 v8 的 atomicAdd 到达序同类）；
+- **权重 half 化**：~1e-3/项舍入（SparseDriveV2 v4/v5 同类过门）；
+- workspace：counts[复用 v8 语义]+entries+partial，175.8MB→33.7-36MB
+  （~5×）；引擎侧 getWorkspaceSize=max(v8,v11)，引擎按 v3（ws=0）编
+  的场景下实例懒自分配，capture 前完成故 graph-replay 安全；
+- enqueue 优先 v11（G==8 且 C%32==0 且 ws 足）→ v8 → v3 回落链不动。
+
+### 模块级 A/B（dfa_eT6 12 调用真实 dump，test_dfa_v11）
+
+- 数值：v11vseng l2 1.8-3.0e-4 / maxabs ≤7.8e-3（half 权重量化类，
+  预测内；v8vseng ~1e-5），rc=0 全过；
+- 时延：全帧 12 调用 **6.60→5.59ms（1.18×）**；det 1.14-1.45×，
+  map 1.03-1.23×。
+
+### 81 帧闭环门禁（bb2+hd+graph+libdfaplug_v11，`deploy/_v11_gate.py`）
+
+| 指标 | v8 交付基线 | v11 实测 | 判定 |
+|---|---|---|---|
+| det mAP / NDS | 0.4160 / 0.4729 | **0.4157 / 0.4724** | Δ-0.0003 抖动类内 ✓ |
+| map mAP | 0.7481 | **0.7462** | 抖动带 0.746-0.749 内 ✓ |
+| e2e p50 | 39.86 ms | **39.11 ms** | -0.75 ms |
+| hd 段 p50 | ~19.9 ms | **18.50 ms** | -1.4 ms（=DFA 收益落点） |
+| 吞吐 | 5fps 源-paced | **5.06fps 81/81 全跑通** | 无停顿 ✓ |
+
+产物：`libdfaplug_v11.so`（门禁数据对应 build md5
+`f46f5bf710e9ee1c117c7e9592ca636d`，nvcc 时间戳致每次编译 md5 不同，
+以功能为准）安装 /usr/local/lib 与 v8 并存（按路径显式 dlopen 互不
+影响）；引擎零重编。**交付建议：两引擎链接插件换 v11 为默认**（门禁
+过、严格更快、ws 5× 更省），v8 保留为回退。评估留档
+`deploy/artifacts/eval_v11plug_mini.json`（det）/
+`eval_v11plug_map.json`（map），闭环 dump `preproc_ref/v11g1` +
+evaldata/v11plug。
+
+### 本轮踩坑（全部已录 AGENTS.md 板端操作坑）
+
+1. **pkill -f 自匹配杀 wrapper**：pkill 与后续命令同链时，载命令的
+   bash 自身 cmdline 含 pattern → 自杀，后续 mkdir 全不执行 → node.log
+   都不出现的"静默启动失败"。修：`pkill -9 -f 'sp_filesr[c]'`。
+2. **gate 重跑旧 RC 假阳性**：CLEAN 没删 RC → 轮询第一跳读旧 rc 直接
+   返回并 pkill 掉正在启动的新 run。修：整目录 `rm -rf BD && mkdir`。
+3. **--hd 旗标漏拼 format 串（重犯 AGENTS.md 已记坑，第 2 次）**：
+   gate 脚本定义了 HD 变量没拼进 nd → 静默 bb2 单引擎：infer 15ms、
+   dump 只有 Reshape_9(46MB/帧!)、无 det_cls。修：拼进 format 串 +
+   **launch 后日志指纹校验**（out_00/det_cls 存在性）。
+4. **/opt/m0 盘满 100% 假死**：46MB/帧 dump 把 26G 盘写满 → dump 写
+   停 7-99s（svc 尖刺而 gpu_ms 正常 = 文件 IO 特征）→ filesrc lease
+   5s 强收槽 → FATAL 12 / exit 20。修：清 `*_out`（释放 4G）+ gate
+   CLEAN 带 df 检查 + filesrc `SP_BUS_LEASE_MS=600000`（瞬态停顿不再
+   破坏 seq 连续性；真死锁仍有 30×1s claim timeout→exit 20 兜底）。
+5. GMSL 相机序列器内核日志风暴（~7.8 条/s，2026-10-05 起）——观测不
+   致卡顿，判障时勿误判为根因。
+
 
