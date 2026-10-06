@@ -1457,5 +1457,34 @@ _pd_step4_det.py 泛化版）。
 4. **mini manifest scene id 从 0 起**（boston=0/queenstown=1），复位行
    `scene 0 -> 1`——断言以板上实际措辞为准，别凭记忆写编号。
 
+### 终审修复轮（fresh-context 全分支 review → 1C+5I 全修，2026-10-07）
+
+评审（1 Critical / 5 Important / 6 Minor）→ 修复与验证：
+
+| # | 发现 | 修法 | 验证 |
+|---|---|---|---|
+| C1 | release 无代校验：wrap-lease 强抢+refill 换代后，陈旧 view 的 release 偷走新持有者 ref → 槽被提前放圈覆写（GPU 在读=fault 类） | release 加 `s.meta.seq == v->meta.seq` 代校验（claim 置 seq=0/commit 写新 seq，比对可靠），ref 与 held_slot 一并守卫 | test_bus_lease 新增 Case 5 交错用例：RED（claim 0ms 拿到槽）→ GREEN，5/5 |
+| I1 | skip 分支不回滚 seq_base → 后续每帧重入 skip（计数按帧倍增、SKIP 行每帧刷；FT2 日志 11 行全是 skipped=28 实锤）；rewind 分支 `seq-1` 只对 submitted==0 正确 | 两分支统一 `seq_base = v.meta.seq - (submitted+1)` | FT2 强化断言 skip_lines==1 过（修复前 11 行） |
+| I2 | 场景内跳序原始 dt（秒级）直接喂时序递归，违反离线链 dt>2.0 清状态契约 | reset 条件加 `dt>2.0‖dt<0` → 同边界口径复位（tmat=identity+dt=0.5），健康节拍（5fps=0.2s）不触发 | 代码路径审查 + mprodf 两 run 无误触发 |
+| I3 | A 点弃帧时 prev_l2g/prev_ts/cur_scene 已折算 → 边界帧被弃丢复位、时序参考错一帧 | 折算前 save_*，A 点（hd 未提交、状态停 k-1）弃帧回滚折算；B/C 点（hd 已提交、状态到 k）保持折算但补发 mp 模板复位（mp 段被跳过，cur_scene 已折算不能再靠 k+1 清） | 逐检查点状态推进表审查（A/B/C/D × 状态/折算/mp 清零） |
+| I4 | 环重置 x120 放弃路径 rc0，违反"常驻源枯竭必须 exit 20"契约（docs 也写错） | give-up 分支置 abort_run=true（--loop 下走 exit20） | 代码审查（:2173 分支实证） |
+| I5 | wrap-lease 默认 800ms 对 hb 老度峰值 690ms 余量仅 110ms | 默认改 1000ms（尾量 310ms，仍 5× 低于 5s 死租约）；失败模式在 C1 修复后降级为撕裂帧 | m3.env 更新 + install 断言生效 |
+| M1/M2/M4 | B 点注释失实（hd 实已提交）/abandon_ms 死字段/环重置 resync 白丢一帧 | 注释改写；删字段；`last_seq = ls-1` 立即消费现存最新 | 同批 |
+| M3/M5/M6 | telemetry 无尺寸帽（既有 C1 行为）/env 每 claim 重读（开销可忽略）/m3.env v11 切换混入提交 | 接受并记录，不修 | — |
+
+修复后门禁（mprodf 两独立 run，全部入 mprodd 带；节点日志零 SKIP）：
+
+| 指标 | mprodd 带 | mprodf_a | mprodf_b |
+|---|---|---|---|
+| det mAP / NDS | 0.4169 / 0.4732 | 0.4164 / 0.4725 | 0.4174 / 0.4734 |
+| map mAP | 0.7479 | 0.7484 | 0.7479 |
+| EPA car/ped | 0.6054 / 0.5000 | 0.6028 / 0.5028 | 0.6020 / 0.4991 |
+| L2 | 0.7473 | 0.7435 | 0.7453 |
+| obj_box_col | 0.161% | 0.161% | 0.161% |
+
+单测 bus 5/5 + tier 4/4；FT 全轮 4/4（FT2 skip_lines=1 新证）；install
+收口断言复跑全绿（wrap=1000 生效、SELFTEST PASS、seq 双探递进）。
+dump 留档 `work_dirs/preproc_ref/mprodf_{a,b}`。
+
 
 

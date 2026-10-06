@@ -191,11 +191,14 @@ def ft2():
         o = run("grep -aE 'SKIP lag|scene 0 -> 1|FATAL' %s" % nlog).strip()
         m = re.search(r"skipped=(\d+)", o)
         skipped = int(m.group(1)) if m else 0
+        # 终审 I1 后 SKIP 行必须唯一 (seq_base 回滚, 不再逐帧重入 skip 分支)
+        n_skip = o.count("SKIP lag")
         if tag == "skip":
-            ok = (rc == 0 and skipped >= 20 and "scene 0 -> 1" in o
-                  and "FATAL" not in o)
-            ev.append("skip: rc=%s skipped=%d scene_reset=%s fatal=%s"
-                      % (rc, skipped, "scene 0 -> 1" in o, "FATAL" in o))
+            ok = (rc == 0 and skipped >= 20 and n_skip == 1
+                  and "scene 0 -> 1" in o and "FATAL" not in o)
+            ev.append("skip: rc=%s skipped=%d skip_lines=%d scene_reset=%s "
+                      "fatal=%s" % (rc, skipped, n_skip, "scene 0 -> 1" in o,
+                                    "FATAL" in o))
         else:
             ok = rc == 12 and "FATAL code=12" in o
             ev.append("strict: rc=%s fatal12=%s (对照)" %

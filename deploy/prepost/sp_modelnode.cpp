@@ -1800,12 +1800,17 @@ int main(int argc, char** argv) {
         if (ls > 0 && ls < last_seq) {
           if (++ring_resets > 120) {
             fprintf(stderr, "modelnode: ring reset x120, give up\n");
+            // 终审 I4: 常驻下放弃 = 源不可用, 必须走 exit20 让 systemd
+            // 重启 (rc0 会被视为成功停机, 发布端恢复后无人接链)
+            abort_run = true;
             break;
           }
           fprintf(stderr,
                   "SKIP ring reset latest=%lu last_seq=%lu → resync\n",
                   (unsigned long)ls, (unsigned long)last_seq);
-          last_seq = ls;  // 下一次 acquire 取 latest+1
+          // 终审 M4: last_seq=ls-1 → 立即消费现存最新帧 ls (真 last-is-
+          // best); 原写法 last_seq=ls 会白丢 ls 等下一帧
+          last_seq = ls - 1;  // 下一次 acquire 取 seq=ls 本身
           continue;
         }
       }
@@ -1840,12 +1845,18 @@ int main(int argc, char** argv) {
                   "SKIP lag got=%lu expect=%lu skipped=%llu total=%llu\n",
                   (unsigned long)v.meta.seq, (unsigned long)expect,
                   (unsigned long long)(v.meta.seq - expect), s_skip_lag);
+          // 终审 I1: 基线重滚到本帧 — 否则 expect 恒差 gap, 后续每帧都
+          // 重入 skip 分支 (计数按帧倍增、SKIP 行每帧刷; FT2 实测 11 行
+          // 全是 skipped=28 即此症)
+          seq_base = v.meta.seq - (uint64_t)(submitted + 1);
         } else {
           // seq 回退 = 发布端重启过 (环被 --fresh 重建): 重新对齐基线,
           // 与 submitted==0 的 resync 同口径, 不计跳序
           fprintf(stderr, "SKIP rewind got=%lu expect=%lu → resync\n",
                   (unsigned long)v.meta.seq, (unsigned long)expect);
-          seq_base = v.meta.seq - 1;
+          // 终审 I1: rebase 公式对任意 submitted 成立 (原 `v.seq-1` 只对
+          // submitted==0 正确, mid-run rewind 会每帧重入本分支)
+          seq_base = v.meta.seq - (uint64_t)(submitted + 1);
         }
       } else {
         fatal_exit(12, "run", "seq misalign got %lu expect %lu",
@@ -1870,13 +1881,21 @@ int main(int argc, char** argv) {
 
     // 场景边界/首帧: 首帧零状态已在循环前完成; 边界与链路二口径一致 ——
     // 只重置 t_matrix(identity)+dt(0.5), 实例状态跨场景保留
-    // (cur_scene 首帧也要落账, 否则下一帧误判成边界)
+    // (cur_scene 折算在下方与 prev_* 同点落账)
     bool reset = !have_prev || fm.scene != cur_scene;
-    if (fm.scene != cur_scene) {
-      if (have_prev)
-        printf("modelnode: scene %u -> %u at frame %ld (tmat=identity,"
-               " dt=0.5, 状态保留)\n", cur_scene, fm.scene, k);
-      cur_scene = fm.scene;
+    if (fm.scene != cur_scene && have_prev)
+      printf("modelnode: scene %u -> %u at frame %ld (tmat=identity,"
+             " dt=0.5, 状态保留)\n", cur_scene, fm.scene, k);
+    float dt = reset ? 0.5f : (float)((double)(fm.ts_ns - prev_ts) / 1e9);
+    if (!reset && (dt > 2.0f || dt < 0.0f)) {
+      // M10 终审 I2: 场景内跳序后原始 dt 可达秒级 — 离线链契约
+      // (tools/test_trt.py) 对 dt>2.0/dt<0 帧清状态; 节点同口径按边界
+      // 复位, 不把多秒级 dt 喂进时序递归 (5fps=0.2s/30fps=0.033s 健康节
+      // 拍不触发; 跨场景跳序已被上方 reset 兜住)
+      fprintf(stderr, "modelnode: dt=%.3f out of contract at frame %ld "
+              "→ reset (tmat=identity, dt=0.5)\n", dt, k);
+      reset = true;
+      dt = 0.5f;
     }
 
     // P2 + t_matrix + dt (host, double)
@@ -1891,10 +1910,18 @@ int main(int argc, char** argv) {
       mat4_mul(inv, prev_l2g, t);
       for (int i = 0; i < 16; ++i) tmat[i] = (float)t[i];
     }
-    float dt = reset ? 0.5f : (float)((double)(fm.ts_ns - prev_ts) / 1e9);
+    // M10 终审 I3: 参考系折算与引擎状态推进点对齐 — A 点弃帧时引擎状态
+    // 停 k-1 (hd 未提交), 折算须回滚; B/C/D 点 hd 已提交, 状态到 k, 保持
+    // 折算 (save_* 只服务 A 点回滚)
+    float save_l2g[16];
+    memcpy(save_l2g, prev_l2g, sizeof(save_l2g));
+    double save_ts = prev_ts;
+    bool save_hp = have_prev;
+    uint32_t save_scene = cur_scene;
     memcpy(prev_l2g, &fm.l2g[0], sizeof(prev_l2g));
     prev_ts = fm.ts_ns;
     have_prev = true;
+    cur_scene = fm.scene;
 
     // ---- pre submit (异步) ----
     // 该 parity 的 host 暂存上一次使用是 k-2 帧: 等那次 H2D 真正执行完
@@ -1984,8 +2011,13 @@ int main(int argc, char** argv) {
     // ≈ max(bb2, hd+mp). 非双流路径与 M5 单流事件序完全一致.
     cudaStream_t sB = dual ? eng_streamB : eng_stream;
     // M10 tier1 排干点 A (pre 末): v 已入 relq (fence 定序归还), 弃帧不
-    // 直接 release; 本帧 preproc 输出无人读, k+2 同 parity 前有 ev_preB 守卫
+    // 直接 release; 本帧 preproc 输出无人读, k+2 同 parity 前有 ev_preB 守卫.
+    // hd 未提交 → 引擎状态停 k-1: 参考系折算回滚 (终审 I3)
     if (watch_abandon_take()) {
+      memcpy(prev_l2g, save_l2g, sizeof(prev_l2g));
+      prev_ts = save_ts;
+      have_prev = save_hp;
+      cur_scene = save_scene;
       f_void[k] = 1;
       ++s_skip_wd;
       fprintf(stderr, "watch: frame abandoned k=%ld at=pre skip_total=%llu\n",
@@ -2033,27 +2065,42 @@ int main(int argc, char** argv) {
       }
       cudaEventRecord(ev_b2[p], eng_stream);  // 单引擎: b2 段记 0, 段时在 hd
     }
-    // M10 tier1 排干点 B (bb2 末): bb2 已提交自然完成, 输出无人读
+    // M10 tier1 排干点 B (bb2 末): bb2+hd(含状态反馈 D2D) 均已提交(异步),
+    // 状态将推进到 k → 折算保持 (与 C 同口径, 终审 I3/M1); 输出无人读
     // (col_feats[p] 由 k+2 的 ev_post 守卫覆写); 检查点在设防段返回后,
-    // 无 parity 竞态
+    // 无 parity 竞态. mp 段被跳过 → 边界帧在此弃掉须补发 mp 清零
     if (watch_abandon_take()) {
       f_void[k] = 1;
       ++s_skip_wd;
       fprintf(stderr, "watch: frame abandoned k=%ld at=bb2 skip_total=%llu\n",
               k, s_skip_wd);
       skipwd_push(watch_now_ms());
+      if (reset && use_mp && ok) {
+        for (size_t si = 0; si < mstates.size(); ++si)
+          cudaMemcpyAsync(mstates[si].in->dev[0], d_mrst[si],
+                          mstates[si].in->bytes, cudaMemcpyDeviceToDevice,
+                          eng_stream);
+      }
       submitted = k + 1;
       continue;
     }
     cudaEventRecord(ev_hd[p], eng_stream);
     // M10 tier1 排干点 C (hd 末): hd 已提交 → det/map 状态已被本帧推进,
-    // 这是弃帧语义的可接受代价 (递归链少一帧输出, 状态值仍是真实计算)
+    // 这是弃帧语义的可接受代价 (递归链少一帧输出, 状态值仍是真实计算);
+    // 折算保持. mp 段被跳过 → 边界帧在此弃掉须补发 mp 清零 (cur_scene 已
+    // 折算, k+1 reset=false 不能再靠它清)
     if (watch_abandon_take()) {
       f_void[k] = 1;
       ++s_skip_wd;
       fprintf(stderr, "watch: frame abandoned k=%ld at=hd skip_total=%llu\n",
               k, s_skip_wd);
       skipwd_push(watch_now_ms());
+      if (reset && use_mp && ok) {
+        for (size_t si = 0; si < mstates.size(); ++si)
+          cudaMemcpyAsync(mstates[si].in->dev[0], d_mrst[si],
+                          mstates[si].in->bytes, cudaMemcpyDeviceToDevice,
+                          eng_stream);
+      }
       submitted = k + 1;
       continue;
     }

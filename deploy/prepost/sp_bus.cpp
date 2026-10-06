@@ -412,9 +412,15 @@ void Bus::release(FrameView* v) {
   if (!v || v->slot_idx < 0) return;  // 幂等: 重复/已失效 view 无害
   lock_lk(&m_->lk);
   SlotHdr& s = *slot(v->slot_idx);
-  if (s.ref.load() > 0) s.ref.fetch_sub(1);
-  if (m_->cons[v->consumer_id].held_slot == v->slot_idx)
-    m_->cons[v->consumer_id].held_slot = -1;
+  // 代校验 (M10 终审 C1): 槽可能已被 wrap-lease 强抢并 refill 换代
+  // (claim 置 seq=0、commit 写新 seq, 比对可靠) — 陈旧 view 的 release
+  // 不得动新持有者的 ref/held_slot, 否则新帧被提前放圈覆写 (GPU 在读 =
+  // nvgpu fault 类事故). 同一消费者换代重取同槽时 held_slot 也由此保住.
+  if (s.meta.seq == v->meta.seq) {
+    if (s.ref.load() > 0) s.ref.fetch_sub(1);
+    ConsumerEntry& c = m_->cons[v->consumer_id];
+    if (c.held_slot == v->slot_idx) c.held_slot = -1;
+  }
   unlock_lk(&m_->lk);
   v->slot_idx = -1;
 }

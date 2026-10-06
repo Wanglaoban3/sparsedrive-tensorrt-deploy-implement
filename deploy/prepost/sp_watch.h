@@ -62,7 +62,6 @@ struct WatchState {
   std::atomic<int> stage{kWsAcq};
   std::atomic<uint64_t> seq{0};
   std::atomic<int> abandon_req{0};   // M10 tier1: 弃帧请求挂起 (主循环排干)
-  std::atomic<int64_t> abandon_ms{0};
   std::mutex mu;
   // 512 帧窗口 (Phase C 遥测 perf 行与 watchdog 共用一份环形)
   static const int kRing = 512;
@@ -198,7 +197,6 @@ inline void watch_start() {
           _exit(13);
         }
         if (watch().abandon_req.exchange(1) == 0) {
-          watch().abandon_ms.store(watch_now_ms());
           fprintf(stderr,
                   "watch: ABANDON req stage=%s stalled_ms=%ld dl_ms=%ld "
                   "seq=%lu detail=watchdog-tier1\n",

@@ -1,5 +1,6 @@
 // test_bus_lease.cpp — M10 Task 1 RED/GREEN: wrap-lease 定向强抢.
-// 断言见 main() 内 PASS 1..4; 退出码 0 = 4/4 全过.
+// 断言见 main() 内 PASS 1..5; 退出码 0 = 全过. Case 5 = 终审 C1 修复:
+// 强抢+refill 换代后, 陈旧 view 的 release 不得动新持有者的引用.
 //
 // 单进程双角色安全性: BusLock 按 pid 记属主且不可重入 (sp_bus.cpp lock_lk
 // owner==me 时自旋), 故发布/消费操作必须串行; 唯一的并发是 case 3 的心跳
@@ -128,6 +129,61 @@ int main() {
     }
     delete h.bus;
   }
-  printf("== %d/4 ==\n", passed);
-  return passed == 4 ? 0 : 1;
+  // ---- Case 5 (终审 C1): 强抢→refill 换代→新消费者持有→陈旧 release ----
+  // 无代校验时: 陈旧 release 把新持有者的 ref 减到 0 → 槽被提前放圈覆写
+  // (GPU 在读 = fault 类). 断言: 陈旧 release 后 claim 仍被新持有者挡住.
+  {
+    setenv("SP_BUS_WRAP_LEASE_MS", "300", 1);
+    Held h = hold_one("wltest5");  // c1 持 slot0(seq1), pub_idx 回到 0
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));  // hb 老
+    uint8_t* p0 = h.bus->claim_of(nullptr, 1500);  // 强抢 c1, 拿回 slot0
+    if (!p0 || h.bus->forced_recycles() != 1) {
+      printf("FAIL 5 (steal setup p=%p forced=%lu)\n", (void*)p0,
+             (unsigned long)h.bus->forced_recycles());
+    } else {
+      FrameMeta m{}; h.bus->commit(m);  // slot0 换代 → seq5, pub_idx→1
+      int32_t c2 = h.bus->register_consumer();
+      FrameView v2{};
+      // last_seq=4 (环内现存 2,3,4+换代 5): acquire 语义 = 最小 seq > last_seq
+      if (c2 < 0 || h.bus->acquire(c2, 4, &v2, 2000) != 0 ||
+          v2.meta.seq != 5) {
+        printf("FAIL 5 (c2 acquire seq=%llu)\n",
+               (unsigned long long)v2.meta.seq);
+      } else {
+        std::atomic<bool> live{true};
+        std::thread hb([&]() {  // 新持有者 hb 保活, 防 wrap-lease 误抢干扰
+          while (live.load()) {
+            h.bus->heartbeat(c2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          }
+        });
+        for (int i = 0; i < 3; ++i) {  // 占满 slot1..3, pub_idx 回 0
+          uint8_t* q = h.bus->claim_of(nullptr, 1000);
+          if (q) { FrameMeta mm{}; h.bus->commit(mm); }
+        }
+        h.bus->release(&h.v);  // 陈旧 view (seq1) release — 不许动 v2 的 ref
+        clk::time_point t0 = clk::now();
+        uint8_t* pb = h.bus->claim_of(nullptr, 800);  // 须被 v2 挡住
+        double took = ms_since(t0);
+        live.store(false);
+        hb.join();
+        if (!pb && took >= 750 && h.bus->forced_recycles() == 1) {
+          printf("PASS 5 (stale release kept new holder, blocked %.0fms)\n",
+                 took);
+          ++passed;
+        } else {
+          printf("FAIL 5 (p=%p took=%.0fms forced=%lu — stale release "
+                 "stole new holder's ref)\n", (void*)pb, took,
+                 (unsigned long)h.bus->forced_recycles());
+        }
+        h.bus->release(&v2);  // 新持有者正常释放 → 环恢复
+        uint8_t* pc = h.bus->claim_of(nullptr, 1000);
+        if (pc) { FrameMeta mm{}; h.bus->commit(mm); }
+        else { printf("FAIL 5b (ring stuck after v2 release)\n"); }
+      }
+    }
+    delete h.bus;
+  }
+  printf("== %d/5 ==\n", passed);
+  return passed == 5 ? 0 : 1;
 }
