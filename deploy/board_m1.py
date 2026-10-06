@@ -44,7 +44,7 @@ SRCS = ["sp_bus.h", "sp_bus.cpp", "image_source.h", "file_source.h",
         "preproc.h", "preproc.cu", "sp_preproc_test.cpp",
         "postproc.h", "sp_result.h", "sp_resultmon.cpp",
         "sp_dmapool.h", "sp_dmapool.cpp", "sp_watch.h", "sp_safety.h",
-        "sp_safety.cu", "sp_modelnode.cpp"]
+        "sp_safety.cu", "sp_status.cpp", "sp_modelnode.cpp"]
 
 
 def connect():
@@ -115,12 +115,13 @@ g++ -O2 -std=c++14 sp_preproc_test.cpp preproc.o \
     -L/usr/local/cuda/lib64 -lcudart
 g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_resultmon.cpp sp_bus.o \
     -o sp_resultmon -lrt
+g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_status.cpp sp_bus.o -o sp_status -lrt
 g++ -O2 -std=c++14 sp_modelnode.cpp preproc.o sp_safety.o sp_bus.o \
     sp_dmapool.o \
     -o sp_modelnode -I/usr/local/cuda/include -I/usr/local/cuda/include \
     -L/usr/local/cuda/lib64 -lcudart -lcuda -lnvinfer -ldl -lrt -lpthread
 cp -f sp_pub sp_sub sp_inspect sp_filesrc sp_preproc_test sp_modelnode \
-    sp_resultmon /usr/local/bin/
+    sp_resultmon sp_status /usr/local/bin/
 echo BUILD_DONE
 """.format(bd=BDIR)
     rc, o, e = run(cli, build, t=600)
@@ -307,6 +308,9 @@ def stage_m3(cli, nframes=81, warmup=2, img_from=None, graph=False,
                    mpp=" --mp " + mp if mp else ""))
     if os.environ.get("SP_ONE_STREAM"):
         nodecmd = "env SP_ONE_STREAM=1 " + nodecmd
+    if os.environ.get("SP_NODE_EXTRA"):
+        # mprode 等门禁的追加旗标通道 (如 --skip-lag), 不动 stage_m3 签名
+        nodecmd += " " + os.environ["SP_NODE_EXTRA"]
     launch(cli, nodecmd, BDIR + "/m3node.log")
     # 等 node 完成 (超时随帧数伸缩: 5fps 节奏 ≈ nframes/5 s, 留 8 倍余量)
     budget = max(600, nframes * 8 / 5)

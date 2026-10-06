@@ -34,12 +34,14 @@
 // 结果发布到单槽 latest-wins 信箱 (sp_result.h, 默认 sp_result_<ring>),
 // 并逐帧追加 JSON 旁路 out_dir/result.jsonl (--no-dump 时跳过 JSON 落盘).
 #include <cuda_runtime.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <time.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -75,6 +77,106 @@ void inject_nan_async(float* p, int n, cudaStream_t s);
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_sig(int) { g_stop = 1; }
+
+// ---- Phase C 在线遥测 (spec §7 C1): 1Hz 采样线程 ----
+// 温度/时钟: /sys/class/thermal (type 含 GPU/CPU 的第一个 zone, milli°C→°C)
+// + /sys/class/devfreq/*ga10b*/cur_freq (Hz→MHz); 读不到 = -1 → 落盘 null/
+// "n/a". 采样值缓存原子量供 frame_log 逐帧扩列 (主循环只做原子读, 不阻塞);
+// 每秒一行 JSON(env+perf) 追加 <out_dir>/telemetry.jsonl, perf = watchdog
+// 同一份 512 帧窗的 p50/p99, 逐行 fflush (fatal _exit 路径不丢已写行).
+static std::atomic<int> g_gpu_temp{-1};
+static std::atomic<int> g_cpu_temp{-1};
+static std::atomic<int> g_clk_mhz{-1};
+
+static int read_thermal_c(const char* key) {
+  DIR* d = opendir("/sys/class/thermal");
+  if (!d) return -1;
+  int out = -1;
+  struct dirent* e;
+  while ((e = readdir(d))) {
+    if (strncmp(e->d_name, "thermal_zone", 12)) continue;
+    char p[160], ty[64] = "";
+    snprintf(p, sizeof(p), "/sys/class/thermal/%s/type", e->d_name);
+    FILE* f = fopen(p, "r");
+    if (!f) continue;
+    if (!fgets(ty, sizeof(ty), f)) {
+      fclose(f);
+      continue;
+    }
+    fclose(f);
+    if (!strstr(ty, key)) continue;
+    snprintf(p, sizeof(p), "/sys/class/thermal/%s/temp", e->d_name);
+    f = fopen(p, "r");
+    if (!f) break;
+    int mc = -1;
+    if (fscanf(f, "%d", &mc) == 1 && mc > 0) out = mc / 1000;
+    fclose(f);
+    break;  // type 匹配的第一个 zone
+  }
+  closedir(d);
+  return out;
+}
+
+static int read_gpu_clk_mhz() {
+  DIR* d = opendir("/sys/class/devfreq");
+  if (!d) return -1;
+  int out = -1;
+  struct dirent* e;
+  while ((e = readdir(d))) {
+    if (!strstr(e->d_name, "ga10b")) continue;  // Orin iGPU devfreq
+    char p[192];
+    snprintf(p, sizeof(p), "/sys/class/devfreq/%s/cur_freq", e->d_name);
+    FILE* f = fopen(p, "r");
+    if (!f) break;
+    long hz = 0;
+    if (fscanf(f, "%ld", &hz) == 1 && hz > 0) out = (int)(hz / 1000000);
+    fclose(f);
+    break;
+  }
+  closedir(d);
+  return out;
+}
+
+static void telemetry_start(const char* out_dir) {
+  char path[512];
+  snprintf(path, sizeof(path), "%s/telemetry.jsonl", out_dir);
+  FILE* f = fopen(path, "a");
+  std::thread([f]() {
+    auto jn = [](char* b, size_t n, int v) {
+      if (v < 0) snprintf(b, n, "null");
+      else snprintf(b, n, "%d", v);
+    };
+    while (!g_stop) {
+      struct timespec ts = {1, 0};
+      nanosleep(&ts, nullptr);
+      if (g_stop) break;
+      int gt = read_thermal_c("GPU"), ct = read_thermal_c("CPU");
+      int ck = read_gpu_clk_mhz();
+      g_gpu_temp.store(gt);
+      g_cpu_temp.store(ct);
+      g_clk_mhz.store(ck);
+      if (!f) continue;
+      char a1[16], a2[16], a3[16];
+      jn(a1, sizeof(a1), gt);
+      jn(a2, sizeof(a2), ct);
+      jn(a3, sizeof(a3), ck);
+      fprintf(f,
+              "{\"t\":%lld,\"type\":\"tick\",\"seq\":%lu,"
+              "\"gpu_temp_c\":%s,\"cpu_temp_c\":%s,\"sm_clock_mhz\":%s,"
+              "\"pre_p50\":%.2f,\"pre_p99\":%.2f,"
+              "\"bb2_p50\":%.2f,\"bb2_p99\":%.2f,"
+              "\"hd_p50\":%.2f,\"hd_p99\":%.2f,"
+              "\"mp_p50\":%.2f,\"mp_p99\":%.2f,"
+              "\"post_p50\":%.2f,\"post_p99\":%.2f}\n",
+              (long long)(now_real_ns() / 1000000000LL),
+              (unsigned long)watch_seq_get(), a1, a2, a3, watch_p50(kWsPre),
+              watch_p99(kWsPre), watch_p50(kWsBB2), watch_p99(kWsBB2),
+              watch_p50(kWsHD), watch_p99(kWsHD), watch_p50(kWsMP),
+              watch_p99(kWsMP), watch_p50(kWsPost), watch_p99(kWsPost));
+      fflush(f);
+    }
+  }).detach();
+}
 
 class Logger : public nvinfer1::ILogger {
   void log(Severity s, const char* msg) noexcept override {
@@ -314,6 +416,14 @@ int main(int argc, char** argv) {
     return 2;
   }
   const char* ring = argv[1];
+  // Phase D 日志兜底: 镜像无 logrotate 时防 /var/log 写满盘 — 启动时
+  // >100MB 截断 (systemd append 句柄 O_APPEND, 截断后写回新 EOF, 安全)
+  {
+    std::string lp = std::string("/var/log/sp/node-") + ring + ".log";
+    struct stat st;
+    if (::stat(lp.c_str(), &st) == 0 && st.st_size > 100LL * 1024 * 1024)
+      ::truncate(lp.c_str(), 0);
+  }
   const char* engine_path = argv[2];
   const char* plugin_so = argv[3];
   const char* manifest_path = argv[4];
@@ -325,6 +435,7 @@ int main(int argc, char** argv) {
   int dump_img_n = 0;   // 前 N 帧落盘实际喂给引擎的 img (对质用)
   const char* img_from = nullptr;  // 隔离模式: 目录根/模板/单文件
   bool serial = false, use_graph = false, loop = false, no_dump = false;
+  bool skip_lag = false;  // M10: 生产跳序 (seq gap/环重置 → 跳到最新, 不 FATAL 12)
   bool dual = false;  // M7a: bb2 独立流与 hd+mp 重叠
   bool use_dma = false;  // M8: 采集源走设备池 (fd 导入), 绕开 mapped-shm 读
   float det_thr = 0.0f, map_thr = 0.0f;  // Q2: 默认=离线评测口径(全保留)
@@ -349,6 +460,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--graph")) use_graph = true;
     else if (!strcmp(argv[i], "--loop")) loop = true;
     else if (!strcmp(argv[i], "--no-dump")) no_dump = true;
+    else if (!strcmp(argv[i], "--skip-lag")) skip_lag = true;
     else if (!strcmp(argv[i], "--selftest")) use_selftest = true;
     else if (!strcmp(argv[i], "--selftest-dump") && i + 1 < argc)
       selftest_dump = argv[++i];
@@ -924,6 +1036,7 @@ int main(int argc, char** argv) {
     fatal_exit(12, "init", "mailbox: %s", rerr);
   }
   printf("modelnode: mailbox sp_res_%s ready\n", mailbox_name.c_str());
+  telemetry_start(out_dir.c_str());  // Phase C: 1Hz env+perf 遥测线程
 
   // ---- B1: 安全探测器 (状态机 + 设备 absmax 标量 + 注入钩子) ----
   const saf::Config saf_cfg = saf::load_config();
@@ -1285,7 +1398,9 @@ int main(int argc, char** argv) {
   if (flog) setvbuf(flog, nullptr, _IOLBF, 0);
   if (flog)
     fprintf(flog, "seq\tpre_ms\tinfer_ms\tpost_ms\tgpu_ms\tsvc_ms\tacq_ms"
-                  "\tready_ns\tbb2_ms\thd_ms\tmp_ms\n");
+                  "\tready_ns\tbb2_ms\thd_ms\tmp_ms"
+                  "\tgpu_temp_c\tcpu_temp_c\tsm_clock_mhz"
+                  "\tskip_lag\tskip_wd\n");
 
   // ---- JSON 旁路 ----
   FILE* fjson = nullptr;
@@ -1307,13 +1422,85 @@ int main(int argc, char** argv) {
 
   std::vector<double> s_pre, s_inf, s_post, s_svc, s_dec, s_json;
   std::vector<double> s_b2, s_hdms, s_mp;
+  // 常驻 --loop 下逐帧 push 无界增长 = 慢泄漏 (8h 浸泡实测 +2MB/h):
+  // 到帽就地抽稀一半, 容量封顶 ~10 万样本/向量, 出口百分位统计意义不变
+  auto stat_feed = [](std::vector<double>& v, double x) {
+    static const size_t kStatCap = 100000;
+    if (v.size() >= kStatCap) {
+      size_t w = 0;
+      for (size_t r = 0; r < v.size(); r += 2) v[w++] = v[r];
+      v.resize(w);
+    }
+    v.push_back(x);
+  };
   std::vector<double> t_acq(n_frames, 0.0), acq_ms_v(n_frames, 0.0);
+  // M10: 跳序/弃帧累计 (标量, 不入 s_* 抽稀向量) + 弃帧哨兵
+  // (complete_frame 对 void 帧只推进游标, 不产出/不发布/不记日志)
+  unsigned long long s_skip_lag = 0, s_skip_wd = 0;
+  std::vector<uint8_t> f_void(n_frames, 0);
+  // 弃帧 60s 滑窗 (≥3 → LATCH, 接 Phase B 报警路径); 仅主线程触碰
+  int64_t skipwd_ts[8] = {0};
+  int skipwd_n = 0;
   double t_first_ready = 0, t_last_ready = 0;
   long submitted = 0;
 
+  // M10: LATCH 发布块 (原 safety 分支内联, 提取复用): 持续发布 last_valid
+  // + 真实旧化, 宽限 SP_DIV_GRACE_MS 后 exit 14. 注意全零消息 crc≠0,
+  // 必须显式补算 msg_crc (Phase B 坑).
+  auto latch_exit = [&](uint8_t reason, const char* why) {
+    uint32_t lv = have_valid ? (uint32_t)last_valid_msg.seq : 0;
+    fprintf(stderr,
+            "safety: LATCH reason=%u (%s) at seq=%lu nan=%u div=%u "
+            "last_valid=%u → 宽限 %.0fms\n",
+            reason, why, (unsigned long)watch_seq_get(), safety.nan_hits,
+            safety.div_hits, lv, saf_cfg.grace_ms);
+    res::ResultMsg lm = last_valid_msg;
+    if (!have_valid) {
+      memset(&lm, 0, sizeof(lm));
+      lm.magic = res::kMagic;
+      lm.version = res::kVer;
+      lm.header_size = (uint16_t)offsetof(res::ResultMsg, det);
+      lm.ts_capture_ns = now_real_ns();
+      lm.config_hash = cfg_hash;
+    }
+    lm.crc = res::msg_crc(lm, crc32);  // crc 只盖 det/map 区, 循环内改
+                                       // 状态/年龄不影响; !have_valid 时
+                                       // 全零 crc ≠ 0 必须补算
+    int64_t t0 = watch_now_ms();
+    while (!g_stop &&
+           (watch_now_ms() - t0) < (int64_t)saf_cfg.grace_ms) {
+      lm.status = res::kStatusDegLatch;
+      lm.reason = reason;
+      lm.resets_60s = safety.resets_60s;
+      lm.nan_hits = safety.nan_hits;
+      lm.div_hits = safety.div_hits;
+      int64_t a = (now_real_ns() - lm.ts_capture_ns) / 1000000;
+      lm.frame_age_ms =
+          (uint16_t)(a < 0 ? 0 : (a > 65535 ? 65535 : a));
+      mailbox->publish(lm);
+      watch_touch(kWsIo);  // 宽限环 = 我方控制路径, 不设防
+      struct timespec ts = {0, 200 * 1000000L};
+      nanosleep(&ts, nullptr);
+    }
+    fatal_exit(14, "latch", "%s", why);
+  };
+  // M10: watchdog 连续弃帧 60s 滑窗 ≥3 → LATCH (reason=StageFail),
+  // 接 Phase B 报警路径
+  auto skipwd_push = [&](int64_t now) {
+    skipwd_ts[skipwd_n % 8] = now;
+    skipwd_n += 1;
+    int recent = 0;
+    for (int i = 0; i < 8 && i < skipwd_n; ++i)
+      if (now - skipwd_ts[i] <= 60000) recent += 1;
+    if (recent >= 3)
+      latch_exit(res::kReasonStageFail, "watchdog_abandon");
+  };
+
   // 完成帧 j: 等 post D2H → 读事件耗时 → dump → 记日志
   auto complete_frame = [&](long j) {
+    if (f_void[j]) { done = j + 1; return; }  // M10: 弃帧只推进游标
     watch_touch(kWsPost);
+    watch_maybe_hang(kWsPost, j);
     int64_t wpost0 = watch_now_ms();
     int p = (int)(j & 1);
     if (!no_dump) cudaEventSynchronize(ev_post[p]);
@@ -1330,7 +1517,24 @@ int main(int argc, char** argv) {
     else cudaEventElapsedTime(&gpu_ms, ev_preA[p], ev_inf1[p]);
     // 设防段只盖 GPU 同步等待 (hang 在这里现形); 落盘/解码/发布是 IO
     watch_record(kWsPost, (double)(watch_now_ms() - wpost0));
+    // Phase C 遥测: 事件链实测的分段耗时喂同一份 512 帧窗 (也让 watchdog
+    // 的 bb2/hd/mp deadline 有真实 p50, 不再吃 2s 地板)
+    watch_record(kWsBB2, b2_ms);
+    watch_record(kWsHD, hd_ms);
+    watch_record(kWsMP, mp_ms);
     watch_touch(kWsIo);
+    // M10 tier1 排干点 D (post 同步返回后): 卡在 decode 前放弃本帧,
+    // 信箱保持上一帧内容 (lage 自然旧化, fail-visible)
+    if (watch_abandon_take()) {
+      f_void[j] = 1;
+      ++s_skip_wd;
+      fprintf(stderr,
+              "watch: frame abandoned k=%ld at=post-sync skip_total=%llu\n",
+              j, s_skip_wd);
+      skipwd_push(watch_now_ms());
+      done = j + 1;
+      return;
+    }
     double ready = now_ns();
     if (!t_first_ready) t_first_ready = ready;
     t_last_ready = ready;
@@ -1464,46 +1668,14 @@ int main(int argc, char** argv) {
       }
       saf::Verdict vd = safety.frame(hits, watch_now_ms());
       if (vd.latch) {
-        // 60s 窗复位超阈 → LATCH: 持续发布 last_valid + 真实旧化,
-        // 宽限 SP_DIV_GRACE_MS 后 exit 14 (systemd 拉起 → 自检 → 正常;
-        // 120s 内再 latch 由 StartLimit 熔断转人工)
-        uint32_t lv = have_valid ? (uint32_t)last_valid_msg.seq : 0;
+        // 60s 窗复位超阈 → LATCH (M10: 发布块提取为 latch_exit 复用;
+        // systemd 拉起 → 自检 → 正常; 120s 内再 latch 由 StartLimit
+        // 熔断转人工)
         fprintf(stderr,
-                "safety: LATCH resets=%u>%d in window at seq=%lu hits=%s "
-                "nan=%u div=%u last_valid=%u → 宽限 %.0fms\n",
+                "safety: LATCH resets=%u>%d in window at seq=%lu hits=%s\n",
                 safety.resets_60s, saf_cfg.latch_n,
-                (unsigned long)f_seq[j], saf::hit_name(hits),
-                safety.nan_hits, safety.div_hits, lv, saf_cfg.grace_ms);
-        res::ResultMsg lm = last_valid_msg;
-        if (!have_valid) {
-          memset(&lm, 0, sizeof(lm));
-          lm.magic = res::kMagic;
-          lm.version = res::kVer;
-          lm.header_size = (uint16_t)offsetof(res::ResultMsg, det);
-          lm.ts_capture_ns = now_real_ns();
-          lm.config_hash = cfg_hash;
-        }
-        lm.crc = res::msg_crc(lm, crc32);  // crc 只盖 det/map 区, 循环内改
-                                           // 状态/年龄不影响; !have_valid 时
-                                           // 全零 crc ≠ 0 必须补算
-        int64_t t0 = watch_now_ms();
-        while (!g_stop &&
-               (watch_now_ms() - t0) < (int64_t)saf_cfg.grace_ms) {
-          lm.status = res::kStatusDegLatch;
-          lm.reason = (uint8_t)vd.reason;
-          lm.resets_60s = safety.resets_60s;
-          lm.nan_hits = safety.nan_hits;
-          lm.div_hits = safety.div_hits;
-          int64_t a = (now_real_ns() - lm.ts_capture_ns) / 1000000;
-          lm.frame_age_ms =
-              (uint16_t)(a < 0 ? 0 : (a > 65535 ? 65535 : a));
-          mailbox->publish(lm);
-          watch_touch(kWsIo);  // 宽限环 = 我方控制路径, 不设防
-          struct timespec ts = {0, 200 * 1000000L};
-          nanosleep(&ts, nullptr);
-        }
-        fatal_exit(14, "latch", "resets=%u nan=%u div=%u", safety.resets_60s,
-                   safety.nan_hits, safety.div_hits);
+                (unsigned long)f_seq[j], saf::hit_name(hits));
+        latch_exit((uint8_t)vd.reason, "resets_window");
       }
       if (vd.do_reset) {
         // 模板复位 (eng_stream 异步 D2D, 排在已提交工作之后自然定序):
@@ -1571,23 +1743,34 @@ int main(int argc, char** argv) {
         }
         fprintf(fjson, "]}\n");
       }
-      s_dec.push_back((t_d1 - t_d0) / 1e6);
-      if (fjson) s_json.push_back((now_ns() - t_d1) / 1e6);
+      stat_feed(s_dec, (t_d1 - t_d0) / 1e6);
+      if (fjson) stat_feed(s_json, (now_ns() - t_d1) / 1e6);
     }
     double svc_ms = t_acq[j] > 0 ? (ready - t_acq[j]) / 1e6 : 0;
-    if (flog)
+    if (flog) {
+      // Phase C 扩列: gpu_temp_c/cpu_temp_c/sm_clock_mhz (1Hz 缓存值,
+      // 读不到 = n/a; 采样与温度源见 telemetry_start)
+      auto na = [](int v, char* b) {
+        if (v < 0) return "n/a";
+        snprintf(b, 16, "%d", v);
+        return (const char*)b;
+      };
+      char t1[16], t2[16], t3[16];
       fprintf(flog,
               "%ld\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.0f\t%.3f\t%.3f\t"
-              "%.3f\n",
+              "%.3f\t%s\t%s\t%s\t%llu\t%llu\n",
               j, pre_ms, inf_ms, post_ms, gpu_ms, svc_ms, acq_ms_v[j], ready,
-              b2_ms, hd_ms, mp_ms);
-    s_pre.push_back(pre_ms);
-    s_inf.push_back(inf_ms);
-    s_post.push_back(post_ms);
-    s_svc.push_back(gpu_ms);  // 事件链 e2e = 真实服务延迟 (不受收割节奏影响)
-    if (use_hd) s_b2.push_back(b2_ms);
-    s_hdms.push_back(hd_ms);
-    if (use_mp) s_mp.push_back(mp_ms);
+              b2_ms, hd_ms, mp_ms, na(g_gpu_temp.load(), t1),
+              na(g_cpu_temp.load(), t2), na(g_clk_mhz.load(), t3),
+              s_skip_lag, s_skip_wd);
+    }
+    stat_feed(s_pre, pre_ms);
+    stat_feed(s_inf, inf_ms);
+    stat_feed(s_post, post_ms);
+    stat_feed(s_svc, gpu_ms);  // 事件链 e2e = 真实服务延迟 (不受收割节奏影响)
+    if (use_hd) stat_feed(s_b2, b2_ms);
+    stat_feed(s_hdms, hd_ms);
+    if (use_mp) stat_feed(s_mp, mp_ms);
     done = j + 1;
   };
 
@@ -1607,8 +1790,25 @@ int main(int argc, char** argv) {
     int nto = 0;
     bool got = false;
     watch_touch(kWsAcq);
+    int ring_resets = 0;
     while (!g_stop) {
       if (bus->acquire(cid, last_seq, &v, 2000) == 0) { got = true; break; }
+      // M10 skip-lag: 发布端 --fresh 重置过环 (latest_seq 倒回) → 重同步到
+      // 当前最新 (last-is-best), 不算超时次数. 限 120 次 (4min) 防永久空转.
+      if (skip_lag) {
+        uint64_t ls = bus->meta()->latest_seq.load();
+        if (ls > 0 && ls < last_seq) {
+          if (++ring_resets > 120) {
+            fprintf(stderr, "modelnode: ring reset x120, give up\n");
+            break;
+          }
+          fprintf(stderr,
+                  "SKIP ring reset latest=%lu last_seq=%lu → resync\n",
+                  (unsigned long)ls, (unsigned long)last_seq);
+          last_seq = ls;  // 下一次 acquire 取 latest+1
+          continue;
+        }
+      }
       if (++nto > 30) {
         fprintf(stderr, "modelnode: source exhausted at n=%ld\n", submitted);
         abort_run = true;
@@ -1628,6 +1828,25 @@ int main(int argc, char** argv) {
         printf("modelnode: resync at seq %lu (mid-stream attach)\n",
                (unsigned long)v.meta.seq);
         seq_base = v.meta.seq - 1;
+      } else if (skip_lag) {
+        // M10 生产跳序: 消费不过来 = 丢最老的, 处理最新 (last-is-best).
+        // manifest 配对跟 seq 走 (mki=(seq-1)%nman), 跳序不影响配对;
+        // 场景边界判定只比较已处理帧的 cur_scene, 边界帧被跳过后下一
+        // 处理帧 fm.scene != cur_scene 仍触发 identity+dt=0.5 复位.
+        uint64_t expect = seq_base + (uint64_t)(submitted + 1);
+        if (v.meta.seq > expect) {
+          s_skip_lag += v.meta.seq - expect;
+          fprintf(stderr,
+                  "SKIP lag got=%lu expect=%lu skipped=%llu total=%llu\n",
+                  (unsigned long)v.meta.seq, (unsigned long)expect,
+                  (unsigned long long)(v.meta.seq - expect), s_skip_lag);
+        } else {
+          // seq 回退 = 发布端重启过 (环被 --fresh 重建): 重新对齐基线,
+          // 与 submitted==0 的 resync 同口径, 不计跳序
+          fprintf(stderr, "SKIP rewind got=%lu expect=%lu → resync\n",
+                  (unsigned long)v.meta.seq, (unsigned long)expect);
+          seq_base = v.meta.seq - 1;
+        }
       } else {
         fatal_exit(12, "run", "seq misalign got %lu expect %lu",
                    (unsigned long)v.meta.seq,
@@ -1682,6 +1901,7 @@ int main(int argc, char** argv) {
     // 才允许覆写 pinned 源 (正常远早于此就完成, 这里只是正确性兜底)
     watch_touch(kWsPre);
     watch_maybe_stall(kWsPre, k);
+    watch_maybe_hang(kWsPre, k);
     int64_t wpre0 = watch_now_ms();
     if (k >= 2) cudaEventSynchronize(ev_preB[p]);
     // 设防段只盖 GPU 同步; 之后的 pinned 拷贝/读图是 IO (不设防)
@@ -1763,8 +1983,20 @@ int main(int argc, char** argv) {
     // 逐帧交错后 GPU 侧自然重叠: bb2(k+1) ∥ hd(k)+mp(k), 帧周期
     // ≈ max(bb2, hd+mp). 非双流路径与 M5 单流事件序完全一致.
     cudaStream_t sB = dual ? eng_streamB : eng_stream;
+    // M10 tier1 排干点 A (pre 末): v 已入 relq (fence 定序归还), 弃帧不
+    // 直接 release; 本帧 preproc 输出无人读, k+2 同 parity 前有 ev_preB 守卫
+    if (watch_abandon_take()) {
+      f_void[k] = 1;
+      ++s_skip_wd;
+      fprintf(stderr, "watch: frame abandoned k=%ld at=pre skip_total=%llu\n",
+              k, s_skip_wd);
+      skipwd_push(watch_now_ms());
+      submitted = k + 1;
+      continue;
+    }
     watch_touch(kWsBB2);
     watch_maybe_stall(kWsBB2, k);
+    watch_maybe_hang(kWsBB2, k);
     cudaStreamWaitEvent(sB, ev_preB[p], 0);
     cudaStreamWaitEvent(sB, ev_post[p], 0);  // 槽 p 复用守卫 (B=边界, H=输出)
     cudaEventRecord(ev_inf0[p], sB);
@@ -1776,6 +2008,7 @@ int main(int argc, char** argv) {
       cudaEventRecord(ev_b2[p], sB);
       watch_touch(kWsHD);
       watch_maybe_stall(kWsHD, k);
+      watch_maybe_hang(kWsHD, k);
       if (ok) {
         cudaStreamWaitEvent(eng_stream, ev_post[p], 0);  // out[p] 复用守卫
         cudaStreamWaitEvent(eng_stream, dual ? ev_b2[p] : ev_preB[p], 0);
@@ -1800,11 +2033,35 @@ int main(int argc, char** argv) {
       }
       cudaEventRecord(ev_b2[p], eng_stream);  // 单引擎: b2 段记 0, 段时在 hd
     }
+    // M10 tier1 排干点 B (bb2 末): bb2 已提交自然完成, 输出无人读
+    // (col_feats[p] 由 k+2 的 ev_post 守卫覆写); 检查点在设防段返回后,
+    // 无 parity 竞态
+    if (watch_abandon_take()) {
+      f_void[k] = 1;
+      ++s_skip_wd;
+      fprintf(stderr, "watch: frame abandoned k=%ld at=bb2 skip_total=%llu\n",
+              k, s_skip_wd);
+      skipwd_push(watch_now_ms());
+      submitted = k + 1;
+      continue;
+    }
     cudaEventRecord(ev_hd[p], eng_stream);
+    // M10 tier1 排干点 C (hd 末): hd 已提交 → det/map 状态已被本帧推进,
+    // 这是弃帧语义的可接受代价 (递归链少一帧输出, 状态值仍是真实计算)
+    if (watch_abandon_take()) {
+      f_void[k] = 1;
+      ++s_skip_wd;
+      fprintf(stderr, "watch: frame abandoned k=%ld at=hd skip_total=%llu\n",
+              k, s_skip_wd);
+      skipwd_push(watch_now_ms());
+      submitted = k + 1;
+      continue;
+    }
     if (ok && use_mp) {
       // M6a: 场景首帧 mp 状态全清零 (模板 D2D, 同流定序), 再逐帧重绑+推理
       watch_touch(kWsMP);
       watch_maybe_stall(kWsMP, k);
+      watch_maybe_hang(kWsMP, k);
       if (reset) {
         for (size_t si = 0; si < mstates.size(); ++si)
           cudaMemcpyAsync(mstates[si].in->dev[0], d_mrst[si],

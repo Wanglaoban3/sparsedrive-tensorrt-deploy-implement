@@ -57,7 +57,8 @@ if not ONLY_FETCH:
     run("(setsid nohup bash -c '%s' > /dev/null 2>&1 < /dev/null &); echo GO" % fs)
     nd = ("/usr/local/bin/sp_modelnode m3 %s /usr/local/lib/libdfaplug_v8.so "
           "/opt/m0/trt-dev/nv12_r0/manifest.jsonl %s%s%s%s "
-          "--warmup 2 --frames 81 --img-from /opt/m0/trt-dev/vec/mini "
+          "--skip-lag --warmup 2 --frames 81 "
+          "--img-from /opt/m0/trt-dev/vec/mini "
           "> %s/node.log 2>&1 < /dev/null; "
           "echo rc=$? > %s/RC" % (ENG, BD, HD, MP, GR, BD, BD))
     run("(setsid nohup bash -c '%s' > /dev/null 2>&1 < /dev/null &); echo GO" % nd)
