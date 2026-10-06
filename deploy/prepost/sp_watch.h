@@ -12,7 +12,7 @@
 // 刻意不走任何清理路径: CUDA 出错后 context 沾毒, 析构/TRT destroy 会
 // 死锁(项目实测坑); 状态都在 shm, 进程消失即一致. ACQUIRE/IO 不设防 —
 // 输入饥饿/文件停顿属于发布端与闪存故障域, 消费端等待是正确行为.
-// SP_WD_TEST_STALL=<stage> 故障注入 (第 5 帧该阶段睡 5s 后返回, 测
+// SP_WD_TEST_STALL=<stage> 故障注入 (第 5 帧该阶段睡 2.5s 后返回, 测
 // tier1); SP_WD_TEST_HANG=<stage> 卡死不返回 (测 tier2). 默认关.
 //
 // fatal_exit: 全链路统一异常退出 (A2 退出码契约), 打一行可解析的
@@ -128,10 +128,14 @@ inline void watch_maybe_stall(int stage, long frame) {
     const char* e = getenv("SP_WD_TEST_STALL");
     stall_stage = e ? atoi(e) : -1;
   }
+  // 2.5s: 落在 tier1(dl≈2s 地板) 与 tier2(dl+dl/2=3s) 之间 — 返回型停顿
+  // 必须在宽限窗内返回才走弃帧; 睡过 tier2 线就是"真挂死"输入 (FT3 首版
+  // 睡 5s 被 tier2 先杀, 属测试输入错而非实现错)
   if (stall_stage >= 0 && stall_stage == stage && frame == 5) {
-    printf("watch: TEST_STALL stage=%s sleep 5s\n", watch_stage_name(stage));
+    printf("watch: TEST_STALL stage=%s sleep 2.5s\n",
+           watch_stage_name(stage));
     fflush(stdout);
-    struct timespec ts = {5, 0};
+    struct timespec ts = {2, 500000000};
     nanosleep(&ts, nullptr);
   }
 }
