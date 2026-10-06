@@ -1314,3 +1314,148 @@ evaldata/v11plug。
    致卡顿，判障时勿误判为根因。
 
 
+## 第十九轮：M-PROD Phase D——权限收紧（2026-10-06 交付，mprodd 门禁过）
+
+spec §7 ⑧ 的收敛版（用户批准口径：**只做文件权限收紧，维持 root 运行**，
+不做用户隔离/最小权限改造——root 隔离需要重排 /var、/run、设备节点权限，
+与"不动板子环境"纪律冲突，收益不抵风险）。与 Phase C1 遥测同批交付，
+浸泡即跑最终形态（C1+D+v11 插件）。
+
+### 改动清单（全部随 C1+D 一个 commit）
+
+| 面 | 改动 | 交付验证（2026-10-06 板上实测） |
+|---|---|---|
+| 共享内存环 | sp_bus.cpp create 路径显式 `fchmod(fd, 0640)`（不依赖 umask） | `/dev/shm/sp_m3` = 0640 ✓ |
+| 结果信箱 | sp_result.h create 路径同上 | `/dev/shm/sp_res_sp_result_m3` = 0640 ✓ |
+| UDS 套接字 | sp_dmapool 路径 /tmp → **/run/sp**（tmpfiles 建目录 0750），socket chmod 0640 | /run/sp 0750 ✓（mapped-shm 模式下无 socket，--dma 迁移点用） |
+| 服务默认掩码 | 双 unit 加 `UMask=0027` | `/proc/<nodepid>/status Umask: 0027` ✓；新文件（telemetry.jsonl/frame_log.tsv）0640 ✓ |
+| 目录基线 | tmpfiles sp.conf：/run/sp、/var/log/sp、/var/lib/sp 全 0750 root:root | systemd-tmpfiles --create 实测 ✓ |
+| 日志轮转 | sp-logrotate 50M×7 → **100M×5**（文件数换单文件预算） | /etc/logrotate.d/sp 在位 ✓ |
+| 日志兜底 | filesrc+node 启动时 >100MB 截断（append 句柄 O_APPEND 下 truncate 安全；无 logrotate 的裸镜像防写满闪存） | 代码路径在位 |
+
+**升级路径已知边界**（诚实记录）：fchmod/UMask 只管**新建**文件——
+现场升级时已存在的旧环/旧日志保持旧 0644 权限，直到环被重建（--fresh/
+删 /dev/shm）或日志被轮转。本日实测两 shm 对象都是新二进制重建的
+（0640），门禁数据即最终形态。
+
+### 附带修复：frame_log 表头/数据列错位（C1 引入，D 轮发现）
+
+C1 给 frame_log.tsv 每行追了 3 列（gpu_temp_c/cpu_temp_c/sm_clock_mhz）
+但漏改表头（11 列 vs 数据 14 列）——按表头解析的分析脚本会错位。修：
+表头同点补齐 3 列名。教训入 AGENTS.md：**自描述文件改列必须同一提交
+改表头**。
+
+### 金标重标（v11）+ 升级顺序实锤
+
+换 v11 插件后自检指纹拦的是 **FATAL code=15 直接退出**（金标过期=基础
+设施错，不是 stay-alive 心跳）→ systemd Restart=on-failure 1s×5 →
+**StartLimit 熔断**。现场顺序固化：install →（旧金标拦，预期）→
+`_prod_golden.py gen --runs 10 --plugin libdfaplug_v11.so`（--selftest-
+dump 从 manifest 直读帧 0，不碰环不消费，**无需活链/无需 override**，
+gen 的 RING_OK 检查只是环境哨兵）→ `systemctl reset-failed` 双单元 →
+start → SELFTEST PASS (9 tensors)。新金标容差（3×跨 run 最大偏差）：
+det_bbox 1.383 / motion_cls 3.381 / plan_reg 0.053 / map_pts 0.381
+（量级与 v8 版同 class）。_prod_golden.py 补上了 docstring 里承诺但
+argparse 没定义的 `--plugin` 参数。
+
+### mprodd 精度门禁（独立 81 帧闭环，插件定死 v8 以隔离 C/D 增量）
+
+| 指标 | mprodd（C1+D） | mprodb | mprodc | m7fix 参考 |
+|---|---|---|---|---|
+| det mAP / NDS | **0.4169 / 0.4732** | — | — | 0.4177 / 0.4735 |
+| map mAP | **0.7479** | 0.7481 | 0.7483 | 0.7485 |
+| EPA car/ped | **0.6054 / 0.5000** | 0.6098/0.5089 | 0.6035/0.5028 | 0.6048/0.5023 |
+| L2 | **0.7473** | 0.7481 | 0.7343 | 0.7377 |
+| obj_box_col | **0.161%** | 0.242% | 0.161% | 0.161% |
+
+全部落在既有跨 run 抖动带内（L2/col 单 run 散布 ±0.01/±0.08pp 口径），
+C1+D 代码**零精度回归**。驱动脚本：`deploy/_pd_step1_build.py`（停单元
+→build→install --no-start）、`_pd_step2_golden.py`/`_pd_step2b_resume.py`
+（金标重标+熔断恢复）、`_pd_step3_verify.py`（D/C1 证据采集）、
+`_pd_step3b_rebuild.py`（表头修复重编）、`_pd_step4_det.py`（mkeval+
+det 目录组装+评估）；mprodd dump 留档 `work_dirs/preproc_ref/mprodd`
+（det/map/mp eval 日志同目录）。
+
+### 本轮踩坑（已录 AGENTS.md）
+
+1. **chmod/fchmod 编译错 = 缺 `<sys/stat.h>`**：sp_dmapool.cpp 独缺
+   （sp_bus/sp_result.h 都有），症状 `error: 'chmod' was not declared`。
+2. **金标过期自检 = exit 15 → StartLimit 熔断**（见上，reset-failed
+   双单元再 start）。
+3. **mkeval 产 out_XX 而 det eval 吃 outv8_XX**：det 门禁用
+   _pd_step4_det.py 现组 `mini_<tag>_det/outv8_XX` 别名目录（键
+   det_cls/det_bbox/det_quality/det_instance_id + mini_meta.npz）。
+
+## 第二十轮：M10 数据面硬化——跳序/latest-wins/分级 watchdog/wrap-lease（2026-10-07 交付，FT 4/4 + mprode 门禁过）
+
+30fps 满负荷前置（spec §5/§8 M10 行）：常驻源枯竭/消费者停顿/晚接入在
+30fps 下从"偶发"变"常态"，四个数据面缺口各补一刀。**零 shm 布局改动**
+（RingMeta/SlotHdr 不动，kVersion=4 不变）；wrap-lease 纯行为、env 门控
+默认关=与 v4 完全同行为。
+
+### 改动清单
+
+| 面 | 改动 | 语义 |
+|---|---|---|
+| sp_modelnode `--skip-lag` | acquire 到 seq>expect → 跳到最新（`s_skip_lag` 记账，frame_log 新列 `skip_lag`/`skip_wd`，16 列）；rewind/环重置仍走 resync 不计跳序；120 连续环重置 → 源枯竭 exit 20 | latest-wins：30fps 下消费者慢一拍不再 FATAL 12 连环重启；场景边界判定比的是已处理帧的 cur_scene，边界帧被跳过则下一处理帧照常触发 identity+dt=0.5 复位 |
+| sp_watch 分级 abandon | dl 到点先发 `abandon_req`（tier1），主循环在**设防段返回后的边界检查点**弃帧（f_void[k]=1 哨兵，complete_frame 只推进 cursor：不产输出/不写信箱/不落 frame_log 行，信箱保持 last_valid、lage 增长=fail-visible）；请求挂起超过 dl+max(dl/2,500) 无人认领 → tier2 FATAL 13 `detail=watchdog-tier2`；SP_WD_MS 强制值仍是平退（逃生门不分级） | 真挂死与"一次卡顿"分开：返回型停顿弃帧续跑，不返回才杀进程。弃帧后 skip_wd 连续≥3/8 帧 → LATCH（kReasonStageFail），防持续饿死静默化 |
+| sp_bus wrap-lease | claim-blocked 槽=发布者绕圈撞上长持有者；`SP_BUS_WRAP_LEASE_MS`（默认 0=关）下按第二租约强抢心跳陈旧持有者。默认 800ms 依据：盖过活读者 hb 老度峰值（2×svc+post 503ms 抖动 ≈690ms），远小于 5s 死租约 | 30fps 单消费者停 >5s 才会死租约强收——绕圈 4 槽 @30fps 下 800ms 就撞回，必须更短租约；release() 加 slot_idx<0 幂等护栏（TDD 意外收获，防强抢后消费者二次 release 解引用 slot(-1)） |
+| sp_filesrc --wait-cons | 只等**第一个**消费者（原 = 等满 N 个才开拍）；`starting anyway (late joiners resync)` 日志行 | 晚接入消费者走 skip-lag/resync 自然对齐；生产不再因第二消费者缺席而无限等待 |
+
+### FT 轮（deploy/_prod_ft_m10.py，板上独立进程 4/4 PASS）
+
+| 用例 | 注入 | 判据 | 实测 |
+|---|---|---|---|
+| FT1 wrap-lease | fps30 --loop + sp_sub --hold-ms 60000 不心跳 | 20s seq≥300 且 forced≥1；对照活消费者 forced=0 | seq=600 forced=1 / forced=0 ✓ |
+| FT2 skip-lag | SIGSTOP 6s 跨场景边界（k=40） | skip-lag rc0 + skipped≥20 + scene 复位行 + 无 FATAL；严格对照 rc12 | skipped=28 + `scene 0 -> 1 at frame 40` / rc12 ✓ |
+| FT3 watchdog | STALL（2.5s 返回型）@pre 帧5 / HANG（不返回）@post 帧5 | stall：ABANDON+弃帧 rc0；hang：ABANDON 在前→rc13 tier2 | rc0 abandon=True / rc13 tier2=True ✓ |
+| FT4 late join | --wait-cons 2 零消费者起拍 + 8s 后第二消费者 | 零消费者等待、starting-anyway、seq 前进、无 claim timeout | 4/4 断言 ✓ |
+
+### mprode 精度门禁（两独立 run，新二进制 + --skip-lag，插件定死 v8）
+
+| 指标 | mprodd 带 | mprode_a | mprode_b | 判定 |
+|---|---|---|---|---|
+| det mAP / NDS | 0.4169 / 0.4732 | 0.4173 / 0.4731 | 0.4176 / 0.4729 | ✓ |
+| map mAP | 0.7479 | 0.7482 | 0.7476 | ✓ |
+| EPA car/ped | 0.6054 / 0.5000 | 0.6069 / 0.5070 | 0.6046 / 0.4967 | ✓ |
+| L2 | 0.7473 | 0.7369 | 0.7405 | ✓（±0.02 带内） |
+| obj_box_col | 0.161% | 0.161% | 0.161% | ✓ |
+
+5fps 节拍下两 run 零 SKIP/零 ABANDON 行（skip-lag 路径休眠等价，符合
+预期）；e2e p50 48.11/48.23ms 带。单测：test_bus_lease 4/4、
+test_watch_tier 4/4（板端）。install 收口断言：ExecStart 经
+$SP_NODE_ARGS 生效 `--skip-lag`、env 含 SP_BUS_WRAP_LEASE_MS=800、
+SELFTEST PASS (9 tensors)（金标 v11 工件指纹不含节点二进制 md5，M10
+零工件改动故直接过）、信箱 seq 双探递进。dump 留档
+`work_dirs/preproc_ref/mprode_{a,b}`（eval 日志同目录），eval driver
+`deploy/_m10_eval_run.py <tag>`（det/map/mp 一键，mprodd 的
+_pd_step4_det.py 泛化版）。
+
+### Review Focus 五条的落地证据（plan 终审项）
+
+1. wrap-lease 误抢 fence-in-flight 读者 → 默认 800ms > hb 老度峰值
+   ~690ms 定量推导 + FT1 对照组 forced=0 实证；
+2. skip-lag 跨场景边界 → FT2 实证边界帧被跳后复位行照出（判定基于
+   已处理帧）；
+3. 弃帧 parity 竞态 → 弃帧只发生在设防段返回后的边界点（GPU 已完成），
+   单测 tier1 用例覆盖"卡住的调用返回后排干"形状；
+4. watchdog 不得放过真挂死 → FT3b HANG 不返回必 rc13 + SP_WD_MS 逃生
+   门平退不分级（单测 case3）；
+5. unit/env 交互 → 零 unit 改动，SP_NODE_ARGS 通道透传（install 断言
+   cmdline 实证）。
+
+### 本轮踩坑（已录 AGENTS.md）
+
+1. **driver launch 重定向串线**：`'> log'` 拼在 `; echo rc=$? > rcfile`
+   链尾 → 重定向落到 echo 头上，echo 启动截断 node 日志且 rc 写进日志
+   （rc=None 假象）——重定向只由 launch 包 `{ ...; }` 组做一次。
+2. **pgrep -f 先命中 wrapper bash**：`{ node ...; }` 包装下 bash 命令行
+   同含 node 字样，SIGSTOP 停 bash、子进程照跑（skipped=0 假阴性）——
+   定点操作用 `pgrep -x`（comm 精确）并验 /proc state==T。
+3. **返回型 STALL 注入必须落 tier 窗内**：睡 5s > dl(2s 地板)+grace(1s)
+   = 真挂死输入，tier2 先杀，tier1 路径根本测不到——hook 改 2.5s。
+4. **mini manifest scene id 从 0 起**（boston=0/queenstown=1），复位行
+   `scene 0 -> 1`——断言以板上实际措辞为准，别凭记忆写编号。
+
+
+
