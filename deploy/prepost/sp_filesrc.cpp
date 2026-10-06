@@ -12,7 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <chrono>
+#include <string>
 #include <thread>
 
 #include <cuda_runtime.h>
@@ -37,6 +40,14 @@ int main(int argc, char** argv) {
     return 2;
   }
   const char* name = argv[1];
+  // Phase D 日志兜底: 镜像无 logrotate 时防 /var/log 写满盘 — 启动时
+  // >100MB 截断 (systemd append 句柄 O_APPEND, 截断后写回新 EOF, 安全)
+  {
+    std::string lp = std::string("/var/log/sp/filesrc-") + name + ".log";
+    struct stat st;
+    if (::stat(lp.c_str(), &st) == 0 && st.st_size > 100LL * 1024 * 1024)
+      ::truncate(lp.c_str(), 0);
+  }
   uint32_t w = (uint32_t)atol(argv[2]);
   uint32_t h = (uint32_t)atol(argv[3]);
   double fps = atof(argv[4]);
@@ -88,10 +99,15 @@ int main(int argc, char** argv) {
   printf("filesrc: manifest=%s entries=%zu %s\n", manifest,
          src.num_entries(), loop ? "loop" : "once");
   if (wait_cons > 0) {
-    // 建环后等消费端注册再开拍 (编排: 慢启动的 node 不丢首帧)
-    while (bus->consumer_count() < wait_cons && !g_stop) {
+    // 建环后等消费端注册再开拍 (编排: 慢启动的 node 不丢首帧).
+    // M10: 只等第一个消费者 —— 后到者走 resync (skip-lag 模式下跳到最新),
+    // 等满 N 个会让多消费者编排卡死在凑数上.
+    while (bus->consumer_count() < 1 && !g_stop) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    if (wait_cons > 1 && bus->consumer_count() < wait_cons)
+      printf("filesrc: wait-cons %d got %d, starting anyway "
+             "(late joiners resync)\n", wait_cons, bus->consumer_count());
     printf("filesrc: consumer present, start publishing\n");
   }
 
