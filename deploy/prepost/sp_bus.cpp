@@ -30,6 +30,17 @@ static int64_t lease_ms_from_env() {
   return v > 0 ? v : kLeaseMsDefault;
 }
 
+// M10 wrap-lease: claim 已阻塞在某槽 = 发布端已绕回一圈, 此时对该槽
+// "活着但失速" 的持有者 (hb 老 > wrap_ms) 定向强抢. 0 = 关闭 (默认,
+// 行为与 v4 一致). 默认 800ms@30fps = k=6 圈: 盖过 2xsvc + post 段
+// 503ms 抖动的 hb 老度峰值 (~690ms), 远小于 5s 死者租约.
+static int64_t wrap_lease_ms_from_env() {
+  const char* e = getenv("SP_BUS_WRAP_LEASE_MS");
+  if (!e) return 0;
+  long v = atol(e);
+  return v > 0 ? v : 0;
+}
+
 int64_t now_ms() {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -147,6 +158,9 @@ Bus* Bus::open(const char* name, uint32_t width, uint32_t height, bool create,
     delete b;
     return nullptr;
   }
+  // Phase D 权限收紧 (spec §8): 环 shm 0640 (默认 umask 下 O_CREAT 得 0600/
+  // 0644 不等, 显式 chmod 不依赖启动方 umask)
+  if (create) fchmod(fd, 0640);
   b->fd_ = fd;
 
   size_t cam_bytes = uint64_t(width) * height * 3 / 2;
@@ -227,6 +241,7 @@ Bus::~Bus() {
 
 uint8_t* Bus::claim_of(int32_t* slot_idx, int64_t timeout_ms) {
   const int64_t lease = lease_ms_from_env();
+  const int64_t wrap = wrap_lease_ms_from_env();
   const int64_t deadline = now_ms() + timeout_ms;
   for (;;) {
     lock_lk(&m_->lk);
@@ -239,6 +254,7 @@ uint8_t* Bus::claim_of(int32_t* slot_idx, int64_t timeout_ms) {
       return payload_of(idx);
     }
     force_stale_locked(m_->pub_idx, now_ms(), lease);
+    if (wrap > 0) force_stale_locked(m_->pub_idx, now_ms(), wrap);
     if (s.ref.load() == 0) {
       s.meta.seq = 0;
       const int32_t idx = m_->pub_idx;
@@ -393,6 +409,7 @@ int Bus::acquire(int32_t cid, uint64_t last_seq, FrameView* out,
 }
 
 void Bus::release(FrameView* v) {
+  if (!v || v->slot_idx < 0) return;  // 幂等: 重复/已失效 view 无害
   lock_lk(&m_->lk);
   SlotHdr& s = *slot(v->slot_idx);
   if (s.ref.load() > 0) s.ref.fetch_sub(1);
