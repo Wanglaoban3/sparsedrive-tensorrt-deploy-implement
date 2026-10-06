@@ -3,12 +3,17 @@
 //
 // watchdog 契约: 主循环每进入一个阶段 watch_touch(stage), 每完成一段
 // watch_record(stage, ms) 喂滚动 p50; 独立线程每 20ms 检查"在某阶段停留
-// 超过 max(3×p50, 500ms)" → FATAL code=13 → _exit(13). 刻意不走任何
-// 清理路径: CUDA 出错后 context 沾毒, 析构/TRT destroy 会死锁(项目实测
-// 坑); 状态都在 shm, 进程消失即一致. ACQUIRE 不设防 —— 输入饥饿属于
-// 发布端故障域(filesrc exit 20 + systemd 编排), 消费端等待是正确行为.
-// SP_WD_MS=<ms> 强制覆盖 deadline; SP_WD_TEST_STALL=<stage> 故障注入钩子
-// (第 5 帧进入该阶段时睡 5s, 默认关).
+// 超过 max(3×p50, 2×p99, 2000ms)" (SP_WD_MS 强制覆盖). M10 分级:
+//   tier1 首次超阈 → 只置弃帧请求 (主循环在设防段边界 watch_abandon_take
+//         排干: 释放槽引用/跳过本帧输出/计数), 不退出;
+//   tier2 请求挂起且主循环超 max(dl/2, 500ms) 未消费 = 排干失败 (真 hang)
+//         → FATAL code=13 (detail=watchdog-tier2) → _exit(13).
+//   SP_WD_MS 逃生门不分级 (强制覆盖时直退 13).
+// 刻意不走任何清理路径: CUDA 出错后 context 沾毒, 析构/TRT destroy 会
+// 死锁(项目实测坑); 状态都在 shm, 进程消失即一致. ACQUIRE/IO 不设防 —
+// 输入饥饿/文件停顿属于发布端与闪存故障域, 消费端等待是正确行为.
+// SP_WD_TEST_STALL=<stage> 故障注入 (第 5 帧该阶段睡 5s 后返回, 测
+// tier1); SP_WD_TEST_HANG=<stage> 卡死不返回 (测 tier2). 默认关.
 //
 // fatal_exit: 全链路统一异常退出 (A2 退出码契约), 打一行可解析的
 // "FATAL code= stage= seq= detail=" 后 _exit, 供 systemd/日志采集锚定.
@@ -56,8 +61,12 @@ struct WatchState {
   std::atomic<int64_t> beat_ms{0};
   std::atomic<int> stage{kWsAcq};
   std::atomic<uint64_t> seq{0};
+  std::atomic<int> abandon_req{0};   // M10 tier1: 弃帧请求挂起 (主循环排干)
+  std::atomic<int64_t> abandon_ms{0};
   std::mutex mu;
-  double ring[kWsN][64] = {{0}};
+  // 512 帧窗口 (Phase C 遥测 perf 行与 watchdog 共用一份环形)
+  static const int kRing = 512;
+  double ring[kWsN][kRing] = {{0}};
   int rhead[kWsN] = {0};
   int rlen[kWsN] = {0};
 };
@@ -76,13 +85,19 @@ inline void watch_seq(uint64_t s) { watch().seq.store(s); }
 inline uint64_t watch_seq_get() { return watch().seq.load(); }
 inline int watch_cur_stage() { return watch().stage.load(); }
 
+// M10 tier1 排干点: 主循环在设防段边界调用; true = 本帧应被弃掉
+// (watchdog 已请求). 取走即清零, 下帧不受影响.
+inline bool watch_abandon_take() {
+  return watch().abandon_req.exchange(0) != 0;
+}
+
 inline void watch_record(int stage, double ms) {
   if (stage < 0 || stage >= kWsN) return;
   WatchState& w = watch();
   std::lock_guard<std::mutex> lk(w.mu);
   w.ring[stage][w.rhead[stage]] = ms;
-  w.rhead[stage] = (w.rhead[stage] + 1) % 64;
-  if (w.rlen[stage] < 64) w.rlen[stage] += 1;
+  w.rhead[stage] = (w.rhead[stage] + 1) % WatchState::kRing;
+  if (w.rlen[stage] < WatchState::kRing) w.rlen[stage] += 1;
 }
 
 inline double watch_p50(int stage) {
@@ -90,7 +105,7 @@ inline double watch_p50(int stage) {
   std::lock_guard<std::mutex> lk(w.mu);
   int n = w.rlen[stage];
   if (!n) return 0.0;
-  double tmp[64];
+  double tmp[WatchState::kRing];
   memcpy(tmp, w.ring[stage], sizeof(double) * n);
   std::sort(tmp, tmp + n);
   return tmp[n / 2];
@@ -101,7 +116,7 @@ inline double watch_p99(int stage) {
   std::lock_guard<std::mutex> lk(w.mu);
   int n = w.rlen[stage];
   if (!n) return 0.0;
-  double tmp[64];
+  double tmp[WatchState::kRing];
   memcpy(tmp, w.ring[stage], sizeof(double) * n);
   std::sort(tmp, tmp + n);
   return tmp[(int)((n - 1) * 0.99)];
@@ -118,6 +133,25 @@ inline void watch_maybe_stall(int stage, long frame) {
     fflush(stdout);
     struct timespec ts = {5, 0};
     nanosleep(&ts, nullptr);
+  }
+}
+
+// M10: 与 maybe_stall 成对的 tier2 注入钩子 — 卡死不返回 (测"排干失败
+// → exit13"路径; stall 返回型只能测 tier1). SP_WD_TEST_HANG=<stage>.
+inline void watch_maybe_hang(int stage, long frame) {
+  static int hang_stage = -2;
+  if (hang_stage == -2) {
+    const char* e = getenv("SP_WD_TEST_HANG");
+    hang_stage = e ? atoi(e) : -1;
+  }
+  if (hang_stage >= 0 && hang_stage == stage && frame == 5) {
+    printf("watch: TEST_HANG stage=%s loop forever\n",
+           watch_stage_name(stage));
+    fflush(stdout);
+    for (;;) {
+      struct timespec ts = {1, 0};
+      nanosleep(&ts, nullptr);
+    }
   }
 }
 
@@ -146,13 +180,39 @@ inline void watch_start() {
       if (dl < 2000) dl = 2000;
       int64_t stalled = watch_now_ms() - watch().beat_ms.load();
       if (stalled > dl) {
-        fprintf(stderr,
-                "FATAL code=13 stage=%s stalled_ms=%ld dl_ms=%ld seq=%lu "
-                "detail=watchdog\n",
-                watch_stage_name(st), (long)stalled, (long)dl,
-                (unsigned long)watch_seq_get());
-        fflush(stderr);
-        _exit(13);
+        // M10 分级: forced 逃生门不分级 (直退); 否则 tier1 = 首次超阈
+        // 只请求弃帧 (主循环在设防段返回后排干), tier2 = 请求挂起且
+        // 主循环超宽限 (max(dl/2,500ms)) 未消费 = 排干失败 (真 hang)
+        // → exit 13.
+        if (forced_ms > 0) {
+          fprintf(stderr,
+                  "FATAL code=13 stage=%s stalled_ms=%ld dl_ms=%ld seq=%lu "
+                  "detail=watchdog\n",
+                  watch_stage_name(st), (long)stalled, (long)dl,
+                  (unsigned long)watch_seq_get());
+          fflush(stderr);
+          _exit(13);
+        }
+        if (watch().abandon_req.exchange(1) == 0) {
+          watch().abandon_ms.store(watch_now_ms());
+          fprintf(stderr,
+                  "watch: ABANDON req stage=%s stalled_ms=%ld dl_ms=%ld "
+                  "seq=%lu detail=watchdog-tier1\n",
+                  watch_stage_name(st), (long)stalled, (long)dl,
+                  (unsigned long)watch_seq_get());
+          fflush(stderr);
+        } else {
+          int64_t grace = dl / 2 > 500 ? dl / 2 : 500;
+          if (stalled > dl + grace) {
+            fprintf(stderr,
+                    "FATAL code=13 stage=%s stalled_ms=%ld dl_ms=%ld "
+                    "seq=%lu detail=watchdog-tier2\n",
+                    watch_stage_name(st), (long)stalled, (long)dl,
+                    (unsigned long)watch_seq_get());
+            fflush(stderr);
+            _exit(13);
+          }
+        }
       }
     }
   }).detach();
