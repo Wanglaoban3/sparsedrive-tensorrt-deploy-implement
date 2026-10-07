@@ -1508,3 +1508,63 @@ dump 留档 `work_dirs/preproc_ref/mprodf_{a,b}`。
 
 
 
+
+
+## 第二十一轮：M9a sp_trigger——L1 规则车载移植 + 规则插件 ABI + THR 外置（2026-10-07 交付，FT 4/4 + mprodt 门禁过 + parity 集合全等）
+
+量产刚需（spec §3/§4.2）：DPU 事件触发器（ADAS 数据回传圈选）先以 L1 规则
+形态上车——CPU 10Hz tick 只读信箱 seqlock（**零关键链改动**：sp_modelnode/
+sp_bus/环布局不动，trigger 是第三类进程=纯下游读者），manifest join 补
+ego 位姿 → 运动学差分 → 64 帧历史环 → 14 规则插件逐个 eval → 配额去重 →
+events.jsonl（10MB×5 轮转）。SDD 六任务（plan c9463b5，TDD RED→GREEN，
+台账 .superpowers/sdd/2026-10-07-m9a-trigger/）。
+
+### 交付物
+
+| 层 | 文件 | 要点 |
+|---|---|---|
+| 规则插件 ABI | prepost/sp_rule.h + sp_ruleload.h | SP_RULE_ABI=1；sp_rule_query() 导出（**必须 extern "C"**）；init(kv_text)/eval(ctx,ev)/fini；abi_ver 校验拒载 fail-visible；SIGHUP/drop-in 热重扫；THR 外置 /etc/sp/thr.conf `[name]` 段注入 init |
+| 宿主 | prepost/sp_trigger.cpp + systemd/sp-trigger@.service | 信箱 attach 轮询（下游先启动是常态）、status!=0（LATCH）帧不评规则不推历史、seq 倒退→环重建、**逐事件 fflush**、10MB×5 轮转 |
+| 规则 ×14 | prepost/rules/sp_rule_*.c | ego 组 7（hard_brake/hard_accel/low_speed_crawl/reverse/sharp_turn/sharp_lat/u_turn）+ det 组 7（lead_hard_brake/slow_lead/stationary_approach/cut_in/vru_near/vru_cross/construction_zone）；events.py 15 条的 portable 子集（stops_within_horizon 依赖 GT 未来不移植） |
+| 配额 | prepost/sp_quota.h | 同 log ±5s 冷却 + per-event 12/min + global 15/min（60s 尾窗按 ts）；场景阶跃清零 |
+| SDK | sp_rule_util.h + sp_egoring.h | ru_sustained/ru_id_series/ru_pick_lead/ru_thr + 类别集（VEHICLE={0..4}/VRU={6,7,8}/锥桶={9}/屏障={5}，nuScenes 序） |
+
+### 关键实测判定
+
+- **车前向 = l2g R 第 1 列**（atan2(l2g[5],l2g[1])，非 atan2(R10,R00)）：
+  nuScenes LIDAR_TOP 装转 90°，manifest l2g 是 **lidar 位姿非车体位姿**；
+  板上位移投影 col0≈0 / col1=8.45=hypot 实锤。 ego.speed 语义修复影响全部
+  ego 组规则。判障方法="observe 列 vs manifest 逐行对账"（ts 对=join 对、
+  speed 错=运动学错）两轮定位。连带：manifest l2g 是嵌套 4×4 JSON，迷你
+  解析器 jump_num 要跳 ']' 且 strtod 取 endptr（两次静默全 0）。
+- **THR 标定纪律**（_m9a_thr_calib.py，3min 稳态观察 950 帧）：分位数
+  前加运动门控（speed>1 且 acc 前后帧都在动）——静止段 yaw 假尖峰
+  p99≈2π、复位帧 acc≈17 伪影。校准：hard_brake p01=-3.21 / hard_accel
+  p99=1.08 / sharp_turn 0.412 / sharp_lat 1.678（留档
+  work_dirs/preproc_ref/m9a_thr）。
+- **parity 门禁**（_m9a_parity.py）：ctx-dump 二进制夹具（布局钉死）+
+  numpy 镜像 14 规则重放 → 951 tick / **3237 事件 (seq,event) 集合全等**，
+  strength |Δ|≤1e-3 无违例。events.py 本体消费 GT occupancy 不可比，
+  parity 盖规则层，ego 运动学由标定对账盖。
+- **FT 4/4**（_prod_ft_m9a.py）：FT1 kill-9 → events 续写 + lage<3s
+  （demo_ft1 确定性注入）；FT2 drop-in 热加载 15→16 + 坏 ABI 拒载；
+  FT3 trigger 启停窗口 node forced 增量全 0（零扰动）；FT4 11MB→.1 滚出。
+- **mprodt 零回归**（trigger active 独占环跑 81 帧）：det 0.4168/0.4729、
+  map 0.7485、EPA 0.6035/0.5005、L2 0.7434、col 0.161%——全入 mprodf 带。
+
+### 坑（本 round 新增）
+
+- **低频事件写 stdio 块缓冲冻结**：events.jsonl mtime 不动、kill -9 连带
+  丢缓冲 → FT1 续写假阴性（88→88）。修复=ev_write/全局计数逐事件 fflush。
+  低频日志行必须逐行 flush，否则"写没写"不可判。
+- **install 曾编板上陈旧源**：push 源与板上编译顺序反了 → 编出旧逻辑。
+  install 流程=sftp put 全部源 → 板上 g++，顺序不能反。
+- **FT 断言读基线要读"服务本次启动"权威行**（`trigger: N rules`），
+  journalctl 全文 grep 会吃到上一轮残留。
+- **信箱读端挂管道不 EOF**：sp_resultmon 持续模式在 paramiko channel
+  上 o.read() 挂到 PipeTimeout——取证用 sp_status/日志文件替代。
+
+插件开发五分钟上手 + 7 条常见死法表见 `docs/M9A_PLUGIN_GUIDE.md`；
+板端安装 = `python deploy\_prod_install.py m3`（规则源 push→板上编译
+15 个 .so→/usr/local/share/sp/rules，三单元 enable --now + 健康断言）。
+常驻态：三单元 active + SELFTEST PASS + trigger 15 规则 hb 前进。

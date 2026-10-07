@@ -1,9 +1,9 @@
 {
-  "img_bbox_NuScenes/mATE": 0.6315,
-  "img_bbox_NuScenes/mASE": 0.4489,
-  "img_bbox_NuScenes/mAOE": 0.5748,
-  "img_bbox_NuScenes/mAVE": 0.4127,
-  "img_bbox_NuScenes/mAAE": 0.2921,
-  "img_bbox_NuScenes/NDS": 0.47285130386281216,
-  "img_bbox_NuScenes/mAP": 0.4176996035600314
+  "img_bbox_NuScenes/mATE": 0.6369,
+  "img_bbox_NuScenes/mASE": 0.4496,
+  "img_bbox_NuScenes/mAOE": 0.5769,
+  "img_bbox_NuScenes/mAVE": 0.3999,
+  "img_bbox_NuScenes/mAAE": 0.2912,
+  "img_bbox_NuScenes/NDS": 0.47293915172199197,
+  "img_bbox_NuScenes/mAP": 0.41678556183835014
 }

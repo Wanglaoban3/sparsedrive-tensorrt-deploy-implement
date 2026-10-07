@@ -33,6 +33,11 @@ FILES = [  # (本地, 远端)
     (os.path.join(SD, "m3.env"), "/etc/sp/%s.env" % INST),
     (os.path.join(SD, "sp.conf"), "/etc/tmpfiles.d/sp.conf"),
     (os.path.join(SD, "sp-logrotate"), "/etc/logrotate.d/sp"),
+    # M9a: 触发器 (只读信箱, 崩溃不影响关键链, spec §6)
+    (os.path.join(SD, "sp-trigger@.service"),
+     "/etc/systemd/system/sp-trigger@.service"),
+    (os.path.join(SD, "trigger.env"), "/etc/sp/trigger.env"),
+    (os.path.join(SD, "thr.conf"), "/etc/sp/thr.conf"),
 ]
 
 cli = paramiko.SSHClient()
@@ -72,6 +77,30 @@ sftp.close()
 print(run("sed -i 's/\\r$//' %s"
           % " ".join(r for _, r in FILES)).strip() or "crlf-clean")
 
+# ---- M9a 规则插件: 源码 push + 板上编译到 /usr/local/share/sp/rules ----
+import glob  # noqa: E402
+RULES_DIR = "/usr/local/share/sp/rules"
+print(run("mkdir -p %s" % RULES_DIR).strip())
+PREPOST_BD = "/opt/m0/trt-dev/prepost"
+print(run("mkdir -p %s/rules" % PREPOST_BD).strip())
+sftp = cli.open_sftp()
+PP = os.path.join(ROOT, "deploy", "prepost")
+for f in ["sp_rule.h", "sp_rule_util.h", "sp_rule_template.c"]:
+    sftp.put(os.path.join(PP, f), "%s/%s" % (PREPOST_BD, f))
+for f in glob.glob(os.path.join(PP, "rules", "*.c")):
+    sftp.put(f, "%s/rules/%s" % (PREPOST_BD, os.path.basename(f)))
+sftp.close()
+print(run("cd %s/rules && for f in *.c; do "
+          "g++ -O2 -shared -fPIC -I%s $f -o %s/${f%%.c}.so || exit 1; done; "
+          "g++ -O2 -shared -fPIC -I%s %s/sp_rule_template.c -o %s/"
+          "sp_rule_template.so; ls %s | wc -l"
+          % (PREPOST_BD, PREPOST_BD, RULES_DIR, PREPOST_BD, PREPOST_BD,
+             RULES_DIR, RULES_DIR)).strip())
+# 触发器宿主二进制 (M9a; board_m1 build 不覆盖它)
+print(run("cd %s && g++ -O2 -std=c++14 -Wall -pthread sp_trigger.cpp "
+          "-o /usr/local/bin/sp_trigger -lrt -ldl && "
+          "echo TRIGGER_BUILD_OK" % PREPOST_BD).strip())
+
 # ---- tmpfiles + daemon-reload ----
 print(run("systemd-tmpfiles --create /etc/tmpfiles.d/sp.conf").strip()
       or "tmpfiles ok")
@@ -85,16 +114,17 @@ if not START:
 
 # ---- enable --now ----
 print(run("systemctl enable --now sp-filesrc@%s.service "
-          "sp-modelnode@%s.service" % (INST, INST)).strip())
+          "sp-modelnode@%s.service sp-trigger@%s.service"
+          % (INST, INST, INST)).strip())
 time.sleep(2)
 
-# ---- 健康断言: 75s 内信箱出现 NOMINAL ----
+# ---- 健康断言: 75s 内信箱出现 NOMINAL + trigger ACTIVE ----
 deadline = time.time() + 75
 ok = False
 last = ""
 while time.time() < deadline:
-    st = run("systemctl is-active sp-filesrc@%s sp-modelnode@%s"
-             % (INST, INST)).strip().replace("\n", " ")
+    st = run("systemctl is-active sp-filesrc@%s sp-modelnode@%s "
+             "sp-trigger@%s" % (INST, INST, INST)).strip().replace("\n", " ")
     if "active" not in st or "failed" in st or "inactive" in st:
         last = "unit-state: " + st
         time.sleep(3)

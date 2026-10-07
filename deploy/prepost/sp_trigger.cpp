@@ -123,6 +123,9 @@ static void ev_write(uint64_t seq, int64_t ts_ns, const char* name,
   fprintf(g_ev,
           "{\"ts_ns\":%lld,\"seq\":%llu,\"event\":\"%s\",\"strength\":%.6f}\n",
           (long long)ts_ns, (unsigned long long)seq, name, (double)strength);
+  // 逐事件 flush: stdio 块缓冲 (4KB) 会把低事件率输出冻在内存里,
+  // kill -9 连带丢缓冲 (FT1 实测 15 条事件冻 40min 不可见)
+  fflush(g_ev);
   g_ev_total += 1;
   if (ftell(g_ev) > (long)kEvRotateBytes) {
     ev_rotate();
@@ -376,6 +379,7 @@ int main() {
                     "\"strength\":%.6f}\n",
                     (long long)fm.ts_ns, (unsigned long long)msg.seq,
                     ev.name, (double)ev.strength);
+            fflush(g_raw);
           }
           if (quota.allow(msg.seq, fm.ts_ns, ev.name)) {
             ev_write(msg.seq, fm.ts_ns, ev.name, ev.strength);
