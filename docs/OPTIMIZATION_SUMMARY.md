@@ -1486,5 +1486,25 @@ _pd_step4_det.py 泛化版）。
 收口断言复跑全绿（wrap=1000 生效、SELFTEST PASS、seq 双探递进）。
 dump 留档 `work_dirs/preproc_ref/mprodf_{a,b}`。
 
+### 30fps 满负荷 8h 浸泡（M10 最终形态，2026-10-07，4/4 验收线 PASS）
+
+以 M10 交付形态（--skip-lag + wrap-lease 1000 + C1 遥测 + D 权限）发车
+`_prod_soak.py start 8`。**关键物理**：请求 SP_FPS=30 实际 ~23fps——
+环背压把源节流到节点吞吐（filesrc 22.9/s = node 22.1/s，4 槽环释放节奏
+= 节点服务率）→ 节点 100% 饱和（GR3D 97-99%、GPU 70-87°C 平稳），
+**单消费者饱和下 skip-lag 天然休眠**（acquire 恒得 last_seq+1，零 SKIP
+行、forced=0）；要真正大规模激活跳序需 drop-oldest 发布语义（另行实验）。
+
+| 验收线（spec §7 C2） | 实测 | 判定 |
+|---|---|---|
+| node RSS 斜率 <1MB/h | **+0.330 MB/h** | PASS（stat_feed 抽稀修复实证：修复前 +2.0MB/h） |
+| 稳态 forced_recycles 增量=0 | 0 | PASS（wrap-lease 8h 零误抢） |
+| 零 exit 13/14（node/filesrc） | 0 / 0 | PASS（watchdog 满负荷零误杀） |
+| 信箱 age p99 <400ms | 89ms | PASS（NOMINAL 480/480，lage p99 132ms） |
+
+单进程跑满 8h 零重启（up 8.6h 含启动余量）；样本/tegrastats 留档
+`work_dirs/soak_2026-10-07/`（report.md 同目录）。收车即恢复量产形态
+（SP_FPS=5，NOMINAL + SELFTEST PASS）。
+
 
 
