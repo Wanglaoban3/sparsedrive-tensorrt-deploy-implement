@@ -7,6 +7,8 @@ StartLimitBurst=5
 [Service]
 Type=simple
 EnvironmentFile=/etc/sp/%i.env
+# Phase D: 服务创建的一切文件 (日志/新 shm) 走 0640 语义
+UMask=0027
 ExecStart=/usr/local/bin/sp_filesrc ${SP_RING} ${SP_W} ${SP_H} ${SP_FPS} \
   ${SP_MANIFEST} ${SP_ROOT} --loop --wait-cons 1
 Restart=on-failure

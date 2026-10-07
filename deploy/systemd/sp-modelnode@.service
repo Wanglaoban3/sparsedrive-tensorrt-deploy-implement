@@ -9,6 +9,8 @@ StartLimitBurst=5
 [Service]
 Type=simple
 EnvironmentFile=/etc/sp/%i.env
+# Phase D: 服务创建的一切文件 (日志/输出/新 shm) 走 0640 语义
+UMask=0027
 ExecStart=/usr/local/bin/sp_modelnode ${SP_RING} ${SP_MODELS_DIR}/e_bb2.engine \
   ${SP_PLUGIN} ${SP_MANIFEST} ${SP_OUT} \
   --hd ${SP_MODELS_DIR}/e_hd.engine --mp ${SP_MODELS_DIR}/e_mp.engine \

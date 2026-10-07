@@ -142,11 +142,13 @@ if __name__ == "__main__":
     ap.add_argument("mode", choices=["gen", "tamper", "verify"])
     ap.add_argument("name", nargs="?", default="det_cls")
     ap.add_argument("--runs", type=int, default=10)
+    ap.add_argument("--plugin", default=PLUGIN)
     cli = paramiko.SSHClient()
     cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     cli.connect(os.environ["BOARD_HOST"], username="root",
                 password=os.environ["BOARD_PASS"], timeout=15)
     a = ap.parse_args()
+    PLUGIN = a.plugin  # gen() 引用全局; 金标指纹/固件路径随插件切换
     if a.mode == "gen":
         gen(a.runs)
     elif a.mode == "tamper":

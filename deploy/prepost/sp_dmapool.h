@@ -26,7 +26,8 @@ struct DmaPoolInfo {          // UDS 首包 + RingMeta 尾字段同构
   uint32_t height;
 };
 
-// 路径约定: /tmp/sp_dma_<ring>.sock (生产端监听, 消费端连接取 fd).
+// 路径约定: /run/sp/sp_dma_<ring>.sock (Phase D 自 /tmp 迁入; 生产端监听,
+// 消费端连接取 fd).
 int dma_sock_path(const char* ring, char* out, size_t outlen);
 
 class DmaPoolPub {            // --- 生产端 (sp_filesrc --dma) ---

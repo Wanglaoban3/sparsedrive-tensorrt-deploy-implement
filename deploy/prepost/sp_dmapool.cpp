@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <thread>
 #include <unistd.h>
@@ -24,7 +25,9 @@ static const uint32_t kDmaMagic = 0x53445031;  // "SDP1"
 static const int kMaxSlots = 16;
 
 int dma_sock_path(const char* ring, char* out, size_t outlen) {
-  return snprintf(out, outlen, "/tmp/sp_dma_%s.sock", ring) < (int)outlen
+  // Phase D 权限收紧: /tmp 是全局可写粘滞目录, UDS 迁到 /run/sp
+  // (tmpfiles.d 0750 root:root; 交付形态全链 root, 0640 语义足够)
+  return snprintf(out, outlen, "/run/sp/sp_dma_%s.sock", ring) < (int)outlen
              ? 0
              : -1;
 }
@@ -129,6 +132,8 @@ bool DmaPoolPub::serve(const char* ring, char* err, size_t n) {
     snprintf(err, n, "dmapool: bind/listen: %s", strerror(errno));
     return false;
   }
+  // Phase D: socket 结点 0640 (默认 umask 下 0755 过宽)
+  chmod(path, 0640);
   serving_ = true;
   std::thread th([this, path]() {
     while (serving_) {

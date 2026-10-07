@@ -1,7 +1,7 @@
 /var/log/sp/*.log {
     daily
-    size 50M
-    rotate 7
+    size 100M
+    rotate 5
     compress
     copytruncate
     missingok

@@ -182,6 +182,8 @@ class Mailbox {
       snprintf(err, errlen, "shm_open %s: errno=%d", path, errno_r());
       return nullptr;
     }
+    // Phase D 权限收紧 (spec §8): 信箱 shm 0640, 不依赖启动方 umask
+    if (create) fchmod(fd, 0640);
     if (create && ftruncate(fd, sizeof(Slot)) != 0) {
       snprintf(err, errlen, "ftruncate: errno=%d", errno_r());
       close(fd);

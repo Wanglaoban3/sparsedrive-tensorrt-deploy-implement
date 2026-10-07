@@ -277,6 +277,39 @@ OpaqueFd→DmaBufFd（cudaExternalMemoryImportFd），池/fence/节点机制复�
 门禁 `_m8_gate.py`（base 模式 81 帧、pre p50=1.45ms、信箱 81 写全过；
 RingMeta v2 双向 guard 生效——--dma 节点遇未注册池正确拒绝）。
 
+### 9.1 M-PROD 量产运行形态（Phase A-D，2026-10-05/06 交付）
+
+常驻运行不再手拉二进制，用 systemd 双单元 + `/etc/sp/m3.env`：
+
+```bash
+# 安装（unit×2 + env + tmpfiles + logrotate, 全程可逆 --uninstall）
+set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\_prod_install.py m3
+# 单元: sp-filesrc@m3 (发布) + sp-modelnode@m3 (三级链), Restart=on-failure
+# SP_NODE_ARGS=--warmup 2 --graph --selftest --loop --frames 1000000 --no-dump
+# SP_PLUGIN=/usr/local/lib/libdfaplug_v11.so (2026-10-06 起; 回退改 v8)
+```
+
+- **看门狗**：节点内 20ms 线程，deadline=max(3×p50,2×p99,2s)，卡死
+  FATAL code=13 不清理即退 → systemd 1s 拉起（热恢复实测 6.1-6.4s）；
+- **开机自检**：`--selftest` 帧0金标容差+引擎/插件 md5 指纹（金标
+  /opt/m0/trt-dev/golden/m3，0444）。**换引擎/插件必须重标**：
+  `python deploy\_prod_golden.py gen --runs 10 --plugin <so 路径>`，旧
+  金标自检走 FATAL 15 → StartLimit 熔断，重标后先 `reset-failed` 再
+  start；
+- **遥测 (C1)**：`/var/lib/sp/m3/telemetry.jsonl` 1Hz（env+分段
+  p50/p99+温度时钟）；`frame_log.tsv` 每帧 14 列（尾部 3 列温度/时钟）；
+  `/usr/local/bin/sp_status m3 [--csv]` 一行全景（ring/信箱/双进程
+  RSS/uptime/温度），浸泡采样器 `_prod_soak.py` 即吃 --csv；
+- **权限 (D)**：环/信箱 shm 0640、/run/sp 0750、UMask=0027、日志
+  100M×5 轮转 + 启动 >100MB 截断；只管新建文件（升级现场旧文件保持
+  旧权限直到重建）；
+- **健康探针**：`sp_resultmon sp_result_m3 --wait-ms 3000` 看
+  `v3 status=NOMINAL` + `last_valid` 前进（**活性看 last_valid/lage，
+  不看 status**——死节点信箱冻结 NOMINAL）；
+- **验收记录**：Phase A FT 4/4、Phase B FTB 3/3、精度 mproda-d 五连
+  不回归、C2 浸泡报告见 OPTIMIZATION_SUMMARY 第十七轮。
+
+
 ## 10. 坑索引（每条详情见 AGENTS.md 对应小节 / OPTIMIZATION_SUMMARY"遇到的主要坑"）
 
 | # | 坑 | 一句话修法 |
