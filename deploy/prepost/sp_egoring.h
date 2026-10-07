@@ -38,7 +38,10 @@ struct Egoring {
     memset(&eg, 0, sizeof(eg));
     eg.x = (float)fr.l2g[3];
     eg.y = (float)fr.l2g[7];
-    eg.heading = (float)atan2(fr.l2g[4], fr.l2g[0]);
+    // 车前向 = R 第 1 列 (l2g[1], l2g[5]): nuScenes LIDAR_TOP 装转 90 度,
+    // l2g 是 lidar 位姿, atan2(R10,R00) 给的是 lidar x 轴, 与行驶方向差
+    // 90 度 (2026-10-07 板上实测: 位移投影 col0≈0, col1=8.45=hypot)
+    eg.heading = (float)atan2(fr.l2g[5], fr.l2g[1]);
     uint32_t prev = (head + SP_RULE_HIST - 1) % SP_RULE_HIST;
     if (depth == 0 || scene[prev] != fr.scene) {
       boundary = true;  // 首帧 / 场景切换: 窗口重建, 不差分

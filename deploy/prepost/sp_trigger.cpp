@@ -25,6 +25,7 @@
 #include "sp_quota.h"
 #include "sp_result.h"
 #include "sp_rule.h"
+#include "sp_rule_util.h"
 #include "sp_ruleload.h"
 
 static std::atomic<int> g_stop{0};
@@ -48,9 +49,9 @@ struct TrigFrame {
   double l2g[16];
 };
 
-static const char* jump_num(const char* p) {  // 跳过空白/逗号/引号/冒号
+static const char* jump_num(const char* p) {  // 跳过 JSON 结构字符取数字
   while (*p && (*p == ' ' || *p == '\t' || *p == ':' || *p == ',' ||
-                *p == '"' || *p == '['))
+                *p == '"' || *p == '[' || *p == ']'))
     ++p;
   return p;
 }
@@ -83,8 +84,9 @@ static bool parse_manifest_min(const char* path, std::vector<TrigFrame>* out) {
     if (k == std::string::npos) return false;
     const char* p = jump_num(line.c_str() + k + 5);
     for (int i = 0; i < 16; ++i) {
-      fm.l2g[i] = strtod(p, 0);
-      p = jump_num(p);
+      char* end = 0;
+      fm.l2g[i] = strtod(p, &end);  // endptr 必须拿: 否则 p 不前进全读同值
+      p = jump_num(end);
     }
     out->push_back(fm);
   }
@@ -129,6 +131,15 @@ static void ev_write(uint64_t seq, int64_t ts_ns, const char* name,
   }
 }
 
+// ---------- 观察模式浮点 json 字段缓冲 (一次 fprintf 多处引用, 轮转池) ----------
+static const char* buf_f(double v) {
+  static char bufs[8][32];
+  static int idx = 0;
+  char* b = bufs[idx++ & 7];
+  snprintf(b, 32, "%.3f", v);
+  return b;
+}
+
 int main() {
   umask(0027);
   signal(SIGTERM, on_term);
@@ -145,6 +156,7 @@ int main() {
   const std::string thr_path = env_s("SP_TRIG_THR", "/etc/sp/thr.conf");
   const std::string out_dir = env_s("SP_TRIG_OUT", "/var/lib/sp/trigger");
   const bool ctx_dump = env_d("SP_TRIG_CTX_DUMP", 0) != 0;
+  const bool observe = env_d("SP_TRIG_OBSERVE", 0) != 0;
 
   std::vector<TrigFrame> man;
   if (!parse_manifest_min(man_path.c_str(), &man)) {
@@ -154,6 +166,10 @@ int main() {
   const size_t nman = man.size();
   fprintf(stderr, "trigger: manifest %s (%zu frames)\n", man_path.c_str(),
           nman);
+  for (int i = 0; i < 3 && i < (int)nman; ++i)
+    fprintf(stderr, "trigger: man[%d] x=%.1f y=%.1f ts=%llu\n", i,
+            man[i].l2g[3], man[i].l2g[7],
+            (unsigned long long)man[i].ts_ns);
 
   mkdir(out_dir.c_str(), 0750);  // 只管新建; 已存在不动 (Phase D 口径)
   if (ctx_dump) {
@@ -164,6 +180,17 @@ int main() {
   if (!g_ev) {
     fprintf(stderr, "trigger: cannot open %s/events.jsonl\n", out_dir.c_str());
     return 2;
+  }
+  // 观察模式 (阈值重标, spec §9): 逐帧落规则统计量原始值, 不评规则不发事件
+  FILE* g_ob = 0;
+  if (observe) {
+    std::string p = out_dir + "/observe.jsonl";
+    g_ob = fopen(p.c_str(), "a");
+    if (!g_ob) {
+      fprintf(stderr, "trigger: cannot open %s\n", p.c_str());
+      return 2;
+    }
+    fprintf(stderr, "trigger: OBSERVE mode (no rule eval, no events)\n");
   }
 
   // 信箱附着: 下游先于节点启动是常态, 轮询等
@@ -253,6 +280,76 @@ int main() {
       sp_frame_ctx ctx;
       er.build_ctx(&ctx, msg.status);
       ctx.final_plan = &msg.final_plan[0][0];
+      if (observe) {
+        // 规则统计量原始值 (Task 4 重标定输入; 空缺 = null)
+        double lead_d = 0, lead_v = 0, vru_lat = 0, vru_cross = 0,
+               cone_d = 0;
+        int has_lead = 0, has_vru = 0, has_cone = 0;
+        int li = -1;
+        double bd = 1e18;
+        for (uint32_t i = 0; i < nd; ++i) {
+          const sp_trk* d = &cur_det[i];
+          double dd = sqrt((double)d->x * d->x + (double)d->y * d->y);
+          if (ru_is_cone(d->label)) {
+            has_cone = 1;
+            if (dd < cone_d || cone_d == 0) cone_d = dd;
+          }
+          if (ru_is_vehicle(d->label) && d->x > 2.0 && d->x < 40.0 &&
+              fabs((double)d->y) < 2.5 && dd < bd) {
+            bd = dd;
+            li = (int)i;
+          }
+        }
+        if (li >= 0) {
+          has_lead = 1;
+          lead_d = bd;
+          lead_v = cur_det[li].vx;
+          double svx[SP_RULE_HIST];
+          int k = ru_id_series(&ctx, cur_det[li].id, 0, 0, svx, 0, 0);
+          if (k >= 3) {
+            double s = 0;
+            for (int i = 0; i < k; ++i) s += svx[i];
+            lead_v = s / k;
+          }
+        }
+        for (uint32_t i = 0; i < nd; ++i) {
+          const sp_trk* d = &cur_det[i];
+          if (!ru_is_vru(d->label) || d->x <= -5.0 || d->x >= 30.0) continue;
+          has_vru = 1;
+          if (fabs((double)d->y) < vru_lat || vru_lat == 0)
+            vru_lat = fabs((double)d->y);
+          if (d->id >= 0) {
+            double sy[SP_RULE_HIST], sts[SP_RULE_HIST];
+            int k = ru_id_series(&ctx, d->id, 0, sy, 0, 0, sts);
+            for (int j = 1; j < k; ++j) {
+              double dt = (sts[j] - sts[j - 1]) / 1e9;
+              if (dt <= 0) continue;
+              double sp = fabs((sy[j] - sy[j - 1]) / dt);
+              if (sp > vru_cross) vru_cross = sp;
+            }
+          }
+        }
+        fprintf(g_ob,
+                "{\"seq\":%llu,\"ts_ns\":%lld,\"acc\":%.4f,\"speed\":%.4f,"
+                "\"yaw_abs\":%.4f,\"lat_abs\":%.4f,"
+                "\"lead_d\":%s,\"lead_v\":%s,\"vru_lat\":%s,"
+                "\"vru_cross\":%s,\"cone_d\":%s}\n",
+                (unsigned long long)msg.seq, (long long)fm.ts_ns,
+                (double)ctx.ego.acc, (double)ctx.ego.speed,
+                fabs((double)ctx.ego.yaw_rate),
+                fabs((double)ctx.ego.speed * (double)ctx.ego.yaw_rate),
+                has_lead ? buf_f(lead_d) : "null",
+                has_lead ? buf_f(lead_v) : "null",
+                has_vru ? buf_f(vru_lat) : "null",
+                vru_cross > 0 ? buf_f(vru_cross) : "null",
+                has_cone ? buf_f(cone_d) : "null");
+        ++n_ctx;
+        if (++hb % (unsigned long long)(hz * 60) == 0)
+          fprintf(stderr, "trigger: hb seq=%llu observe=%llu\n",
+                  (unsigned long long)last_seq, n_ctx);
+        std::this_thread::sleep_until(next_tick);
+        continue;
+      }
       // 规则评估 → 仲裁 → 落盘
       for (int i = 0; i < nrules; ++i) {
         sp_rule_desc* r = rule_at(i);
