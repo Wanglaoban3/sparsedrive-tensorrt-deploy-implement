@@ -1,9 +1,9 @@
 // sp_trigger.cpp — M9a: L1 规则触发器宿主 (CPU, 只读结果信箱, 零 GPU/DLA).
 // spec: docs/superpowers/specs/2026-10-06-m9-multimodel-dla-design.md §4/§4.2.
 // 10Hz tick: 读 sp_result_<ring> 信箱 (seqlock) → 按 seq join manifest 取
-// l2g/ts → 差分 ego 运动学 (events.py human_ego_track 口径, 时间窗按 ts
-// 实差) → 组 sp_frame_ctx (64 帧历史环) → 逐规则 eval → 去重/配额 (Task 3)
-// → events.jsonl (10MB×5 轮转). ctx-dump 模式落逐 tick 二进制夹具 (§7.5).
+// l2g/ts → sp_egoring 差分 ego 运动学 (events.py 口径, 时间窗按 ts 实差) →
+// sp_frame_ctx (64 帧历史) → 逐规则 eval → sp_quota 去重/配额 → events.jsonl
+// (10MB×5 轮转). ctx-dump 模式落逐 tick 二进制夹具 (§7.5, 布局钉死).
 // 故障域 (spec §6): 本进程崩溃只暂停数据飞轮, systemd 拉起, 关键链无感.
 #include <errno.h>
 #include <signal.h>
@@ -21,6 +21,8 @@
 #include <thread>
 #include <vector>
 
+#include "sp_egoring.h"
+#include "sp_quota.h"
 #include "sp_result.h"
 #include "sp_rule.h"
 #include "sp_ruleload.h"
@@ -105,9 +107,9 @@ static void ev_rotate() {
   fclose(g_ev);
   g_ev = 0;
   for (int i = 4; i >= 1; --i) {
-    std::string src = g_ev_path + (i == 1 ? "" : "." + std::to_string(i - 1));
+    std::string src = (i == 1) ? g_ev_path
+                               : g_ev_path + "." + std::to_string(i - 1);
     std::string dst = g_ev_path + "." + std::to_string(i);
-    if (i == 1) src = g_ev_path;
     rename(src.c_str(), dst.c_str());
   }
   g_ev = fopen(g_ev_path.c_str(), "a");
@@ -126,29 +128,6 @@ static void ev_write(uint64_t seq, int64_t ts_ns, const char* name,
             g_ev_total);
   }
 }
-
-// ---------- 历史环 ----------
-struct HistRing {
-  sp_trk det[SP_RULE_HIST][sp::res::kDetCap];
-  uint32_t n[SP_RULE_HIST];
-  sp_ego_state ego[SP_RULE_HIST];
-  int64_t ts[SP_RULE_HIST];
-  uint32_t scene[SP_RULE_HIST];
-  int head = 0;        // 下一写入槽
-  uint32_t depth = 0;  // 有效帧数 (<= SP_RULE_HIST)
-
-  void reset() { head = 0; depth = 0; }
-  void push(const sp_trk* d, uint32_t nd, const sp_ego_state& eg, int64_t t,
-            uint32_t sc) {
-    n[head] = nd;
-    if (nd) memcpy(det[head], d, nd * sizeof(sp_trk));
-    ego[head] = eg;
-    ts[head] = t;
-    scene[head] = sc;
-    head = (head + 1) % SP_RULE_HIST;
-    if (depth < SP_RULE_HIST) depth += 1;
-  }
-};
 
 int main() {
   umask(0027);
@@ -208,12 +187,29 @@ int main() {
   fprintf(stderr, "trigger: %d rules, tick=%.1fHz, ctx_dump=%d\n", nrules,
           hz, (int)ctx_dump);
 
-  HistRing ringh;
+  // [quota] 段 → 仲裁器
+  Quota quota;
+  {
+    FILE* f = fopen(thr_path.c_str(), "rb");
+    if (f) {
+      std::string all;
+      char buf[8192];
+      size_t n;
+      while ((n = fread(buf, 1, sizeof(buf), f)) > 0) all.append(buf, n);
+      fclose(f);
+      quota.configure(sprule::thr_section(all, "quota").c_str());
+    }
+  }
+  fprintf(stderr, "trigger: quota dedup=%.1fs per_ev=%d/min global=%d/min\n",
+          quota.dedup_window_s, quota.per_event_per_min, quota.global_per_min);
+
+  Egoring er;
   uint64_t last_seq = 0;
-  unsigned long long n_ctx = 0, n_ev = 0;
+  unsigned long long n_ctx = 0, n_ev = 0, n_skip = 0;
   sp_trk cur_det[sp::res::kDetCap];
 
-  auto tick_period = std::chrono::microseconds((int)(1e6 / (hz > 0 ? hz : 10)));
+  auto tick_period =
+      std::chrono::microseconds((int)(1e6 / (hz > 0 ? hz : 10)));
   auto next_tick = std::chrono::steady_clock::now();
   unsigned long long hb = 0;
 
@@ -227,42 +223,13 @@ int main() {
     bool got = mb->read_latest(&msg);
     if (got && msg.magic == sp::res::kMagic && msg.seq != last_seq &&
         msg.status == sp::res::kStatusNominal) {
-      // 跳变: seq 倒退 = 发布端重灌 → 历史作废重建
-      if (last_seq && msg.seq < last_seq) ringh.reset();
+      if (last_seq && msg.seq < last_seq) {
+        fprintf(stderr, "trigger: seq rewind %llu->%llu, ring rebuilt\n",
+                (unsigned long long)last_seq, (unsigned long long)msg.seq);
+      }
       last_seq = msg.seq;
       // manifest join: seq 1-based; filesrc 按 seq s 携带 manifest[(s-1)%nman]
       const TrigFrame& fm = man[(msg.seq - 1) % nman];
-      // 场景边界: 上一个已处理帧的 scene 存在环里, 直接比
-      // (l2g 跨场景跳变会差分出假尖峰 → 清历史, 本帧速度置零)
-      bool scene_switch =
-          ringh.depth > 0 && fm.scene != ringh.scene[ringh.head == 0
-                                                        ? SP_RULE_HIST - 1
-                                                        : ringh.head - 1];
-      // ego 运动学 (events.py human_ego_track 的流式版)
-      sp_ego_state eg;
-      memset(&eg, 0, sizeof(eg));
-      eg.x = (float)fm.l2g[3];
-      eg.y = (float)fm.l2g[7];
-      eg.heading = (float)atan2(fm.l2g[4], fm.l2g[0]);
-      uint32_t prev_idx = (ringh.head + SP_RULE_HIST - 1) % SP_RULE_HIST;
-      if (ringh.depth == 0 || scene_switch) {
-        ringh.reset();  // 历史清零, 本帧为窗口首帧
-      } else if (ringh.ts[prev_idx] != 0) {
-        double dt = (double)(fm.ts_ns - ringh.ts[prev_idx]) / 1e9;
-        if (dt > 0 && dt < 10.0) {
-          double dx = fm.l2g[3] - (double)ringh.ego[prev_idx].x;
-          double dy = fm.l2g[7] - (double)ringh.ego[prev_idx].y;
-          double mid = 0.5 * ((double)ringh.ego[prev_idx].heading + eg.heading);
-          eg.speed = (float)((dx * cos(mid) + dy * sin(mid)) / dt);
-          eg.acc = (float)((eg.speed - (double)ringh.ego[prev_idx].speed) / dt);
-          double dh = eg.heading - (double)ringh.ego[prev_idx].heading;
-          while (dh > M_PI) dh -= 2 * M_PI;
-          while (dh < -M_PI) dh += 2 * M_PI;
-          eg.yaw_rate = (float)(dh / dt);
-        } else {
-          ringh.reset();  // ts 异常 (回退/长停) → 窗口重建
-        }
-      }
       // 检出转换 (DetBox 与 sp_trk 字段序不同, 逐字段拷贝)
       uint32_t nd = msg.n_det > sp::res::kDetCap ? sp::res::kDetCap
                                                  : msg.n_det;
@@ -281,37 +248,12 @@ int main() {
         cur_det[i].vx = d.vx;
         cur_det[i].vy = d.vy;
       }
-      ringh.push(cur_det, nd, eg, fm.ts_ns, fm.scene);
-      // ctx 组装: hist[i] = i 帧前 (含当前); 环形索引翻转, 逐帧拷贝最直白
-      uint32_t hd = ringh.depth;
-      static thread_local sp_ego_state he[SP_RULE_HIST];
-      static thread_local int64_t ht[SP_RULE_HIST];
-      static thread_local uint32_t hn[SP_RULE_HIST];
-      static thread_local sp_trk* hdp[SP_RULE_HIST];
-      for (uint32_t i = 0; i < hd; ++i) {
-        uint32_t ix = (ringh.head + SP_RULE_HIST - 1 - i) % SP_RULE_HIST;
-        he[i] = ringh.ego[ix];
-        ht[i] = ringh.ts[ix];
-        hn[i] = ringh.n[ix];
-        hdp[i] = ringh.det[ix];
-      }
+      TrigFrameLite fr{msg.seq, fm.scene, (int64_t)fm.ts_ns, fm.l2g};
+      er.push_frame(fr, cur_det, nd);  // 边界/ts 异常内部重建窗口
       sp_frame_ctx ctx;
-      memset(&ctx, 0, sizeof(ctx));
-      ctx.abi_ver = SP_RULE_ABI;
-      ctx.seq = msg.seq;
-      ctx.ts_ns = fm.ts_ns;
-      ctx.scene = fm.scene;
-      ctx.ego = eg;
-      ctx.det = cur_det;
-      ctx.n_det = nd;
-      ctx.n_hist = hd;
-      ctx.hist_det = (const sp_trk* const*)hdp;
-      ctx.hist_n = hn;
-      ctx.hist_ego = he;
-      ctx.hist_ts = ht;
+      er.build_ctx(&ctx, msg.status);
       ctx.final_plan = &msg.final_plan[0][0];
-      ctx.status = msg.status;
-      // 规则评估
+      // 规则评估 → 仲裁 → 落盘
       for (int i = 0; i < nrules; ++i) {
         sp_rule_desc* r = rule_at(i);
         if (!r) continue;
@@ -319,9 +261,10 @@ int main() {
         memset(&ev, 0, sizeof(ev));
         int ne = r->eval(&ctx, &ev);
         for (int e = 0; e < ne; ++e) {
-          // Task 3 在此插入去重/配额仲裁
-          ev_write(msg.seq, fm.ts_ns, ev.name, ev.strength);
-          ++n_ev;
+          if (quota.allow(msg.seq, fm.ts_ns, ev.name)) {
+            ev_write(msg.seq, fm.ts_ns, ev.name, ev.strength);
+            ++n_ev;
+          }
         }
       }
       // ctx-dump (对拍夹具; 布局钉死见 SDD ledger pre-flight)
@@ -332,6 +275,7 @@ int main() {
         FILE* f = fopen(pf, "wb");
         if (f) {
           uint32_t magic = 0x53505431, flags = 0;
+          uint32_t cur = (er.head + SP_RULE_HIST - 1) % SP_RULE_HIST;
           fwrite(&magic, 4, 1, f);
           fwrite(&ctx.abi_ver, 4, 1, f);
           fwrite(&flags, 4, 1, f);
@@ -342,13 +286,15 @@ int main() {
           fwrite(&ctx.n_hist, 4, 1, f);
           fwrite(&ctx.ego, sizeof(sp_ego_state), 1, f);
           fwrite(cur_det, sizeof(sp_trk), nd, f);
-          for (uint32_t i = 0; i < hd; ++i) {
-            fwrite(&he[i], sizeof(sp_ego_state), 1, f);
-            fwrite(&ht[i], 8, 1, f);
-            fwrite(&hn[i], 4, 1, f);
-            uint32_t pad = 0;
+          for (uint32_t i = 0; i < ctx.n_hist; ++i) {
+            uint32_t ix = (cur + SP_RULE_HIST - i) % SP_RULE_HIST;
+            fwrite(&er.ego[ix], sizeof(sp_ego_state), 1, f);
+            int64_t t8 = er.ts[ix];
+            uint32_t n4 = er.n[ix], pad = 0;
+            fwrite(&t8, 8, 1, f);
+            fwrite(&n4, 4, 1, f);
             fwrite(&pad, 4, 1, f);
-            fwrite(hdp[i], sizeof(sp_trk), hn[i], f);
+            fwrite(er.det[ix], sizeof(sp_trk), n4, f);
           }
           fclose(f);
         }
@@ -356,15 +302,22 @@ int main() {
       n_ctx += 1;
       if (++hb % (unsigned long long)(hz * 60) == 0)
         fprintf(stderr,
-                "trigger: hb seq=%llu ctx=%llu events=%llu rules=%d\n",
-                (unsigned long long)last_seq, n_ctx, n_ev, nrules);
+                "trigger: hb seq=%llu ctx=%llu events=%llu supp=%llu "
+                "rules=%d\n",
+                (unsigned long long)last_seq, n_ctx, n_ev,
+                quota.suppressed, nrules);
+    } else if (got) {
+      ++n_skip;  // seq 未前进 / LATCH 帧 / 撕裂重试耗尽
     }
     if (g_stop.load()) break;
     std::this_thread::sleep_until(next_tick);
-    if (std::chrono::steady_clock::now() - next_tick > std::chrono::seconds(2))
+    if (std::chrono::steady_clock::now() - next_tick >
+        std::chrono::seconds(2))
       next_tick = std::chrono::steady_clock::now();  // 追不上就重置节拍
   }
-  fprintf(stderr, "trigger: stop (ctx=%llu events=%llu)\n", n_ctx, n_ev);
+  fprintf(stderr,
+          "trigger: stop (ctx=%llu events=%llu suppressed=%llu skip=%llu)\n",
+          n_ctx, n_ev, quota.suppressed, n_skip);
   if (g_ev) fclose(g_ev);
   rule_unload_all();
   return 0;

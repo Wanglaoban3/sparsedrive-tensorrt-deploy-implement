@@ -3,12 +3,14 @@ board, run, print output. Usage:
 
   set BOARD_HOST=...&& set BOARD_PASS=...&& python deploy\\_m9a_boardtest.py test_rule_load [args...]
 
-Deps pushed: sp_rule.h sp_ruleload.h sp_result.h postproc.h
-sp_rule_template.c (rule fixtures compile at test runtime). Binaries go to
-/usr/local/bin (/opt/m0 is noexec). Exit code = board-side test's exit code.
+Deps pushed: sp_rule.h sp_ruleload.h sp_rule_util.h sp_quota.h sp_egoring.h
+sp_result.h postproc.h + rules/*.c (rule fixtures compile at test runtime).
+Binaries go to /usr/local/bin (/opt/m0 is noexec). Exit code = board-side
+test's exit code.
 """
 import os
 import sys
+import glob
 
 import paramiko
 
@@ -16,8 +18,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PREPOST = os.path.join(ROOT, "deploy", "prepost")
 BDIR = "/opt/m0/trt-dev/prepost"
 BIN = "/usr/local/bin"
-DEPS = ["sp_rule.h", "sp_ruleload.h", "sp_result.h", "postproc.h",
-        "sp_rule_template.c"]
+DEPS = ["sp_rule.h", "sp_ruleload.h", "sp_rule_util.h", "sp_quota.h",
+        "sp_egoring.h", "sp_result.h", "postproc.h", "sp_rule_template.c"]
 
 
 def main():
@@ -42,6 +44,9 @@ def main():
     sftp = cli.open_sftp()
     for f in DEPS + [name + ".cpp"]:
         sftp.put(os.path.join(PREPOST, f), BDIR + "/" + f)
+    run("mkdir -p %s/rules" % BDIR)
+    for f in glob.glob(os.path.join(PREPOST, "rules", "*.c")):
+        sftp.put(f, BDIR + "/rules/" + os.path.basename(f))
     sftp.close()
     build = ("cd %s && g++ -O2 -std=c++14 -Wall -Wextra -pthread %s.cpp "
              "-o %s -lrt -ldl && cp -f %s %s/%s"

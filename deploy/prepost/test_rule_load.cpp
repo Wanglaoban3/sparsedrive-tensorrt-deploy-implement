@@ -1,12 +1,14 @@
-// test_rule_load.cpp — M9a Task 1 RED/GREEN: 规则插件 ABI + 加载器.
-// 断言见 main() PASS 1..6; 退出码 0 = 全过.
-// 规则夹具在板上运行时用 g++ -shared 现编 (模板 + 坏 ABI + 额外规则).
+// test_rule_load.cpp — M9a Task 1/3 RED/GREEN: 规则插件 ABI + 加载器 +
+// L1 规则移植 + 去重/配额. 断言见 main() PASS 1..8; 退出码 0 = 全过.
+// 规则夹具在板上运行时用 g++ -shared 现编 (模板 + 坏 ABI + 额外规则 + L1 组).
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 
 #include "sp_rule.h"
 #include "sp_ruleload.h"
+#include "sp_quota.h"
+#include "sp_egoring.h"
 
 static const char* kBadAbiSrc =
     "#include \"sp_rule.h\"\n"
@@ -147,5 +149,144 @@ int main() {
   }
 
   printf("== %d/4 ==\n", passed);
-  return passed == 4 ? 0 : 1;
+  int ok4 = passed == 4;
+
+  // ================= Task 3: L1 规则移植 + 去重/配额 =================
+  int passed3 = 0;
+  // ---- Case 5: hard_brake 合成减速序列触发, strength = min(1, 4/5) ----
+  {
+    // 编译 L1 规则组 (deploy/prepost/rules/*.c 已被 driver push)
+    system("rm -rf /tmp/m9a_t3 && mkdir -p /tmp/m9a_t3/rules");
+    int n1 = system("for f in /opt/m0/trt-dev/prepost/rules/*.c; do "
+                    "g++ -shared -fPIC -I/opt/m0/trt-dev/prepost $f "
+                    "-o /tmp/m9a_t3/rules/$(basename $f .c).so || exit 1; "
+                    "done");
+    f = fopen("/tmp/m9a_t3/thr.conf", "w");
+    fputs("[hard_brake]\nacc_thr=-3.0\ndur_s=0.5\n", f);
+    fclose(f);
+    if (n1 != 0) {
+      printf("FAIL 5 (rule compile)\n");
+      return 1;
+    }
+    int n = rule_rescan("/tmp/m9a_t3/rules", "/tmp/m9a_t3/thr.conf");
+    // 合成减速: dt=0.1s, speed 每帧 -0.4 (acc=-4), l2g 沿 x 前进
+    Egoring er;
+    int hb_idx = -1;
+    sp_rule_desc* hb = 0;
+    for (int i = 0; i < n; ++i)
+      if (strcmp(rule_at(i)->name, "hard_brake") == 0) hb = rule_at(i);
+    if (!hb) {
+      printf("FAIL 5 (hard_brake not loaded, n=%d)\n", n);
+      return 1;
+    }
+    double x = 0;
+    for (int i = 0; i < 12; ++i) {
+      double l2g[16] = {0};
+      l2g[0] = 1; l2g[5] = 1; l2g[10] = 1; l2g[15] = 1;
+      l2g[3] = x;
+      TrigFrameLite fr{100 + i, 0, (int64_t)(1e9 * i * 0.1), l2g};
+      er.push_frame(fr, 0, 0);
+      x += (5.0 - 0.4 * i) * 0.1;  // 本帧速度决定本帧位移
+      sp_frame_ctx ctx;
+      er.build_ctx(&ctx, 0);
+      sp_rule_event ev;
+      memset(&ev, 0, sizeof(ev));
+      if (hb->eval(&ctx, &ev) > 0 && hb_idx < 0) {
+        hb_idx = i;
+        if (strcmp(ev.name, "hard_brake") != 0 ||
+            ev.strength < 0.799f || ev.strength > 0.801f) {
+          printf("FAIL 5 (name=%s str=%f)\n", ev.name, (double)ev.strength);
+          return 1;
+        }
+      }
+    }
+    if (hb_idx >= 0) { printf("PASS 5 (hard_brake at i=%d, str=0.8)\n", hb_idx); ++passed3; }
+    else printf("FAIL 5 (never fired)\n");
+    rule_unload_all();
+  }
+
+  // ---- Case 6: 配额/去重 (sp_quota.h): 冷却窗 / 事件类型配额 / 全局预算 ----
+  {
+    Quota q;  // 默认 dedup 5s, per-event 12/min, global 15/min
+    int64_t t0 = (int64_t)1e9 * 1000;
+    int a1 = q.allow(1, t0, "hard_brake");
+    int a2 = q.allow(2, t0 + (int64_t)3e9, "hard_brake");   // 冷却窗内 → 吞
+    int a3 = q.allow(3, t0 + (int64_t)3e9, "hard_accel");   // 异名 → 过
+    Quota g;
+    g.global_per_min = 2;
+    int g1 = g.allow(1, t0, "e1");
+    int g2 = g.allow(2, t0 + (int64_t)1e9, "e2");
+    int g3 = g.allow(3, t0 + (int64_t)2e9, "e3");           // 全局超 → 吞
+    Quota p;
+    p.per_event_per_min = 2;
+    p.dedup_window_s = 1.0;
+    int p1 = p.allow(1, t0, "same");
+    int p2 = p.allow(2, t0 + (int64_t)2e9, "same");         // 出冷却窗 → 过
+    int p3 = p.allow(3, t0 + (int64_t)4e9, "same");         // 类型配额 → 吞
+    int ok = a1 == 1 && a2 == 0 && a3 == 1 && q.suppressed == 1 &&
+             g1 == 1 && g2 == 1 && g3 == 0 && g.suppressed == 1 &&
+             p1 == 1 && p2 == 1 && p3 == 0 && p.suppressed == 1;
+    if (ok) { printf("PASS 6 (quota dedup+per-event+global)\n"); ++passed3; }
+    else printf("FAIL 6 (a=%d,%d,%d,%d g=%d,%d,%d,%llu p=%d,%d,%d,%llu)\n",
+                a1, a2, a3, q.suppressed, g1, g2, g3,
+                (unsigned long long)g.suppressed, p1, p2, p3,
+                (unsigned long long)p.suppressed);
+  }
+
+  // ---- Case 7: 场景边界 l2g 阶跃 → ego 清零不差分, 无假事件 ----
+  {
+    Egoring er;
+    // 场景 0: 匀速直行 8 帧 (speed=5)
+    double x = 0;
+    for (int i = 0; i < 8; ++i) {
+      double l2g[16] = {0};
+      l2g[0] = 1; l2g[5] = 1; l2g[10] = 1; l2g[15] = 1;
+      l2g[3] = x;
+      TrigFrameLite fr{200 + i, 0, (int64_t)(1e9 * i * 0.1), l2g};
+      er.push_frame(fr, 0, 0);
+      x += 0.5;
+    }
+    // 场景 1 首帧: l2g 阶跃 1000m (跨场景重定位)
+    double lg2[16] = {0};
+    lg2[0] = 1; lg2[5] = 1; lg2[10] = 1; lg2[15] = 1; lg2[3] = x + 1000;
+    TrigFrameLite fr{208, 1, (int64_t)(1e9 * 8 * 0.1), lg2};
+    er.push_frame(fr, 0, 0);
+    sp_frame_ctx ctx;
+    er.build_ctx(&ctx, 0);
+    int ok = ctx.n_hist == 1 && ctx.ego.speed == 0 && ctx.ego.acc == 0 &&
+             ctx.ego.yaw_rate == 0;
+    if (ok) { printf("PASS 7 (scene jump neutralized)\n"); ++passed3; }
+    else printf("FAIL 7 (n_hist=%u speed=%f)\n", ctx.n_hist,
+                (double)ctx.ego.speed);
+  }
+
+  // ---- Case 8: LATCH 帧 (status!=0) 规则不评 ----
+  {
+    int n = rule_rescan("/tmp/m9a_t3/rules", "/tmp/m9a_t3/thr.conf");
+    sp_rule_desc* hb = 0;
+    for (int i = 0; i < n; ++i)
+      if (strcmp(rule_at(i)->name, "hard_brake") == 0) hb = rule_at(i);
+    Egoring er;
+    double x = 0;
+    for (int i = 0; i < 12; ++i) {  // 同 case 5 的减速序列
+      double l2g[16] = {0};
+      l2g[0] = 1; l2g[5] = 1; l2g[10] = 1; l2g[15] = 1;
+      l2g[3] = x;
+      TrigFrameLite fr{300 + i, 0, (int64_t)(1e9 * i * 0.1), l2g};
+      er.push_frame(fr, 0, 0);
+      x += (5.0 - 0.4 * i) * 0.1;
+    }
+    sp_frame_ctx ctx;
+    er.build_ctx(&ctx, 0);
+    ctx.status = 2;  // LATCH
+    sp_rule_event ev;
+    memset(&ev, 0, sizeof(ev));
+    int ne = hb->eval(&ctx, &ev);
+    if (ne == 0) { printf("PASS 8 (latch not evaluated)\n"); ++passed3; }
+    else printf("FAIL 8 (ne=%d)\n", ne);
+    rule_unload_all();
+  }
+
+  printf("== task1 %d/4, task3 %d/4 ==\n", ok4, passed3);
+  return (ok4 && passed3 == 4) ? 0 : 1;
 }
