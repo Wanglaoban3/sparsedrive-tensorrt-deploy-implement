@@ -229,7 +229,7 @@ v1.0-mini 元数据。回放源吃 **manifest json**(每帧:6 路 NV12 路径 +
       forced=0 零回收, GR3D 稳态 p50=99%。口径注意: 事件链 gpu_ms 含
       队列等待(饱和时 ≈2×单帧服务), 延迟(节拍跑)与吞吐(不限速跑)分开测。
       文件: sp_modelnode.cpp(重写) + board_m1.py m3(--graph/--serial/
-      --fps/--fetch log/--loop) + _probe_m4_report.py |
+      --fps/--fetch log/--loop) + deploy/_probe_m4_report.py |
 | 算子库收尾 ✅ **完成**(2026-10-04) | Q1 det decode + Q2 阈值参数化 +
       Q3 map decode(postproc.h; **口径逐位对齐离线评测脚本**
       eval_t6_mini_v8 / eval_t6_mini_map: sigmoid → 摊平 9000 稳定
@@ -249,7 +249,7 @@ v1.0-mini 元数据。回放源吃 **manifest json**(每帧:6 路 NV12 路径 +
       JSON 旁路仅验证跑(+5.9ms); flags=127(source_ok+6 路 cam_ok)
       端到端可见。文件: postproc.h + sp_result.h + sp_resultmon.cpp +
       sp_modelnode.cpp(--det-thr/--map-thr/--det-topk/--mailbox) +
-      _probe_decode_check.py |
+      deploy/_probe_decode_check.py |
 | DLA 实验 ✅ **完成**(2026-10-04; 用户批准的一次全量构建尝试) |
       结论: **本模型/本栈 DLA 离载不可行, 该优化杠杆关闭**。三级证据:
       (1) 全图 e_T6 trtexec --useDLACore=0 --allowGPUFallback:
