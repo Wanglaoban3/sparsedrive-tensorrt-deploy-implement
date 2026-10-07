@@ -1,0 +1,19 @@
+[Unit]
+Description=SP trigger — L1 rule mining on mailbox %i (M9a, CPU, read-only)
+# 只读 sp_result_%i 信箱, 不依赖 filesrc/node 存活 (attach 轮询等待);
+# 崩溃重启 = 数据飞轮暂停, 关键链无感 (spec §6)
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sp/trigger.env
+UMask=0027
+ExecStart=/usr/local/bin/sp_trigger
+Restart=on-failure
+RestartSec=1s
+StandardOutput=append:/var/log/sp/trigger-%i.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

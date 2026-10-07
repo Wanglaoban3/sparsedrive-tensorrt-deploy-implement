@@ -1,0 +1,371 @@
+// sp_trigger.cpp — M9a: L1 规则触发器宿主 (CPU, 只读结果信箱, 零 GPU/DLA).
+// spec: docs/superpowers/specs/2026-10-06-m9-multimodel-dla-design.md §4/§4.2.
+// 10Hz tick: 读 sp_result_<ring> 信箱 (seqlock) → 按 seq join manifest 取
+// l2g/ts → 差分 ego 运动学 (events.py human_ego_track 口径, 时间窗按 ts
+// 实差) → 组 sp_frame_ctx (64 帧历史环) → 逐规则 eval → 去重/配额 (Task 3)
+// → events.jsonl (10MB×5 轮转). ctx-dump 模式落逐 tick 二进制夹具 (§7.5).
+// 故障域 (spec §6): 本进程崩溃只暂停数据飞轮, systemd 拉起, 关键链无感.
+#include <errno.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "sp_result.h"
+#include "sp_rule.h"
+#include "sp_ruleload.h"
+
+static std::atomic<int> g_stop{0};
+static std::atomic<int> g_rescan{0};
+static void on_term(int) { g_stop.store(1); }
+static void on_hup(int) { g_rescan.store(1); }
+
+static std::string env_s(const char* k, const char* dflt) {
+  const char* e = getenv(k);
+  return e && e[0] ? e : dflt;
+}
+static double env_d(const char* k, double dflt) {
+  const char* e = getenv(k);
+  return e && e[0] ? atof(e) : dflt;
+}
+
+// ---------- 迷你 manifest 读取 (只取 ts_ns/scene/l2g; 键序与节点同源) ----------
+struct TrigFrame {
+  uint64_t ts_ns;
+  uint32_t scene;
+  double l2g[16];
+};
+
+static const char* jump_num(const char* p) {  // 跳过空白/逗号/引号/冒号
+  while (*p && (*p == ' ' || *p == '\t' || *p == ':' || *p == ',' ||
+                *p == '"' || *p == '['))
+    ++p;
+  return p;
+}
+
+static bool parse_manifest_min(const char* path, std::vector<TrigFrame>* out) {
+  FILE* f = fopen(path, "rb");
+  if (!f) return false;
+  std::string all;
+  char buf[65536];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) all.append(buf, n);
+  fclose(f);
+  size_t pos = all.find('\n');  // 首行是 header
+  if (pos == std::string::npos) return false;
+  while (pos < all.size()) {
+    size_t eol = all.find('\n', pos + 1);
+    if (eol == std::string::npos) eol = all.size();
+    std::string line = all.substr(pos, eol - pos);
+    pos = eol;
+    if (line.size() < 3) continue;
+    TrigFrame fm;
+    memset(&fm, 0, sizeof(fm));
+    size_t k = line.find("\"ts_ns\"");
+    if (k == std::string::npos) return false;
+    fm.ts_ns = strtoull(jump_num(line.c_str() + k + 7), 0, 10);
+    k = line.find("\"scene\"");
+    if (k == std::string::npos) return false;
+    fm.scene = (uint32_t)strtoul(jump_num(line.c_str() + k + 7), 0, 10);
+    k = line.find("\"l2g\"");
+    if (k == std::string::npos) return false;
+    const char* p = jump_num(line.c_str() + k + 5);
+    for (int i = 0; i < 16; ++i) {
+      fm.l2g[i] = strtod(p, 0);
+      p = jump_num(p);
+    }
+    out->push_back(fm);
+  }
+  return !out->empty();
+}
+
+// ---------- 事件流 (jsonl, 10MB×5 轮转) ----------
+static const size_t kEvRotateBytes = 10ull * 1024 * 1024;
+static FILE* g_ev = 0;
+static std::string g_ev_path;
+static unsigned long long g_ev_total = 0;
+
+static void ev_open(const std::string& path) {
+  g_ev_path = path;
+  g_ev = fopen(path.c_str(), "a");
+}
+
+static void ev_rotate() {
+  if (!g_ev) return;
+  fclose(g_ev);
+  g_ev = 0;
+  for (int i = 4; i >= 1; --i) {
+    std::string src = g_ev_path + (i == 1 ? "" : "." + std::to_string(i - 1));
+    std::string dst = g_ev_path + "." + std::to_string(i);
+    if (i == 1) src = g_ev_path;
+    rename(src.c_str(), dst.c_str());
+  }
+  g_ev = fopen(g_ev_path.c_str(), "a");
+}
+
+static void ev_write(uint64_t seq, int64_t ts_ns, const char* name,
+                     float strength) {
+  if (!g_ev) return;
+  fprintf(g_ev,
+          "{\"ts_ns\":%lld,\"seq\":%llu,\"event\":\"%s\",\"strength\":%.6f}\n",
+          (long long)ts_ns, (unsigned long long)seq, name, (double)strength);
+  g_ev_total += 1;
+  if (ftell(g_ev) > (long)kEvRotateBytes) {
+    ev_rotate();
+    fprintf(stderr, "trigger: events.jsonl rotated (%llu total)\n",
+            g_ev_total);
+  }
+}
+
+// ---------- 历史环 ----------
+struct HistRing {
+  sp_trk det[SP_RULE_HIST][sp::res::kDetCap];
+  uint32_t n[SP_RULE_HIST];
+  sp_ego_state ego[SP_RULE_HIST];
+  int64_t ts[SP_RULE_HIST];
+  uint32_t scene[SP_RULE_HIST];
+  int head = 0;        // 下一写入槽
+  uint32_t depth = 0;  // 有效帧数 (<= SP_RULE_HIST)
+
+  void reset() { head = 0; depth = 0; }
+  void push(const sp_trk* d, uint32_t nd, const sp_ego_state& eg, int64_t t,
+            uint32_t sc) {
+    n[head] = nd;
+    if (nd) memcpy(det[head], d, nd * sizeof(sp_trk));
+    ego[head] = eg;
+    ts[head] = t;
+    scene[head] = sc;
+    head = (head + 1) % SP_RULE_HIST;
+    if (depth < SP_RULE_HIST) depth += 1;
+  }
+};
+
+int main() {
+  umask(0027);
+  signal(SIGTERM, on_term);
+  signal(SIGINT, on_term);
+  signal(SIGHUP, on_hup);
+  signal(SIGPIPE, SIG_IGN);
+
+  const std::string ring = env_s("SP_TRIG_RING", "m3");
+  const double hz = env_d("SP_TRIG_HZ", 10.0);
+  const std::string man_path = env_s(
+      "SP_TRIG_MANIFEST", "/opt/m0/trt-dev/nv12_r0/manifest.jsonl");
+  const std::string rules_dir =
+      env_s("SP_TRIG_RULES_DIR", "/usr/local/share/sp/rules");
+  const std::string thr_path = env_s("SP_TRIG_THR", "/etc/sp/thr.conf");
+  const std::string out_dir = env_s("SP_TRIG_OUT", "/var/lib/sp/trigger");
+  const bool ctx_dump = env_d("SP_TRIG_CTX_DUMP", 0) != 0;
+
+  std::vector<TrigFrame> man;
+  if (!parse_manifest_min(man_path.c_str(), &man)) {
+    fprintf(stderr, "trigger: manifest parse failed: %s\n", man_path.c_str());
+    return 2;
+  }
+  const size_t nman = man.size();
+  fprintf(stderr, "trigger: manifest %s (%zu frames)\n", man_path.c_str(),
+          nman);
+
+  mkdir(out_dir.c_str(), 0750);  // 只管新建; 已存在不动 (Phase D 口径)
+  if (ctx_dump) {
+    std::string cd = out_dir + "/ctx";
+    mkdir(cd.c_str(), 0750);
+  }
+  ev_open(out_dir + "/events.jsonl");
+  if (!g_ev) {
+    fprintf(stderr, "trigger: cannot open %s/events.jsonl\n", out_dir.c_str());
+    return 2;
+  }
+
+  // 信箱附着: 下游先于节点启动是常态, 轮询等
+  sp::res::Mailbox* mb = 0;
+  while (!mb && !g_stop.load()) {
+    char err[256] = {0};
+    mb = sp::res::Mailbox::attach(("sp_result_" + ring).c_str(), err,
+                                  sizeof(err));
+    if (!mb) {
+      fprintf(stderr, "trigger: mailbox wait (%s)\n", err);
+      for (int i = 0; i < 50 && !g_stop.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+  if (!mb) return 0;
+  fprintf(stderr, "trigger: mailbox sp_result_%s attached\n", ring.c_str());
+
+  char serr[256] = {0};
+  int nrules = rule_scan(rules_dir.c_str(), thr_path.c_str(), 0, 256, serr,
+                         sizeof(serr));
+  fprintf(stderr, "trigger: %d rules, tick=%.1fHz, ctx_dump=%d\n", nrules,
+          hz, (int)ctx_dump);
+
+  HistRing ringh;
+  uint64_t last_seq = 0;
+  unsigned long long n_ctx = 0, n_ev = 0;
+  sp_trk cur_det[sp::res::kDetCap];
+
+  auto tick_period = std::chrono::microseconds((int)(1e6 / (hz > 0 ? hz : 10)));
+  auto next_tick = std::chrono::steady_clock::now();
+  unsigned long long hb = 0;
+
+  while (!g_stop.load()) {
+    next_tick += tick_period;
+    if (g_rescan.exchange(0)) {
+      nrules = rule_rescan(rules_dir.c_str(), thr_path.c_str());
+      fprintf(stderr, "trigger: rescan -> %d rules\n", nrules);
+    }
+    sp::res::ResultMsg msg;
+    bool got = mb->read_latest(&msg);
+    if (got && msg.magic == sp::res::kMagic && msg.seq != last_seq &&
+        msg.status == sp::res::kStatusNominal) {
+      // 跳变: seq 倒退 = 发布端重灌 → 历史作废重建
+      if (last_seq && msg.seq < last_seq) ringh.reset();
+      last_seq = msg.seq;
+      // manifest join: seq 1-based; filesrc 按 seq s 携带 manifest[(s-1)%nman]
+      const TrigFrame& fm = man[(msg.seq - 1) % nman];
+      // 场景边界: 上一个已处理帧的 scene 存在环里, 直接比
+      // (l2g 跨场景跳变会差分出假尖峰 → 清历史, 本帧速度置零)
+      bool scene_switch =
+          ringh.depth > 0 && fm.scene != ringh.scene[ringh.head == 0
+                                                        ? SP_RULE_HIST - 1
+                                                        : ringh.head - 1];
+      // ego 运动学 (events.py human_ego_track 的流式版)
+      sp_ego_state eg;
+      memset(&eg, 0, sizeof(eg));
+      eg.x = (float)fm.l2g[3];
+      eg.y = (float)fm.l2g[7];
+      eg.heading = (float)atan2(fm.l2g[4], fm.l2g[0]);
+      uint32_t prev_idx = (ringh.head + SP_RULE_HIST - 1) % SP_RULE_HIST;
+      if (ringh.depth == 0 || scene_switch) {
+        ringh.reset();  // 历史清零, 本帧为窗口首帧
+      } else if (ringh.ts[prev_idx] != 0) {
+        double dt = (double)(fm.ts_ns - ringh.ts[prev_idx]) / 1e9;
+        if (dt > 0 && dt < 10.0) {
+          double dx = fm.l2g[3] - (double)ringh.ego[prev_idx].x;
+          double dy = fm.l2g[7] - (double)ringh.ego[prev_idx].y;
+          double mid = 0.5 * ((double)ringh.ego[prev_idx].heading + eg.heading);
+          eg.speed = (float)((dx * cos(mid) + dy * sin(mid)) / dt);
+          eg.acc = (float)((eg.speed - (double)ringh.ego[prev_idx].speed) / dt);
+          double dh = eg.heading - (double)ringh.ego[prev_idx].heading;
+          while (dh > M_PI) dh -= 2 * M_PI;
+          while (dh < -M_PI) dh += 2 * M_PI;
+          eg.yaw_rate = (float)(dh / dt);
+        } else {
+          ringh.reset();  // ts 异常 (回退/长停) → 窗口重建
+        }
+      }
+      // 检出转换 (DetBox 与 sp_trk 字段序不同, 逐字段拷贝)
+      uint32_t nd = msg.n_det > sp::res::kDetCap ? sp::res::kDetCap
+                                                 : msg.n_det;
+      for (uint32_t i = 0; i < nd; ++i) {
+        const sp::res::DetBox& d = msg.det[i];
+        cur_det[i].score = d.score;
+        cur_det[i].label = d.label;
+        cur_det[i].id = d.id;
+        cur_det[i].x = d.x;
+        cur_det[i].y = d.y;
+        cur_det[i].z = d.z;
+        cur_det[i].w = d.w;
+        cur_det[i].l = d.l;
+        cur_det[i].h = d.h;
+        cur_det[i].yaw = d.yaw;
+        cur_det[i].vx = d.vx;
+        cur_det[i].vy = d.vy;
+      }
+      ringh.push(cur_det, nd, eg, fm.ts_ns, fm.scene);
+      // ctx 组装: hist[i] = i 帧前 (含当前); 环形索引翻转, 逐帧拷贝最直白
+      uint32_t hd = ringh.depth;
+      static thread_local sp_ego_state he[SP_RULE_HIST];
+      static thread_local int64_t ht[SP_RULE_HIST];
+      static thread_local uint32_t hn[SP_RULE_HIST];
+      static thread_local sp_trk* hdp[SP_RULE_HIST];
+      for (uint32_t i = 0; i < hd; ++i) {
+        uint32_t ix = (ringh.head + SP_RULE_HIST - 1 - i) % SP_RULE_HIST;
+        he[i] = ringh.ego[ix];
+        ht[i] = ringh.ts[ix];
+        hn[i] = ringh.n[ix];
+        hdp[i] = ringh.det[ix];
+      }
+      sp_frame_ctx ctx;
+      memset(&ctx, 0, sizeof(ctx));
+      ctx.abi_ver = SP_RULE_ABI;
+      ctx.seq = msg.seq;
+      ctx.ts_ns = fm.ts_ns;
+      ctx.scene = fm.scene;
+      ctx.ego = eg;
+      ctx.det = cur_det;
+      ctx.n_det = nd;
+      ctx.n_hist = hd;
+      ctx.hist_det = (const sp_trk* const*)hdp;
+      ctx.hist_n = hn;
+      ctx.hist_ego = he;
+      ctx.hist_ts = ht;
+      ctx.final_plan = &msg.final_plan[0][0];
+      ctx.status = msg.status;
+      // 规则评估
+      for (int i = 0; i < nrules; ++i) {
+        sp_rule_desc* r = rule_at(i);
+        if (!r) continue;
+        sp_rule_event ev;
+        memset(&ev, 0, sizeof(ev));
+        int ne = r->eval(&ctx, &ev);
+        for (int e = 0; e < ne; ++e) {
+          // Task 3 在此插入去重/配额仲裁
+          ev_write(msg.seq, fm.ts_ns, ev.name, ev.strength);
+          ++n_ev;
+        }
+      }
+      // ctx-dump (对拍夹具; 布局钉死见 SDD ledger pre-flight)
+      if (ctx_dump) {
+        char pf[512];
+        snprintf(pf, sizeof(pf), "%s/ctx/ctx_%05llu.bin", out_dir.c_str(),
+                 (unsigned long long)n_ctx);
+        FILE* f = fopen(pf, "wb");
+        if (f) {
+          uint32_t magic = 0x53505431, flags = 0;
+          fwrite(&magic, 4, 1, f);
+          fwrite(&ctx.abi_ver, 4, 1, f);
+          fwrite(&flags, 4, 1, f);
+          fwrite(&ctx.seq, 8, 1, f);
+          fwrite(&ctx.ts_ns, 8, 1, f);
+          fwrite(&ctx.scene, 4, 1, f);
+          fwrite(&ctx.n_det, 4, 1, f);
+          fwrite(&ctx.n_hist, 4, 1, f);
+          fwrite(&ctx.ego, sizeof(sp_ego_state), 1, f);
+          fwrite(cur_det, sizeof(sp_trk), nd, f);
+          for (uint32_t i = 0; i < hd; ++i) {
+            fwrite(&he[i], sizeof(sp_ego_state), 1, f);
+            fwrite(&ht[i], 8, 1, f);
+            fwrite(&hn[i], 4, 1, f);
+            uint32_t pad = 0;
+            fwrite(&pad, 4, 1, f);
+            fwrite(hdp[i], sizeof(sp_trk), hn[i], f);
+          }
+          fclose(f);
+        }
+      }
+      n_ctx += 1;
+      if (++hb % (unsigned long long)(hz * 60) == 0)
+        fprintf(stderr,
+                "trigger: hb seq=%llu ctx=%llu events=%llu rules=%d\n",
+                (unsigned long long)last_seq, n_ctx, n_ev, nrules);
+    }
+    if (g_stop.load()) break;
+    std::this_thread::sleep_until(next_tick);
+    if (std::chrono::steady_clock::now() - next_tick > std::chrono::seconds(2))
+      next_tick = std::chrono::steady_clock::now();  // 追不上就重置节拍
+  }
+  fprintf(stderr, "trigger: stop (ctx=%llu events=%llu)\n", n_ctx, n_ev);
+  if (g_ev) fclose(g_ev);
+  rule_unload_all();
+  return 0;
+}
