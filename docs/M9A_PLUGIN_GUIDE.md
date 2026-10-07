@@ -24,6 +24,8 @@ sp_result_m3 信箱(只读) ──> sp_trigger (10Hz tick)
 
 ```c
 typedef struct { float x,y,heading,speed,acc,yaw_rate; } sp_ego_state;
+// heading 是连续 unwrap 值 (跨 ±π 不翻侧, 终审 C1); 做角度差仍须 wrap_pi,
+// 不要拿相邻两帧 heading 直接相减判"转角"
 typedef struct { float score; int32_t label,id;
                  float x,y,z,w,l,h,yaw,vx,vy; } sp_trk;   // ego 系, x 前向
 typedef struct { char name[32]; float strength; } sp_rule_event;

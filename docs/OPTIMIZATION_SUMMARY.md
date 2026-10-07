@@ -1566,5 +1566,19 @@ events.jsonl（10MB×5 轮转）。SDD 六任务（plan c9463b5，TDD RED→GREE
 
 插件开发五分钟上手 + 7 条常见死法表见 `docs/M9A_PLUGIN_GUIDE.md`；
 板端安装 = `python deploy\_prod_install.py m3`（规则源 push→板上编译
-15 个 .so→/usr/local/share/sp/rules，三单元 enable --now + 健康断言）。
-常驻态：三单元 active + SELFTEST PASS + trigger 15 规则 hb 前进。
+14 个 .so→/usr/local/share/sp/rules，三单元 enable --now + 健康断言）。
+常驻态：三单元 active + SELFTEST PASS + trigger 14 规则 hb 前进。
+
+### 终审修复轮（2026-10-07，fresh reviewer NEEDS_FIX → 4/4 修复 + 复验绿）
+
+| 项 | 问题 | 修复 | 复验 |
+|---|---|---|---|
+| C1 (Critical) | sp_egoring heading 存裸 atan2，±π 边界速度投影中点角偏差 π → speed 翻负/假 reverse（交付夹具 950 帧实证 24 处 speed≈-3.6~-3.9） | push_frame 存连续 unwrap 值 `prev+wrap_pi(raw-prev)`；yaw/u_turn 的 wrap_pi 差分不变；ctx 布局不变 | 重跑 parity 950 tick/2908 事件集合全等 + _m9a_unwrap_check 翻负帧 **24→0** |
+| I1 | lead_hard_brake 用 min(vx)≤-3 = "检测目标倒车"（vx 带符号；上游 events.py 原式因 speed 非负恒真退化） | 改 vx 差分减速序列 + sustained 0.3s（plan 契约口径），rule v1.1.0 + numpy 镜像同步 + thr.conf 补 dur_s | parity 集合全等（两侧同式） |
+| I2 | install 只 push 部分 m9a 源（编板上陈旧副本）、直写运行中二进制（ETXTBSY）、编译失败不断言 | push 闭包全量（7 头+cpp+14 规则）、.tmp+mv 原子替换、RULES_BUILD_OK/TRIGGER_BUILD_OK/数量断言、uninstall 扩展 trigger 全家 | 修后 install 跑通：`rules: 14 .so == 14 .c` + `TRIGGER_BUILD_OK` + INSTALL_HEALTHY |
+| I3 | AGENTS.md 缺 M9a 条目 | 已补交付条目+8 条坑（含 C1/I1 修法） | — |
+| 连带 | ①模板 demo_speed_high.so 曾进生产 RULES_DIR（生产加载 demo 凑 15 rules）——install 清出，生产=14 规则 ②test_rule_load 用例 5/7/8 夹具仍按 Task 4 前的 col0 前向合成——90° 修复后空过/假阴（Task 4 后无人复跑暴露），修夹具到 col1 + 用例 7 加跳变前 speed=5 预检 ③parity 驱动曾直写生产二进制路径——改 .parity 后缀 | test_rule_load **8/8**（用例 5 真实触发 i=6 str=0.8） |
+
+门禁复跑：parity PASS + unwrap check PASS + install 端到端 + trigger 重启
+14 规则 + NOMINAL（lage 284ms）。修复轮 commit 见 git log "m9a: review
+fix round"。

@@ -169,7 +169,8 @@ int main() {
       return 1;
     }
     int n = rule_rescan("/tmp/m9a_t3/rules", "/tmp/m9a_t3/thr.conf");
-    // 合成减速: dt=0.1s, speed 每帧 -0.4 (acc=-4), l2g 沿 x 前进
+    // 合成减速: dt=0.1s, speed 每帧 -0.4 (acc=-4). 车前向 = R 第 1 列
+    // (Task 4 90° 装转口径): 位移放 col1 (l2g[7]), heading=atan2(1,0)=pi/2
     Egoring er;
     int hb_idx = -1;
     sp_rule_desc* hb = 0;
@@ -179,14 +180,14 @@ int main() {
       printf("FAIL 5 (hard_brake not loaded, n=%d)\n", n);
       return 1;
     }
-    double x = 0;
+    double y = 0;
     for (int i = 0; i < 12; ++i) {
       double l2g[16] = {0};
       l2g[0] = 1; l2g[5] = 1; l2g[10] = 1; l2g[15] = 1;
-      l2g[3] = x;
+      l2g[7] = y;
       TrigFrameLite fr{100 + i, 0, (int64_t)(1e9 * i * 0.1), l2g};
       er.push_frame(fr, 0, 0);
-      x += (5.0 - 0.4 * i) * 0.1;  // 本帧速度决定本帧位移
+      y += (5.0 - 0.4 * i) * 0.1;  // 本帧速度决定本帧位移
       sp_frame_ctx ctx;
       er.build_ctx(&ctx, 0);
       sp_rule_event ev;
@@ -236,19 +237,28 @@ int main() {
   // ---- Case 7: 场景边界 l2g 阶跃 → ego 清零不差分, 无假事件 ----
   {
     Egoring er;
-    // 场景 0: 匀速直行 8 帧 (speed=5)
-    double x = 0;
+    // 场景 0: 匀速直行 8 帧 (speed=5); 车前向 = R 第 1 列 (col1 口径)
+    double y = 0;
     for (int i = 0; i < 8; ++i) {
       double l2g[16] = {0};
       l2g[0] = 1; l2g[5] = 1; l2g[10] = 1; l2g[15] = 1;
-      l2g[3] = x;
+      l2g[7] = y;
       TrigFrameLite fr{200 + i, 0, (int64_t)(1e9 * i * 0.1), l2g};
       er.push_frame(fr, 0, 0);
-      x += 0.5;
+      y += 0.5;
+    }
+    sp_frame_ctx pre;
+    er.build_ctx(&pre, 0);
+    // 预检: 夹具本身有效 (跳变前速度确为 5, 防夹具静默失效)
+    if (pre.ego.speed < 4.9f || pre.ego.speed > 5.1f) {
+      printf("FAIL 7 (pre speed=%f, fixture broken)\n",
+             (double)pre.ego.speed);
+      rule_unload_all();
+      return 1;
     }
     // 场景 1 首帧: l2g 阶跃 1000m (跨场景重定位)
     double lg2[16] = {0};
-    lg2[0] = 1; lg2[5] = 1; lg2[10] = 1; lg2[15] = 1; lg2[3] = x + 1000;
+    lg2[0] = 1; lg2[5] = 1; lg2[10] = 1; lg2[15] = 1; lg2[7] = y + 1000;
     TrigFrameLite fr{208, 1, (int64_t)(1e9 * 8 * 0.1), lg2};
     er.push_frame(fr, 0, 0);
     sp_frame_ctx ctx;
@@ -267,14 +277,14 @@ int main() {
     for (int i = 0; i < n; ++i)
       if (strcmp(rule_at(i)->name, "hard_brake") == 0) hb = rule_at(i);
     Egoring er;
-    double x = 0;
-    for (int i = 0; i < 12; ++i) {  // 同 case 5 的减速序列
+    double y = 0;
+    for (int i = 0; i < 12; ++i) {  // 同 case 5 的减速序列 (col1 口径)
       double l2g[16] = {0};
       l2g[0] = 1; l2g[5] = 1; l2g[10] = 1; l2g[15] = 1;
-      l2g[3] = x;
+      l2g[7] = y;
       TrigFrameLite fr{300 + i, 0, (int64_t)(1e9 * i * 0.1), l2g};
       er.push_frame(fr, 0, 0);
-      x += (5.0 - 0.4 * i) * 0.1;
+      y += (5.0 - 0.4 * i) * 0.1;
     }
     sp_frame_ctx ctx;
     er.build_ctx(&ctx, 0);

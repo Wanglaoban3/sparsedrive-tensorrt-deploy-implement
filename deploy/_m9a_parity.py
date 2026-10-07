@@ -53,13 +53,15 @@ rc, o, e = run("cd %s/rules && for f in *.c; do g++ -shared -fPIC -I%s $f "
                "-o ${f%%.c}.so || exit 1; done" % (W, BD))
 assert rc == 0, "rule compile failed:\n" + e[-1200:]
 rc, o, e = run("cd %s && g++ -O2 -std=c++14 -Wall -Wextra -pthread "
-               "sp_trigger.cpp -o /usr/local/bin/sp_trigger -lrt -ldl" % BD)
+               "sp_trigger.cpp -o /usr/local/bin/sp_trigger.parity "
+               "-lrt -ldl" % BD)
 assert rc == 0, "trigger build failed:\n" + e[-1200:]
 rc, o, e = run("cd %s && SP_TRIG_RING=m3 SP_TRIG_HZ=10 SP_TRIG_CTX_DUMP=1 "
                "SP_TRIG_RULES_DIR=%s/rules SP_TRIG_THR=%s/thr.conf "
                "SP_TRIG_OUT=%s/out timeout -s TERM %d /usr/local/bin/"
-               "sp_trigger" % (W, W, W, W, int(MIN * 60 + 10)),
+               "sp_trigger.parity" % (W, W, W, W, int(MIN * 60 + 10)),
                t=int(MIN * 60 + 60))
+run("rm -f /usr/local/bin/sp_trigger.parity")
 print(e[-700:])
 
 # 拉回 raw events + thr + (ctx 数量统计)

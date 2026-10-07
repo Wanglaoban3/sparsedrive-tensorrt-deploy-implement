@@ -41,7 +41,8 @@ struct Egoring {
     // 车前向 = R 第 1 列 (l2g[1], l2g[5]): nuScenes LIDAR_TOP 装转 90 度,
     // l2g 是 lidar 位姿, atan2(R10,R00) 给的是 lidar x 轴, 与行驶方向差
     // 90 度 (2026-10-07 板上实测: 位移投影 col0≈0, col1=8.45=hypot)
-    eg.heading = (float)atan2(fr.l2g[5], fr.l2g[1]);
+    double h_raw = atan2(fr.l2g[5], fr.l2g[1]);
+    eg.heading = (float)h_raw;
     uint32_t prev = (head + SP_RULE_HIST - 1) % SP_RULE_HIST;
     if (depth == 0 || scene[prev] != fr.scene) {
       boundary = true;  // 首帧 / 场景切换: 窗口重建, 不差分
@@ -50,6 +51,13 @@ struct Egoring {
       if (!(dt > 0 && dt < 10.0)) {
         boundary = true;  // ts 回退/长停
       } else {
+        // heading 连续 unwrap (终审 C1): 裸 atan2 值域 (-pi,pi], 跨 ±pi
+        // 边界时存裸值会让下方中点角偏差 pi → speed 投影翻负 (交付夹具
+        // 实测 950 帧 24 处) → 假 reverse/acc 尖峰。存连续值; 规则侧
+        // yaw_rate/u_turn 本就走 wrap_pi 差分, 不受影响。
+        eg.heading =
+            (float)((double)ego[prev].heading +
+                    wrap_pi(h_raw - (double)ego[prev].heading));
         double dx = fr.l2g[3] - (double)ego[prev].x;
         double dy = fr.l2g[7] - (double)ego[prev].y;
         double mid = 0.5 * ((double)ego[prev].heading + eg.heading);

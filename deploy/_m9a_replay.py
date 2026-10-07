@@ -104,7 +104,10 @@ def _sustained(vals, ts, thr, ge, dur_s):
 
 
 def _id_series(ctx, tid, want_ts=False):
-    # 镜像 ru_id_series: 最老→当前, 每帧首条 id 匹配, 缺帧跳过
+    # 镜像 ru_id_series: 最老→当前, 每帧首条 id 匹配, 缺帧跳过;
+    # id<0 直接空 (镜像 C 侧守卫, 终审 minor-3)
+    if tid < 0:
+        return ([], [], [], [], [] if want_ts else None)
     sx, sy, svx, svy, sts = [], [], [], [], []
     for i in range(ctx["n_hist"] - 1, -1, -1):
         for d in ctx["hist_det"][i]:
@@ -216,13 +219,21 @@ def r_lead_hard_brake(c, s, thr):
     if li < 0:
         return None
     d = c["det"][li]
-    sx, _, svx, _, _ = _id_series(c, int(d["id"]))
+    _, _, svx, _, sts = _id_series(c, int(d["id"]), want_ts=True)
     if len(svx) < 3:
         return None
+    # 终审 I1: 减速序列 + sustained (镜像 C 侧 1.1.0; 原式检测倒车且
+    # events.py 原式因 speed 非负恒真退化)
+    a = []
+    for i in range(len(svx) - 1):
+        dt = (sts[i + 1] - sts[i]) / 1e9
+        a.append((svx[i + 1] - svx[i]) / dt if dt > 1e-6 else 0.0)
+    vmax = max(svx)
     d0 = math.hypot(float(d["x"]), float(d["y"]))
-    if (d0 < thr["dist_thr"] and min(svx) <= thr["decel_thr"]
-            and max(svx) > thr["v0_thr"]):
-        return min(1.0, -min(svx) / 5.0)
+    if (d0 < thr["dist_thr"] and vmax > thr["v0_thr"]
+            and _sustained(a, sts[:-1], thr["decel_thr"], 0,
+                           thr["dur_s"])):
+        return min(1.0, -min(a) / 5.0)
     return None
 
 
