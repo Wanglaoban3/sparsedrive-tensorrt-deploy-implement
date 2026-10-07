@@ -192,6 +192,16 @@ int main() {
     }
     fprintf(stderr, "trigger: OBSERVE mode (no rule eval, no events)\n");
   }
+  // parity 原始事件流 (仅 ctx_dump 模式, 免配额)
+  FILE* g_raw = 0;
+  if (ctx_dump) {
+    std::string p = out_dir + "/events_raw.jsonl";
+    g_raw = fopen(p.c_str(), "a");
+    if (!g_raw) {
+      fprintf(stderr, "trigger: cannot open %s\n", p.c_str());
+      return 2;
+    }
+  }
 
   // 信箱附着: 下游先于节点启动是常态, 轮询等
   sp::res::Mailbox* mb = 0;
@@ -358,6 +368,15 @@ int main() {
         memset(&ev, 0, sizeof(ev));
         int ne = r->eval(&ctx, &ev);
         for (int e = 0; e < ne; ++e) {
+          // ctx_dump = parity 夹具模式: 原始事件 (免配额) 另落一份,
+          // 供 §7.5 与 numpy 参考实现全等比对
+          if (ctx_dump) {
+            fprintf(g_raw,
+                    "{\"ts_ns\":%lld,\"seq\":%llu,\"event\":\"%s\","
+                    "\"strength\":%.6f}\n",
+                    (long long)fm.ts_ns, (unsigned long long)msg.seq,
+                    ev.name, (double)ev.strength);
+          }
           if (quota.allow(msg.seq, fm.ts_ns, ev.name)) {
             ev_write(msg.seq, fm.ts_ns, ev.name, ev.strength);
             ++n_ev;
@@ -416,6 +435,8 @@ int main() {
           "trigger: stop (ctx=%llu events=%llu suppressed=%llu skip=%llu)\n",
           n_ctx, n_ev, quota.suppressed, n_skip);
   if (g_ev) fclose(g_ev);
+  if (g_raw) fclose(g_raw);
+  if (g_ob) fclose(g_ob);
   rule_unload_all();
   return 0;
 }
