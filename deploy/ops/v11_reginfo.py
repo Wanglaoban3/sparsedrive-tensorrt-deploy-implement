@@ -6,7 +6,7 @@ import sys
 
 import paramiko
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = os.path.join(ROOT, "deploy", "board_src", "plugin")
 RDIR = "/opt/m0/trt-dev/src"
 

@@ -8,7 +8,7 @@ import time
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 assert os.environ.get("BOARD_HOST") and os.environ.get("BOARD_PASS")
 
 import paramiko  # noqa: E402

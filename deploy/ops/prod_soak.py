@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """M-PROD Phase C2 8h 浸泡 (spec §7 C2).
 用法:
-  python _prod_soak.py start [hours=8]   重启 systemd 双单元 → 板端采样器
+  python prod_soak.py start [hours=8]   重启 systemd 双单元 → 板端采样器
                                          (60s×N sp_status --csv 行) 启动,
                                          tegrastats 存在则并行录
-  python _prod_soak.py poll              只查进度 (SOAK_DONE / 行数)
-  python _prod_soak.py report            拉样 + 生成 report.md + 验收线判定
+  python prod_soak.py poll              只查进度 (SOAK_DONE / 行数)
+  python prod_soak.py report            拉样 + 生成 report.md + 验收线判定
 验收线: node RSS 斜率 <1MB/h (稳态=去首 10min); 稳态 forced_recycles 增量=0;
         journal 零 exit 13/14; 信箱 age p99 <400ms (2×200ms 帧周期).
 板端坑: heredoc 生成脚本 (CRLF 会静默死); setsid 括号孤儿启动."""
@@ -21,7 +21,7 @@ import paramiko
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = "/opt/m0/trt-dev/soak_out"
 SH = OUT + "/soak.sh"
 SAMPLES = OUT + "/samples.csv"

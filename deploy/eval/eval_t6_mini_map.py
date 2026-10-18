@@ -31,7 +31,7 @@ import importlib.util as ilu
 
 import numpy as np
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 ENG = os.path.join(ROOT, "work_dirs", "sparsedrive_small_stage2",
                    "evaldata", "mini_eng_v8")

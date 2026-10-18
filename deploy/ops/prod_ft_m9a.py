@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""M9a FT 轮 (4 用例, 前提: _prod_install.py 已装, trigger 单元 ACTIVE):
+"""M9a FT 轮 (4 用例, 前提: prod_install.py 已装, trigger 单元 ACTIVE):
 FT1 crash:     kill -9 trigger → systemd 拉起 → events.jsonl 续写 + 关键链无感
 FT2 drop-in:   新规则 .so + SIGHUP → 热加载; 坏 ABI .so → REJECT + 宿主不倒
 FT3 零扰动:    trigger 启停全程 filesrc 节拍 / 信箱 forced=0 / 零 FATAL
 FT4 轮转:      events.jsonl >10MB → 5 份轮转不写满
-用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python _prod_ft_m9a.py [all|1|2|3|4]"""
+用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python prod_ft_m9a.py [all|1|2|3|4]"""
 import os
 import re
 import sys

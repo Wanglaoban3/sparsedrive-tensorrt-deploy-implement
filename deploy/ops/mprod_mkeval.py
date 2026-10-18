@@ -6,12 +6,12 @@
   mp:  mini_<tag>_mp/out_XX/{det_id(=det_instance_id), motion_*, plan_*,
        history_*(=outm_XX next_history_*, 同 k 帧 — 与 mproda 基线逐位
        同约定)} + mini_meta.npz (eval_mp_mini.py 口径)
-用法: python _mprod_mkeval.py <tag>"""
+用法: python mprod_mkeval.py <tag>"""
 import os
 import shutil
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TAG = sys.argv[1] if len(sys.argv) > 1 else "mprodb"
 SRC = os.path.join(ROOT, "work_dirs", "preproc_ref", TAG)
 ED = os.path.join(ROOT, "work_dirs", "sparsedrive_small_stage2", "evaldata")

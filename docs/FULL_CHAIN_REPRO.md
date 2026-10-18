@@ -82,10 +82,10 @@ INT8 QAT skip28 0.4081 / 0.5200（量化代价 −0.53 / −0.26 点）。
 
 ```bash
 # FP32 mini 基线一键复现 (P100 ~3min): dump 引擎同格式张量到 evaldata\mini_sp32
-H:\miniconda3\envs\sparsedrive_deploy\python.exe deploy\infer_sp32_mini.py
+H:\miniconda3\envs\sparsedrive_deploy\python.exe deploy\eval\infer_sp32_mini.py
 # map 口径评估 + det 官方评估
-python deploy\eval_t6_mini_map.py --eng ...evaldata\mini_sp32 --art ...
-H:\miniconda3\envs\sparsedrive_deploy\python.exe deploy\eval_sp32_mini_det.py
+python deploy\eval\eval_t6_mini_map.py --eng ...evaldata\mini_sp32 --art ...
+H:\miniconda3\envs\sparsedrive_deploy\python.exe deploy\eval\eval_sp32_mini_det.py
 # MP 头 PyTorch 基准 (EPA/L2/col 口径): infer_sp32_mp_mini.py + eval_mp_mini.py
 ```
 
@@ -218,9 +218,9 @@ bash repro/mini_pipeline_mp.sh e_mp.engine libdfaplug_v8.so <感知SRC> <OUTM> 0
 评估（本地）：
 
 ```bash
-python deploy\eval_t6_mini_v8.py                 # det/map 指标 (EVAL_ENG_DIR 可换目录)
-python deploy\eval_t6_mini_map.py --eng <dir> --art <outdir>   # map 口径
-python deploy\eval_mp_mini.py --eng <dir>        # EPA/L2/col 口径 (MP)
+python deploy\eval\eval_t6_mini_v8.py                 # det/map 指标 (EVAL_ENG_DIR 可换目录)
+python deploy\eval\eval_t6_mini_map.py --eng <dir> --art <outdir>   # map 口径
+python deploy\eval\eval_mp_mini.py --eng <dir>        # EPA/L2/col 口径 (MP)
 ```
 
 铁律：**递归状态链 f1+ 必然发散**（byid rel 0.57、top-300 重叠 30-40% 是正常
@@ -283,7 +283,7 @@ RingMeta v2 双向 guard 生效——--dma 节点遇未注册池正确拒绝）�
 
 ```bash
 # 安装（unit×2 + env + tmpfiles + logrotate, 全程可逆 --uninstall）
-set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\prod_install.py m3
+set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\ops\prod_install.py m3
 # 单元: sp-filesrc@m3 (发布) + sp-modelnode@m3 (三级链), Restart=on-failure
 # SP_NODE_ARGS=--warmup 2 --graph --selftest --loop --frames 1000000 --no-dump
 # SP_PLUGIN=/usr/local/lib/libdfaplug_v11.so (2026-10-06 起; 回退改 v8)
@@ -293,7 +293,7 @@ set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\prod_install.py m3
   FATAL code=13 不清理即退 → systemd 1s 拉起（热恢复实测 6.1-6.4s）；
 - **开机自检**：`--selftest` 帧0金标容差+引擎/插件 md5 指纹（金标
   /opt/m0/trt-dev/golden/m3，0444）。**换引擎/插件必须重标**：
-  `python deploy\prod_golden.py gen --runs 10 --plugin <so 路径>`，旧
+  `python deploy\ops\prod_golden.py gen --runs 10 --plugin <so 路径>`，旧
   金标自检走 FATAL 15 → StartLimit 熔断，重标后先 `reset-failed` 再
   start；
 - **遥测 (C1)**：`/var/lib/sp/m3/telemetry.jsonl` 1Hz（env+分段

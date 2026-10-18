@@ -5,7 +5,7 @@ out_XX/{det_cls,det_bbox,det_quality,det_instance_id,map_cls,map_pts}.bin
 import os
 import shutil
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = os.path.join(ROOT, "work_dirs", "preproc_ref", "mproda")
 REF = os.path.join(ROOT, "work_dirs", "sparsedrive_small_stage2", "evaldata",
                    "mini_eng_v8")

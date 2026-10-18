@@ -31,7 +31,7 @@ def eval_json_line(ln):
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PREPOST = os.path.join(ROOT, "deploy", "board_src", "prepost")
 # /opt/m0 is noexec; binaries go to /usr/local/bin (allowed install target),
 # sources + data live under /opt/m0/trt-dev/prepost.

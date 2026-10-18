@@ -4,7 +4,7 @@
 判据: 每个有 >=2 帧历史的 ctx, 速度模长 v_mag = |Δpos|/Δt (纯几何, 不经
 heading); 修复前交付夹具 24 帧出现 speed≈-3.6~-3.9 (符号翻转) — 修复后
 speed 应与 v_mag 同号且前向行驶恒正. 输出 count(speed < -1.0) 与最差样本.
-用法: python deploy\\_m9a_unwrap_check.py [ctx_dir]
+用法: python deploy\\ops\\m9a_unwrap_check.py [ctx_dir]
   默认 ctx_dir = work_dirs/preproc_ref/m9a_parity/ctx (parity 重跑产物)
 """
 import glob
@@ -16,10 +16,10 @@ import sys
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import _m9a_replay as rp  # noqa: E402
+import m9a_replay as rp  # noqa: E402
 
 ctx_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "work_dirs", "preproc_ref", "m9a_parity", "ctx")
 
 neg = []       # (seq, speed, v_mag)

@@ -1,7 +1,7 @@
-"""_m10_boardtest.py — push given test .cpp + current bus/watch sources,
+"""m10_boardtest.py — push given test .cpp + current bus/watch sources,
 compile on board, run, print output. Usage:
 
-  set BOARD_HOST=...&& set BOARD_PASS=...&& python deploy\\_m10_boardtest.py test_bus_lease [args...]
+  set BOARD_HOST=...&& set BOARD_PASS=...&& python deploy\\m10_boardtest.py test_bus_lease [args...]
 
 Binaries are copied to /usr/local/bin (/opt/m0 is noexec). Exit code = the
 board-side test's exit code.
@@ -11,7 +11,7 @@ import sys
 
 import paramiko
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PREPOST = os.path.join(ROOT, "deploy", "board_src", "prepost")
 BDIR = "/opt/m0/trt-dev/prepost"
 BIN = "/usr/local/bin"

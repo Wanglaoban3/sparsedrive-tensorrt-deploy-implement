@@ -244,7 +244,8 @@ int main(int argc, char** argv) {
 
     // --f32-names <file>: 按 ONNX 节点名精确列表强制 FP32 (每行一个名字,
     // 忽略前导 '/')。用途: map 头单独退回 FP32 (det 头维持 fp16 tactic),
-    // 名字列表由 deploy/_gen_f32_names.py 从 v5_P1h.onnx 反向遍历 map 输出生成,
+    // 名字列表由 deploy/engine/_gen_f32_names.py 从 v5_P1h.onnx 反向遍历 map
+    // 输出生成,
     // 已排除 backbone/neck (保 INT8) 与显式 fp16 区域 (保 NVRTC 安全)。
     // 纯浮点护栏同 f32-substr; 另跳过 Q/DQ 邻接层 (防打断 int8 折叠链)。
     if (f32NamesFile) {

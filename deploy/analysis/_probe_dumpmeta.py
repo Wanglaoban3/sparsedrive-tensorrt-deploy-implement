@@ -7,7 +7,7 @@ import paramiko
 
 HOST = os.environ["BOARD_HOST"]
 PW = os.environ["BOARD_PASS"]
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DST = os.path.join(ROOT, "work_dirs", "preproc_ref", "vecmeta")
 
 cli = paramiko.SSHClient()

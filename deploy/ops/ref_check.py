@@ -18,12 +18,18 @@ ALLOW = {
     "board_split_build.py", "census_det.py", "dfaplug_dump.cu",
     "dfaplug_v10.cu", "extract_dfa_consts.py", "extract_region.py",
     "make_v5_p2h.py", "onnx2engine3.cpp", "probe_fa_io.py",
-    "sim_dfa_v8.py", "smoke_mini_pipeline.py", "split_analysis.py",
-    "strip_casts.py", "test_dfa_ab.cu", "test_dfa_kernels.cu",
-    "test_dfa_pure.py", "test_dfa_real2.cu", "trace_dfa_inputs.py",
+    "sim_dfa_v8.py", "strip_casts.py", "test_dfa_ab.cu",
+    "test_dfa_kernels.cu", "test_dfa_real2.cu", "trace_dfa_inputs.py",
     "_bx.py", "_m6_cmp.py", "_m6_ref.py", "_m6b_gate.py",
     "_m7a_bit2.py", "_m7a_cmp.py", "_m7a_gate.py", "_m8_gate.py",
     "_m8_nvbuf.py", "_m8_probe.py",
+    # 2026-10-18 重整: 已改名件的历史叙事名 (ops/eval 去 `_` 前缀, git 历史可查)
+    "_m10_eval_run.py", "_m5_rerun.py", "_m9a_parity.py", "_m9a_thr_calib.py",
+    "_mprod_gate.py", "_mprod_mkeval.py", "_mprod_mkmap.py",
+    "_pd_step1_build.py", "_pd_step2_golden.py", "_pd_step2b_resume.py",
+    "_pd_step3_verify.py", "_pd_step3b_rebuild.py", "_pd_step4_det.py",
+    "_prod_ft_a.py", "_prod_ft_b.py", "_prod_ft_m10.py", "_prod_ft_m9a.py",
+    "_prod_golden.py", "_prod_install.py", "_prod_soak.py", "_v11_gate.py",
     # 外部仓库/系统头/文档示例占位/板上路径 — 非本仓文件
     "4.cu", "8.py", "_rewrite_report.json", "events.py",
     "mini_pipeline_sp2.sh", "nvrtc_compile.cpp", "script.sh", "soak.sh",
@@ -57,3 +63,33 @@ if missing:
         print("  %-36s (referenced in %s)" % (k, v))
 else:
     print("NO_DANGLING_REFS (all documented files exist)")
+
+# ---- 第二道: deploy 层内脚本锚点深度 (git mv 加深一层必须重锚; 2026-10-18
+# 终审 C1 复发防线: 54 个移动脚本曾集体少一层 dirname, 所有门禁结构性失明) ----
+import glob as _glob
+
+pat_chain = re.compile(r"(?:os\.path\.dirname\s*\(\s*)+os\.path\.abspath"
+                       r"\(__file__\)[ \t]*(?:\)[ \t]*)+")
+anchor_bad = []
+for p in _glob.glob(os.path.join(ROOT, "deploy", "**", "*.py"),
+                    recursive=True):
+    if "__pycache__" in p:
+        continue
+    rel = os.path.relpath(p, ROOT).replace(os.sep, "/")
+    if rel == "deploy/spdeploy.py":
+        continue  # 顶层自锚 DEPLOY=自身目录, 语义正确
+    need = len(rel.split("/")[:-1]) + 1
+    for line in open(p, encoding="utf-8", errors="replace"):
+        if "sys.path.insert" in line:
+            continue  # 兄弟导入自锚 (同层 import), 语义正确
+        m = pat_chain.search(line)
+        if m and m.group(0).count("dirname") != need:
+            anchor_bad.append("%s: d%d != d%d" % (
+                rel, m.group(0).count("dirname"), need))
+
+if anchor_bad:
+    print("ANCHOR_DEPTH_ERRORS:")
+    for k in anchor_bad:
+        print("  %s" % k)
+elif not missing:
+    print("ANCHORS_OK (deploy/** layers all anchored to repo root)")

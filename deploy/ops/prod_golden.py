@@ -8,10 +8,10 @@ gen    帧0 全链张量采集 ×N (selftest-dump 模式, 与自检同一代码�
 tamper 破坏指定金标张量 4 字节 (FT: 篡改金标 → SELFTEST_FAIL 用例)
 verify 板端逐张量 bin 尺寸清单 (诊断)
 
-用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python _prod_golden.py gen
+用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python prod_golden.py gen
           [--runs 10] [--ring m3] [--models-dir P] [--plugin P]
-      python _prod_golden.py tamper det_cls [--ring m3]
-前置: _prod_install.py 已安装且健康 (dump 模式 attach 真环, 不消费).
+      python prod_golden.py tamper det_cls [--ring m3]
+前置: prod_install.py 已安装且健康 (dump 模式 attach 真环, 不消费).
 """
 import argparse
 import os
@@ -68,7 +68,7 @@ def gen(runs):
     # dump 模式 attach 真环 (不消费不注册), 环不存在则前置失败
     out, _ = run("test -e /dev/shm/sp_%s && echo RING_OK" % RING)
     if "RING_OK" not in out:
-        raise SystemExit("环 /dev/shm/sp_%s 不存在, 先 _prod_install.py" % RING)
+        raise SystemExit("环 /dev/shm/sp_%s 不存在, 先 prod_install.py" % RING)
     args = ("--hd %s/e_hd.engine --mp %s/e_mp.engine --warmup 2"
             % (MODELS, MODELS))
     for i in range(runs):

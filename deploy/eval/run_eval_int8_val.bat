@@ -1,7 +1,7 @@
 @echo off
 REM Full-val INT8-QAT eval (6019 frames), direct log to _eval_int8_val.log
 cd /d H:\projects\sparsedrive-tensorrt-deploy-implement
-H:\miniconda3\envs\sparsedrive_deploy\python.exe deploy\eval_nuscenes.py ^
+H:\miniconda3\envs\sparsedrive_deploy\python.exe deploy\eval\eval_nuscenes.py ^
   --mode quant ^
   --checkpoint ckpt\sparsedrive_stage2_qat.pth ^
   --skip-json deploy\artifacts\sparsedrive_ptq_sensitivity.json ^

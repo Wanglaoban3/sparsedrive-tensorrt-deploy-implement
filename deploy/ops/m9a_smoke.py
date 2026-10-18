@@ -9,7 +9,7 @@ sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 assert os.environ.get("BOARD_HOST") and os.environ.get("BOARD_PASS")
 import paramiko  # noqa: E402
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PRE = os.path.join(ROOT, "deploy", "board_src", "prepost")
 BD = "/opt/m0/trt-dev/prepost"
 W = "/tmp/m9a_t2"

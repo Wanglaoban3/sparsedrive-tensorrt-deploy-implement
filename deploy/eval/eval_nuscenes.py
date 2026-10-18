@@ -21,9 +21,10 @@ import time
 
 import torch
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(ROOT)
 sys.path.append(os.path.join(ROOT, "deploy", "eval"))
+sys.path.append(os.path.join(ROOT, "deploy", "engine"))
 os.chdir(ROOT)
 os.environ.setdefault("SPARSEDRIVE_DFA_CHUNK", "256")
 os.environ.setdefault("SPARSEDRIVE_DFA_PCHUNK", "32")

@@ -25,7 +25,7 @@ import sys
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 W = os.path.join(ROOT, "work_dirs", "sparsedrive_small_stage2")
 EV = os.path.join(W, "evaldata")
 SEND = os.path.join(ROOT, "deploy", "segsend")

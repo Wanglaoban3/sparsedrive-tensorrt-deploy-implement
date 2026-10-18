@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """mat4_inv 修复后闭环复测: legacy(e_T6 单引擎) / split(e_bb2+e_hd) /
 mp(bb2+hd+e_mp 三级, M6a).
-用法: python _m5_rerun.py legacy|split|mp [graph|nograph] [fetch]
+用法: python m5_rerun.py legacy|split|mp [graph|nograph] [fetch]
 板上跑 81 帧(输出在 out_XX/ 子目录, mp 另有 outm_XX/), 拉回 eval 键到
 work_dirs/preproc_ref/<tag>; fetch 模式只抓取(任务已在板上跑完时用)."""
 import os
@@ -16,7 +16,7 @@ ONLY_FETCH = len(sys.argv) > 3 and sys.argv[3] == "fetch"
 TAG = {"legacy": "m3fix", "split": "m5fix", "mp": "m6fix"}[MODE]
 HOST = os.environ["BOARD_HOST"]
 PW = os.environ["BOARD_PASS"]
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DST = os.path.join(ROOT, "work_dirs", "preproc_ref", TAG)
 BD = "/opt/m0/trt-dev/%s_out" % TAG
 KEYS = ["det_cls", "det_bbox", "det_quality", "det_instance_id",

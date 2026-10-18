@@ -25,7 +25,7 @@ import sys
 import numpy as np
 from PIL import Image
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 R0 = os.path.join(ROOT, "work_dirs", "nv12_r0")
 OUT = os.path.join(ROOT, "work_dirs", "preproc_ref")
 

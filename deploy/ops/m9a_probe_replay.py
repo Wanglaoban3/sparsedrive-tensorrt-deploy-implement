@@ -8,11 +8,11 @@ import traceback
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import _m9a_replay as rp  # noqa: E402
+import m9a_replay as rp  # noqa: E402
 
-d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+d = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                  "work_dirs", "preproc_ref", "m9a_parity", "ctx")
-thr = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+thr = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                    "work_dirs", "preproc_ref", "m9a_parity", "thr.conf")
 secs = rp.parse_thr(thr)
 for fn in sorted(os.listdir(d)):

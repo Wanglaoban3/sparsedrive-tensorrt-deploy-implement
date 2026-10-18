@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """v11 插件闭环门禁: 编译 libdfaplug_v11.so -> 81 帧节点闭环 (bb2+hd+graph)
 -> 拉回 eval 键 + frame_log. 引擎不重编 (插件按 名字/版本/命名空间 绑定).
-用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python _v11_gate.py [fetch]
+用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python v11_gate.py [fetch]
 板上输出 /opt/m0/trt-dev/v11g1_out; 拉回 work_dirs/preproc_ref/v11g1."""
 import os
 import sys
@@ -13,7 +13,7 @@ ONLY_FETCH = len(sys.argv) > 1 and sys.argv[1] == "fetch"
 TAG = "v11g1"
 HOST = os.environ["BOARD_HOST"]
 PW = os.environ["BOARD_PASS"]
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DST = os.path.join(ROOT, "work_dirs", "preproc_ref", TAG)
 BD = "/opt/m0/trt-dev/%s_out" % TAG
 KEYS = ["det_cls", "det_bbox", "det_quality", "det_instance_id",

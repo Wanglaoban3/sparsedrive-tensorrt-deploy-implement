@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """M-PROD Phase A 故障注入验收 (spec §5 表, 4 场景): 每场景独立进程/独立恢复.
-用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python _prod_ft_a.py [all|1|2|3|4]
-前置: _prod_install.py 已安装且健康. FT 中途改 /etc/sp/m3.env 的场景结束后
+用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python prod_ft_a.py [all|1|2|3|4]
+前置: prod_install.py 已安装且健康. FT 中途改 /etc/sp/m3.env 的场景结束后
 一律恢复原 env + reset-failed + restart + 等 NOMINAL."""
 import os
 import sys
@@ -16,7 +16,7 @@ ENV_R = "/etc/sp/%s.env" % INST
 NODE_BIN = "/usr/local/bin/sp_modelnode"
 LOG = "/var/log/sp/node-%s.log" % INST
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ENV_L = os.path.join(ROOT, "deploy", "systemd", "%s.env" % INST)
 
 cli = paramiko.SSHClient()
@@ -116,7 +116,7 @@ u = units()
 print("pre-check units:", u)
 ok, s, _ = wait_nominal(30)
 if not ok:
-    raise SystemExit("前置失败: 信箱无 NOMINAL, 先跑 _prod_install.py")
+    raise SystemExit("前置失败: 信箱无 NOMINAL, 先跑 prod_install.py")
 print("pre-check mailbox: NOMINAL (last_valid=%s)" % s.get("last_valid"))
 run("systemctl reset-failed %s %s" % (FS_U, NODE_U))
 

@@ -16,7 +16,7 @@ import sys
 
 import numpy as np
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 REF = os.path.join(ROOT, "work_dirs", "sparsedrive_small_stage2",
                    "evaldata", "mini_eng_v8")
 GOT = os.path.join(ROOT, "work_dirs", "preproc_ref", "m3")

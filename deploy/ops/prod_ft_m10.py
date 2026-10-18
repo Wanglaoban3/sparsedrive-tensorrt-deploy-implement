@@ -5,7 +5,7 @@ FT2 skip-lag:   SIGSTOP 跨场景边界 → 跳序 rc0 + scene 复位行; 对照
 FT3 watchdog:   STALL(返回型)→ABANDON+弃帧继续 rc0; HANG(不返回)→exit13 tier2
 FT4 晚接入:     --wait-cons 2 首消费者即开拍 (starting anyway), 第二消费者
                 中途入列不扰动发布
-用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python _prod_ft_m10.py [all|1|2|3|4]
+用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python prod_ft_m10.py [all|1|2|3|4]
 前置: M10 二进制已装 /usr/local/bin (board_m1 --stage build); 单元会被 stop,
 结束统一恢复 (reset-failed + restart + 等 NOMINAL)."""
 import os

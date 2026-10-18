@@ -29,7 +29,7 @@ import torch
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(ROOT)
 sys.path.append(os.path.join(ROOT, "deploy", "eval"))
 sys.path.append(os.path.join(ROOT, "tools"))

@@ -29,7 +29,7 @@ import time
 import numpy as np
 import torch
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(ROOT)
 
 from mmcv import Config  # noqa: E402

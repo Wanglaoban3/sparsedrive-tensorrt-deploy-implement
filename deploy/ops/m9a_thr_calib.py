@@ -10,7 +10,7 @@
   reverse/u_turn/low_speed_crawl/lead_*/vru_*/construction_zone = 保持 v0 种子
   (物理量纲阈值: -0.5m/s, 120 度, 2m/s, 20/25m, 2/3m, 1.5m/s, 30m — 观测表
    只作分布合理性证据)
-用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\\_m9a_thr_calib.py [minutes=3]
+用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\\m9a_thr_calib.py [minutes=3]
 留档: work_dirs/preproc_ref/m9a_thr/ (observe.jsonl + thr.conf + report.md)
 """
 import datetime
@@ -26,7 +26,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
 assert os.environ.get("BOARD_HOST") and os.environ.get("BOARD_PASS")
 import paramiko  # noqa: E402
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PRE = os.path.join(ROOT, "deploy", "board_src", "prepost")
 BD = "/opt/m0/trt-dev/prepost"
 W = "/tmp/m9a_calib"

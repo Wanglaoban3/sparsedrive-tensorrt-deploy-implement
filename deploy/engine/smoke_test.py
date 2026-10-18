@@ -10,7 +10,7 @@ import sys
 import numpy as np
 import torch
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(ROOT)
 sys.path.append(os.path.join(ROOT, "tools"))
 sys.path.append(os.path.join(ROOT, "deploy", "eval"))

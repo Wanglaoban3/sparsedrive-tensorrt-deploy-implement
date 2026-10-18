@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """M-PROD Phase A 门禁: 量产化改动(watchdog/v3 信箱/退出码)后的闭环精度复跑.
-用法: python _mprod_gate.py mp [fetch]
+用法: python mprod_gate.py mp [fetch]
   mp: filesrc 5fps, node bb2+hd+mp --graph (与 M6a/M7a 基线同形状, 无 --dual),
       带 dump, 拉 20 键 x81 -> preproc_ref/mproda
 对比基线: m7fix (map 0.7485 / EPA 0.6048,0.5023); 精度评估走 _mprod_eval.py."""
@@ -16,7 +16,7 @@ ONLY_FETCH = len(sys.argv) > 2 and sys.argv[2] == "fetch"
 TAG = os.environ.get("MPROD_TAG", "mproda")
 HOST = os.environ["BOARD_HOST"]
 PW = os.environ["BOARD_PASS"]
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DST = os.path.join(ROOT, "work_dirs", "preproc_ref", TAG)
 BD = "/opt/m0/trt-dev/%s_out" % TAG
 KEYS = ["det_cls", "det_bbox", "det_quality", "det_instance_id",

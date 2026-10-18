@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """M-PROD Phase B 故障注入验收 (spec §9 B 出口条件).
-用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python _prod_ft_b.py [all|1|2|3]
+用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python prod_ft_b.py [all|1|2|3]
 
 FTB1 篡改金标 (det_cls 4B NaN) → restart → SELFTEST_FAIL 心跳可见
      (status/last_valid=0), 节点存活 (阻止 ACTIVE 语义) → 还原金标 → NOMINAL
@@ -110,7 +110,7 @@ def report(idx, name, ok, ev):
 u = units()
 ok, s, _ = wait_nominal(30)
 if not ok:
-    raise SystemExit("前置失败: 无 NOMINAL, 先 _prod_install.py")
+    raise SystemExit("前置失败: 无 NOMINAL, 先 prod_install.py")
 print("pre-check: NOMINAL (last_valid=%s)" % s.get("last_valid"))
 ENV_BASE = open("deploy/systemd/%s.env" % INST, "rb").read().decode("utf-8")
 run("systemctl reset-failed %s %s" % (NODE_U, NODE_U2))

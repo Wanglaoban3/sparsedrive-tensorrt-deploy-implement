@@ -7,7 +7,7 @@ import sys
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
-d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+d = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                  "work_dirs", "preproc_ref", "m9a_parity", "ctx")
 EGO, TRK = 24, 48
 files = sorted(os.listdir(d))

@@ -4,7 +4,7 @@ import os
 
 import numpy as np
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 VM = os.path.join(ROOT, "work_dirs", "preproc_ref", "vecmeta")
 np.set_printoptions(precision=3, suppress=True, linewidth=200)
 

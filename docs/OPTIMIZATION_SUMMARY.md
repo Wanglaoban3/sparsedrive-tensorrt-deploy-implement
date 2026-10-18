@@ -11,8 +11,8 @@
 | `deploy/board_m1.py` | `deploy/board/board_m1.py` |
 | `deploy/dfaplug_v3.cu`、`dfaplug_v8.cu`、`dfaplug_v11.cu`、`test_dfa_v11.cu` | `deploy/board_src/plugin/` |
 | `deploy/run_engine.cpp`、`run_engine2.cpp`、`run_engines.cpp`、`onnx2engine.cpp` | `deploy/board_src/runner/` |
-| 导出/量化链（`export_*.py`、`qdq_onnx_rewrite.py`、`split_*.py`、`requant_fpn.py`、`prep_mini_inputs.py` 等） | `deploy/engine/` |
-| 评估/对拍（`eval_t6_mini*.py`、`eval_mp_mini.py`、`map_gt.py`、`infer_*.py`、`compare_m2.py / compare_m3.py` 等） | `deploy/eval/` |
+| 导出/量化链（`export_*.py`、`qdq_onnx_rewrite.py`、`split_*.py`、`requant_fpn.py` 等） | `deploy/engine/` |
+| 评估/对拍（`eval_t6_mini*.py`、`eval_mp_mini.py`、`map_gt.py`、`infer_*.py`、`prep_mini_inputs.py`、`compare_m2.py / compare_m3.py` 等) | `deploy/eval/` |
 | 分析/取证（`_cmp_*.py`、`_probe_dumpmeta.py`、`_probe_decode_check.py`、`_probe_m4_report.py`、`_inv_verify.py`、`_fa_part.cu`、`selftest_fa*.cu`） | `deploy/analysis/`（保留原名） |
 | 其余活跃运维驱动（`_prod_*.py`、`_m10_*.py`、`_m9a_*.py`、`_mprod_*.py`、`_pd_step*.py`、`_m5_rerun`、`board_mapfix.py`、`v11_*.py`、`preproc_ref/`、`ref_check.py`） | `deploy/ops/` |
 | `deploy/_*.py`（ops/eval 落点） | **去 `_` 前缀**：`ops/prod_install.py` 等；`analysis/` 与 `engine/_gen_f32_names.py` 保留原名 |
@@ -946,7 +946,7 @@ M5 把拆分链（e_bb2+e_hd）接入真实闭环节点 sp_modelnode 后复测 m
 3. **定版**：刚体逆平移在**列 3**（下标 3/7/11），行 3 恒 [0 0 0 1]；
    C 一维下标口径逐句对拍 numpy 4.8e-13（deploy/_inv_verify.py）。
 
-### 修复后闭环实测（81 帧，m5_rerun.py 口径）
+### 修复后闭环实测（81 帧，_m5_rerun.py 口径）
 | 组合 | det mAP | NDS | mAVE | map mAP |
 |---|---|---|---|---|
 | legacy e_T6 单引擎（pipe） | **0.4210** | 0.4740 | 0.4164 | - |
@@ -955,7 +955,7 @@ M5 把拆分链（e_bb2+e_hd）接入真实闭环节点 sp_modelnode 后复测 m
 | 修复前节点闭环 | 0.3124~0.3144 | - | 0.89 | 不受影响 |
 
 **M5 门禁通过**：拆分链闭环精度与离线基线对齐（det +0.0017 /
-map -0.0003）。工具沉淀：`deploy/ops/m5_rerun.py`（复测驱动）、
+map -0.0003）。工具沉淀：`deploy/_m5_rerun.py`（复测驱动）、
 `_probe_dumpmeta.py`/`_probe_cmp.py`（meta 字节探针）、
 `_inv_verify.py`（公式对拍）、`_seed_f0.py`（种子实验）、
 `_mk_evaldir.py`（eval 组装）。板端复测 dump 留档
@@ -1110,7 +1110,7 @@ Requires+After filesrc（不反向拉活：--loop 下源枯竭 node 必须 exit 
 留在重启环里等 filesrc 修复）。常驻 env 三件套：`--loop --frames
 1000000 --no-dump`（缺一：钳 81 帧 rc0 退 / dump 7.3MB/帧写满盘）。
 SIGTERM 处理后两进程 stop ~0.9s（原 SIGTERM 不响应要吃满 TimeoutStopSec
-30s）。安装/健康断言/卸载：`deploy/ops/prod_install.py`（tmpfiles →
+30s）。安装/健康断言/卸载：`deploy/_prod_install.py`（tmpfiles →
 daemon-reload → enable --now → 75s 内 probe 信箱 NOMINAL + 单元态检查）。
 
 ### ③ 信箱 v3 fail-visible（sp_result.h v3 / sp_resultmon）
@@ -1146,7 +1146,7 @@ Phase B 钩子）。**frame_age_ms 是发布时冻结的处理时延，不是读
 | planning L2 | 0.7398 | 0.7377 | ✓ |
 | obj_box_col | 0.161% | 0.161% | ✓ |
 
-### 故障注入验收（`deploy/ops/prod_ft_a.py`，4/4 PASS + 恢复全过）
+### 故障注入验收（`deploy/_prod_ft_a.py`，4/4 PASS + 恢复全过）
 
 | 用例 | 注入 | 验收证据 |
 |---|---|---|
@@ -1164,9 +1164,9 @@ Phase B 钩子）。**frame_age_ms 是发布时冻结的处理时延，不是读
 sp_result.h（v3）、sp_resultmon.cpp（v3+lage）、sp_modelnode.cpp
 （watchdog/退出码/resync/快停）、sp_filesrc.cpp（attach-or-create/
 exit10/快停）；`deploy/systemd/`：2 单元 + m3.env + sp.conf +
-sp-logrotate；`deploy/ops/prod_install.py`（安装/健康/卸载）、
-`prod_ft_a.py`（FT 套件）、`_bx.py`（板上任意命令）、
-`mprod_mkmap.py`（map 评测组装）+ evaldata/mini_mproda_map。
+sp-logrotate；`deploy/_prod_install.py`（安装/健康/卸载）、
+`_prod_ft_a.py`（FT 套件）、`_bx.py`（板上任意命令）、
+`_mprod_mkmap.py`（map 评测组装）+ evaldata/mini_mproda_map。
 板上面貌：`systemctl status sp-modelnode@m3` 常驻，48.06ms/帧，
 FATAL/熔断/冻结全部可见。
 
@@ -1214,7 +1214,7 @@ status=DEGRADED_RESET；60s 窗复位 >5 → **LATCH**：持续发布 last_valid
 
 warmup 后、graph 捕获前，eager 跑帧 0（=模板零态）流水线：读 manifest
 目录的 6 路 NV12，输出 9 张量与金标比容差；指纹 md5(bb2/main/mp 引擎 +
-插件) 对 meta.txt。金标标定 `prod_golden.py gen`：独立进程 10 次
+插件) 对 meta.txt。金标标定 `_prod_golden.py gen`：独立进程 10 次
 `--selftest-dump`（attach 活 ring 不消费），tol = max(3×跨运行最大绝对
 偏差, 1e-3 地板)——**不存 hash**（M7：跨运行非位确定，hash 门禁必误报），
 指纹+容差双保险。
@@ -1225,7 +1225,7 @@ SELFTEST_FAIL 心跳（seq=0/det 清零/last_valid=0）、不发布有效结果�
 SP_SELFTEST_OVERRIDE=1 放行（继续发布但每帧标 SELFTEST_FAIL）。
 自检帧跑完必须 zero_states_all（污染时序状态会带进正式循环）。
 
-### 故障注入验收（`deploy/ops/prod_ft_b.py`，3/3 PASS + 恢复全过 + OVERRIDE 过）
+### 故障注入验收（`deploy/_prod_ft_b.py`，3/3 PASS + 恢复全过 + OVERRIDE 过）
 
 | 用例 | 注入 | 验收证据 |
 |---|---|---|
@@ -1250,9 +1250,9 @@ SP_SELFTEST_OVERRIDE=1 放行（继续发布但每帧标 SELFTEST_FAIL）。
 
 `deploy/prepost/`：sp_safety.h/.cu（新）、sp_modelnode.cpp（B1 检查块/
 复位/LATCH/SP_INJECT_NAN/--selftest/--selftest-dump/--golden）、
-sp_resultmon.cpp（v3 健康计数真实填充）；`deploy/ops/prod_golden.py`
-（金标标定/篡改/校验）、`prod_ft_b.py`（FTB 套件）、
-`mprod_mkeval.py`（map+mp 评测组装泛化）、`mprod_gate.py`
+sp_resultmon.cpp（v3 健康计数真实填充）；`deploy/_prod_golden.py`
+（金标标定/篡改/校验）、`_prod_ft_b.py`（FTB 套件）、
+`_mprod_mkeval.py`（map+mp 评测组装泛化）、`_mprod_gate.py`
 （MPROD_TAG 参数化 + systemctl stop 清场）。板上
 /opt/m0/trt-dev/golden/m3/{frame0×9, tol.txt, meta.txt}（0444）。
 
@@ -1294,7 +1294,7 @@ sumfusion anchor 求和入 gather）。我们已经有的：32B 重复 entry、
 - 时延：全帧 12 调用 **6.60→5.59ms（1.18×）**；det 1.14-1.45×，
   map 1.03-1.23×。
 
-### 81 帧闭环门禁（bb2+hd+graph+libdfaplug_v11，`deploy/ops/v11_gate.py`）
+### 81 帧闭环门禁（bb2+hd+graph+libdfaplug_v11，`deploy/_v11_gate.py`）
 
 | 指标 | v8 交付基线 | v11 实测 | 判定 |
 |---|---|---|---|
@@ -1369,12 +1369,12 @@ C1 给 frame_log.tsv 每行追了 3 列（gpu_temp_c/cpu_temp_c/sm_clock_mhz）
 换 v11 插件后自检指纹拦的是 **FATAL code=15 直接退出**（金标过期=基础
 设施错，不是 stay-alive 心跳）→ systemd Restart=on-failure 1s×5 →
 **StartLimit 熔断**。现场顺序固化：install →（旧金标拦，预期）→
-`prod_golden.py gen --runs 10 --plugin libdfaplug_v11.so`（--selftest-
+`_prod_golden.py gen --runs 10 --plugin libdfaplug_v11.so`（--selftest-
 dump 从 manifest 直读帧 0，不碰环不消费，**无需活链/无需 override**，
 gen 的 RING_OK 检查只是环境哨兵）→ `systemctl reset-failed` 双单元 →
 start → SELFTEST PASS (9 tensors)。新金标容差（3×跨 run 最大偏差）：
 det_bbox 1.383 / motion_cls 3.381 / plan_reg 0.053 / map_pts 0.381
-（量级与 v8 版同 class）。prod_golden.py 补上了 docstring 里承诺但
+（量级与 v8 版同 class）。_prod_golden.py 补上了 docstring 里承诺但
 argparse 没定义的 `--plugin` 参数。
 
 ### mprodd 精度门禁（独立 81 帧闭环，插件定死 v8 以隔离 C/D 增量）
@@ -1388,10 +1388,10 @@ argparse 没定义的 `--plugin` 参数。
 | obj_box_col | **0.161%** | 0.242% | 0.161% | 0.161% |
 
 全部落在既有跨 run 抖动带内（L2/col 单 run 散布 ±0.01/±0.08pp 口径），
-C1+D 代码**零精度回归**。驱动脚本：`deploy/ops/pd_step1_build.py`（停单元
-→build→install --no-start）、`pd_step2_golden.py`/`pd_step2b_resume.py`
-（金标重标+熔断恢复）、`pd_step3_verify.py`（D/C1 证据采集）、
-`pd_step3b_rebuild.py`（表头修复重编）、`pd_step4_det.py`（mkeval+
+C1+D 代码**零精度回归**。驱动脚本：`deploy/_pd_step1_build.py`（停单元
+→build→install --no-start）、`_pd_step2_golden.py`/`_pd_step2b_resume.py`
+（金标重标+熔断恢复）、`_pd_step3_verify.py`（D/C1 证据采集）、
+`_pd_step3b_rebuild.py`（表头修复重编）、`_pd_step4_det.py`（mkeval+
 det 目录组装+评估）；mprodd dump 留档 `work_dirs/preproc_ref/mprodd`
 （det/map/mp eval 日志同目录）。
 
@@ -1402,7 +1402,7 @@ det 目录组装+评估）；mprodd dump 留档 `work_dirs/preproc_ref/mprodd`
 2. **金标过期自检 = exit 15 → StartLimit 熔断**（见上，reset-failed
    双单元再 start）。
 3. **mkeval 产 out_XX 而 det eval 吃 outv8_XX**：det 门禁用
-   pd_step4_det.py 现组 `mini_<tag>_det/outv8_XX` 别名目录（键
+   _pd_step4_det.py 现组 `mini_<tag>_det/outv8_XX` 别名目录（键
    det_cls/det_bbox/det_quality/det_instance_id + mini_meta.npz）。
 
 ## 第二十轮：M10 数据面硬化——跳序/latest-wins/分级 watchdog/wrap-lease（2026-10-07 交付，FT 4/4 + mprode 门禁过）
@@ -1421,7 +1421,7 @@ det 目录组装+评估）；mprodd dump 留档 `work_dirs/preproc_ref/mprodd`
 | sp_bus wrap-lease | claim-blocked 槽=发布者绕圈撞上长持有者；`SP_BUS_WRAP_LEASE_MS`（默认 0=关）下按第二租约强抢心跳陈旧持有者。默认 800ms 依据：盖过活读者 hb 老度峰值（2×svc+post 503ms 抖动 ≈690ms），远小于 5s 死租约 | 30fps 单消费者停 >5s 才会死租约强收——绕圈 4 槽 @30fps 下 800ms 就撞回，必须更短租约；release() 加 slot_idx<0 幂等护栏（TDD 意外收获，防强抢后消费者二次 release 解引用 slot(-1)） |
 | sp_filesrc --wait-cons | 只等**第一个**消费者（原 = 等满 N 个才开拍）；`starting anyway (late joiners resync)` 日志行 | 晚接入消费者走 skip-lag/resync 自然对齐；生产不再因第二消费者缺席而无限等待 |
 
-### FT 轮（deploy/ops/prod_ft_m10.py，板上独立进程 4/4 PASS）
+### FT 轮（deploy/_prod_ft_m10.py，板上独立进程 4/4 PASS）
 
 | 用例 | 注入 | 判据 | 实测 |
 |---|---|---|---|
@@ -1447,8 +1447,8 @@ $SP_NODE_ARGS 生效 `--skip-lag`、env 含 SP_BUS_WRAP_LEASE_MS=800、
 SELFTEST PASS (9 tensors)（金标 v11 工件指纹不含节点二进制 md5，M10
 零工件改动故直接过）、信箱 seq 双探递进。dump 留档
 `work_dirs/preproc_ref/mprode_{a,b}`（eval 日志同目录），eval driver
-`deploy/ops/m10_eval_run.py <tag>`（det/map/mp 一键，mprodd 的
-pd_step4_det.py 泛化版）。
+`deploy/_m10_eval_run.py <tag>`（det/map/mp 一键，mprodd 的
+_pd_step4_det.py 泛化版）。
 
 ### Review Focus 五条的落地证据（plan 终审项）
 
@@ -1508,7 +1508,7 @@ dump 留档 `work_dirs/preproc_ref/mprodf_{a,b}`。
 ### 30fps 满负荷 8h 浸泡（M10 最终形态，2026-10-07，4/4 验收线 PASS）
 
 以 M10 交付形态（--skip-lag + wrap-lease 1000 + C1 遥测 + D 权限）发车
-`prod_soak.py start 8`。**关键物理**：请求 SP_FPS=30 实际 ~23fps——
+`_prod_soak.py start 8`。**关键物理**：请求 SP_FPS=30 实际 ~23fps——
 环背压把源节流到节点吞吐（filesrc 22.9/s = node 22.1/s，4 槽环释放节奏
 = 节点服务率）→ 节点 100% 饱和（GR3D 97-99%、GPU 70-87°C 平稳），
 **单消费者饱和下 skip-lag 天然休眠**（acquire 恒得 last_seq+1，零 SKIP
@@ -1556,16 +1556,16 @@ events.jsonl（10MB×5 轮转）。SDD 六任务（plan c9463b5，TDD RED→GREE
   ego 组规则。判障方法="observe 列 vs manifest 逐行对账"（ts 对=join 对、
   speed 错=运动学错）两轮定位。连带：manifest l2g 是嵌套 4×4 JSON，迷你
   解析器 jump_num 要跳 ']' 且 strtod 取 endptr（两次静默全 0）。
-- **THR 标定纪律**（m9a_thr_calib.py，3min 稳态观察 950 帧）：分位数
+- **THR 标定纪律**（_m9a_thr_calib.py，3min 稳态观察 950 帧）：分位数
   前加运动门控（speed>1 且 acc 前后帧都在动）——静止段 yaw 假尖峰
   p99≈2π、复位帧 acc≈17 伪影。校准：hard_brake p01=-3.21 / hard_accel
   p99=1.08 / sharp_turn 0.412 / sharp_lat 1.678（留档
   work_dirs/preproc_ref/m9a_thr）。
-- **parity 门禁**（m9a_parity.py）：ctx-dump 二进制夹具（布局钉死）+
+- **parity 门禁**（_m9a_parity.py）：ctx-dump 二进制夹具（布局钉死）+
   numpy 镜像 14 规则重放 → 951 tick / **3237 事件 (seq,event) 集合全等**，
   strength |Δ|≤1e-3 无违例。events.py 本体消费 GT occupancy 不可比，
   parity 盖规则层，ego 运动学由标定对账盖。
-- **FT 4/4**（prod_ft_m9a.py）：FT1 kill-9 → events 续写 + lage<3s
+- **FT 4/4**（_prod_ft_m9a.py）：FT1 kill-9 → events 续写 + lage<3s
   （demo_ft1 确定性注入）；FT2 drop-in 热加载 15→16 + 坏 ABI 拒载；
   FT3 trigger 启停窗口 node forced 增量全 0（零扰动）；FT4 11MB→.1 滚出。
 - **mprodt 零回归**（trigger active 独占环跑 81 帧）：det 0.4168/0.4729、
@@ -1584,7 +1584,7 @@ events.jsonl（10MB×5 轮转）。SDD 六任务（plan c9463b5，TDD RED→GREE
   上 o.read() 挂到 PipeTimeout——取证用 sp_status/日志文件替代。
 
 插件开发五分钟上手 + 7 条常见死法表见 `docs/M9A_PLUGIN_GUIDE.md`；
-板端安装 = `python deploy\prod_install.py m3`（规则源 push→板上编译
+板端安装 = `python deploy\_prod_install.py m3`（规则源 push→板上编译
 14 个 .so→/usr/local/share/sp/rules，三单元 enable --now + 健康断言）。
 常驻态：三单元 active + SELFTEST PASS + trigger 14 规则 hb 前进。
 

@@ -9,7 +9,7 @@ import paramiko
 
 HOST = os.environ["BOARD_HOST"]
 PW = os.environ["BOARD_PASS"]
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 M3 = os.path.join(ROOT, "work_dirs", "preproc_ref", "m3")
 
 ROT = [("next_det_feat", "prev_det_feat"),

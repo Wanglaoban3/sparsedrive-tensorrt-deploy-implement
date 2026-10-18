@@ -4,7 +4,7 @@ import sys
 
 import numpy as np
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 D = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     ROOT, "work_dirs", "preproc_ref", "m3")
 

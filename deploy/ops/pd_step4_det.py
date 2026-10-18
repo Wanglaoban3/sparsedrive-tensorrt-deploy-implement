@@ -8,7 +8,7 @@ import sys
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
 TAG = "mprodd"
 SRC = os.path.join(ROOT, "work_dirs", "preproc_ref", TAG)
@@ -18,7 +18,7 @@ PYDEP = r"H:\miniconda3\envs\sparsedrive_deploy\python.exe"
 ART = os.path.join(ROOT, "deploy", "artifacts", "eval_v8_mini.json")
 BAK = ART + ".mprodd_bak"
 
-r = subprocess.call([sys.executable, os.path.join(ROOT, "deploy", "ops", "_mprod_mkeval.py"), TAG])
+r = subprocess.call([sys.executable, os.path.join(ROOT, "deploy", "ops", "mprod_mkeval.py"), TAG])
 assert r == 0, "mkeval failed"
 assert os.path.isdir(DMAP) and os.path.isdir(os.path.join(ED, "mini_%s_mp"
                                                           % TAG))

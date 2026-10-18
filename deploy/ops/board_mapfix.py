@@ -7,7 +7,7 @@ Two orthogonal fixes, one board session:
      the prev_* blind copy at scene-start frames and restores in_40 zero
      history first. Run with the DELIVERED e_T6 -> dump vec/mini_r/outv8_XX.
   F2 (one rebuild) map-head FP32: onnx2engine --f32-names (map-side layer
-     name list from deploy/_gen_f32_names.py, fp16-region/backbone kept)
+     name list from deploy/engine/_gen_f32_names.py, fp16-region/backbone kept)
      builds models/e_T6m.engine, then reset chain -> vec/mini_m/outv8_XX.
 Plus trtexec profile of e_T6m for the speed cost, then fetch both dumps.
 
@@ -28,7 +28,7 @@ import numpy as np
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEV = "/opt/m0/trt-dev"
 MODS = DEV + "/mods"
 LIST_B = MODS + "/map_f32_names.txt"

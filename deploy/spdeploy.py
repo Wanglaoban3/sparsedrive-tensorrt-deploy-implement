@@ -12,11 +12,14 @@ verbs:
   gate          ops/mprod_gate.py       精度门禁 (det/map/EPA/L2/col)
   eval          ops/m10_eval_run.py     一键评估 run (gate 全链)
   golden        ops/prod_golden.py      自检金标重标 (--runs 10 --plugin vN)
-  ft            ops/prod_ft_m9a.py      故障注入 (--suite a|b|m9a|m10 选路)
+  ft            ops/prod_ft_m9a.py      故障注入 (--suite a|b|m9a|m10 选路,
+                                        dispatcher 旗标不透传; 目标裸跑 which=
+                                        1..4|all, 缺省 all=对在线单元连杀/STOP)
   soak          ops/prod_soak.py        8h 浸泡 (满负荷验收 4 判据)
   calib         ops/m9a_thr_calib.py    trigger THR 分位数标定
   parity        ops/m9a_parity.py       trigger 规则 parity 对拍
-  boardtest     ops/m9a_boardtest.py    板上板测 (--m10 切 m10_boardtest)
+  boardtest     ops/m9a_boardtest.py    板上板测 (--m10 切 m10_boardtest,
+                                        dispatcher 旗标不透传)
   run           ops/m5_rerun.py         闭环复测 legacy|split [fetch]
   build-plugin  ops/board_mapfix.py     插件/引擎工具链 (默认 tool 段)
 
@@ -29,9 +32,6 @@ import io
 import os
 import subprocess
 import sys
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
-                              line_buffering=True)
 
 DEPLOY = os.path.dirname(os.path.abspath(__file__))
 
@@ -121,6 +121,22 @@ def cmd_status():
     sys.exit(rc)
 
 
+def _strip_ft_flags(argv):
+    """剥掉 dispatcher 自有的 --suite 旗标 (目标脚本只收位置参数)."""
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+            continue
+        if a == "--suite":
+            skip = True
+            continue
+        if a.startswith("--suite="):
+            continue
+        out.append(a)
+    return out
+
+
 def main():
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help"):
@@ -135,17 +151,21 @@ def main():
     _require_creds()
     if verb == "ft":
         target = _pick_ft(rest)
+        rest = _strip_ft_flags(rest)
     elif verb == "boardtest":
         target = _pick_boardtest(rest)
+        rest = [a for a in rest if a != "--m10"]
     else:
         target = VERBS[verb][0]
     script = os.path.join(DEPLOY, target.replace("/", os.sep))
     if not os.path.exists(script):
         print("目标脚本不存在: %s" % script)
         sys.exit(2)
-    extra = VERBS[verb][1] if verb in VERBS else []
+    extra = VERBS[verb][1]
     sys.exit(subprocess.call([sys.executable, script] + extra + rest))
 
 
 if __name__ == "__main__":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
+                                  line_buffering=True)
     main()

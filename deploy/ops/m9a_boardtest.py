@@ -1,7 +1,7 @@
-"""_m9a_boardtest.py — push given test .cpp + m9a/sp sources, compile on
+"""m9a_boardtest.py — push given test .cpp + m9a/sp sources, compile on
 board, run, print output. Usage:
 
-  set BOARD_HOST=...&& set BOARD_PASS=...&& python deploy\\_m9a_boardtest.py test_rule_load [args...]
+  set BOARD_HOST=...&& set BOARD_PASS=...&& python deploy\\m9a_boardtest.py test_rule_load [args...]
 
 Deps pushed: sp_rule.h sp_ruleload.h sp_rule_util.h sp_quota.h sp_egoring.h
 sp_result.h postproc.h + rules/*.c (rule fixtures compile at test runtime).
@@ -14,7 +14,7 @@ import glob
 
 import paramiko
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PREPOST = os.path.join(ROOT, "deploy", "board_src", "prepost")
 BDIR = "/opt/m0/trt-dev/prepost"
 BIN = "/usr/local/bin"

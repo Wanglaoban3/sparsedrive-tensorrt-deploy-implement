@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """M9a §7.5 一致性门禁驱动: 板上 C 触发器 (ctx_dump+raw events) vs
-numpy 参考实现 (_m9a_replay) 全等比对.
-用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\\_m9a_parity.py [minutes=3]
+numpy 参考实现 (m9a_replay) 全等比对.
+用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\\ops\\m9a_parity.py [minutes=3]
 留档: work_dirs/preproc_ref/m9a_parity/ (ctx 夹具不拉, report + events)"""
 import io
 import json
@@ -15,9 +15,9 @@ assert os.environ.get("BOARD_HOST") and os.environ.get("BOARD_PASS")
 import paramiko  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import _m9a_replay as rp  # noqa: E402
+import m9a_replay as rp  # noqa: E402
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PRE = os.path.join(ROOT, "deploy", "board_src", "prepost")
 BD = "/opt/m0/trt-dev/prepost"
 W = "/tmp/m9a_parity"

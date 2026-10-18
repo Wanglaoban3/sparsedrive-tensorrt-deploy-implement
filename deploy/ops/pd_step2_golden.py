@@ -3,7 +3,7 @@
 重启节点 -> 自检 PASS 断言.
 selftest-dump 不消费不 attach 环(帧0 从 manifest 直读), 旧金标指纹拦截
 不影响重标; 重标后指纹/容差都是 v11 的.
-运行时注入: set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\_pd_step2_golden.py
+运行时注入: set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\pd_step2_golden.py
 """
 import io
 import os
@@ -14,7 +14,7 @@ import time
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 assert os.environ.get("BOARD_HOST") and os.environ.get("BOARD_PASS")
 
 import paramiko  # noqa: E402

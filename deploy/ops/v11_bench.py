@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """v11 DFA gather 向量化: push 源码 -> 板端模块编译 -> 真实 IO A/B + 分相计时.
-用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python _v11_bench.py [iters]
+用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python v11_bench.py [iters]
 不重编引擎 (插件按 名字/版本/命名空间 运行时绑定); 二进制进 /usr/local/bin."""
 import os
 import sys
@@ -8,7 +8,7 @@ import time
 
 import paramiko
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = os.path.join(ROOT, "deploy", "board_src", "plugin")
 FILES = ["dfaplug_v11.cu", "test_dfa_v11.cu"]
 RDIR = "/opt/m0/trt-dev/src"

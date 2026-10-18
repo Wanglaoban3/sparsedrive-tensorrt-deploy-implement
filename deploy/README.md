@@ -43,11 +43,11 @@ deploy/
 | `gate` | ops/mprod_gate.py | 精度门禁（det/map/EPA/L2/col） |
 | `eval` | ops/m10_eval_run.py | 一键评估 run |
 | `golden` | ops/prod_golden.py | 自检金标重标 |
-| `ft` | ops/prod_ft_m9a.py | 故障注入（`--suite a\|b\|m9a\|m10` 选路） |
+| `ft` | ops/prod_ft_m9a.py | 故障注入（`--suite a\|b\|m9a\|m10` 选路，旗标为 dispatcher 所有不透传；**裸 ft = m9a 全 4 案例，对在线单元连杀/STOP**） |
 | `soak` | ops/prod_soak.py | 8h 浸泡验收 |
 | `calib` | ops/m9a_thr_calib.py | trigger THR 分位数标定 |
 | `parity` | ops/m9a_parity.py | trigger 规则 parity 对拍 |
-| `boardtest` | ops/m9a_boardtest.py | 板上板测（`--m10` 切 m10 版） |
+| `boardtest` | ops/m9a_boardtest.py | 板上板测（`--m10` 切 m10 版，旗标不透传） |
 | `run` | ops/m5_rerun.py | 闭环复测 legacy\|split [fetch]（仅 CLI，无薄壳） |
 | `build-plugin` | ops/board_mapfix.py | 插件/引擎工具链（默认 tool 段） |
 
@@ -57,7 +57,7 @@ deploy/
 ## 加新脚本前先读这个
 
 1. **一次性脚本不入库**：探针/对拍/排查脚本用完即删；结论写进
-   docs（OPTIMIZATION_SUMMARY 对应轮次）。历史上 246 个临时脚本
+   docs（OPTIMIZATION_SUMMARY 对应轮次）。历史上 245 个临时脚本
    已清洗过一次，别再攒。
 2. **运维脚本必须可被 spdeploy 调**：进 `ops/` 的脚本要么挂进
    `spdeploy.py` 的 VERBS 表，要么是某 verb 的子步骤（pd_step* 形态）；

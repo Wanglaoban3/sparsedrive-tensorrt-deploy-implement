@@ -5,7 +5,7 @@ import os
 import shutil
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EV = os.path.join(ROOT, "work_dirs", "sparsedrive_small_stage2", "evaldata")
 SRC = os.path.join(ROOT, "work_dirs", "preproc_ref", sys.argv[1])
 DST = os.path.join(EV, sys.argv[2])

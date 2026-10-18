@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Phase C+D 板端部署 step1: 停双单元 -> push+build(C1 遥测 + D 权限代码) ->
 _prod_install --no-start (新 unit UMask=0027 + m3.env v11 + tmpfiles + logrotate).
-运行时注入: set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\_pd_step1_build.py
+运行时注入: set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\pd_step1_build.py
 """
 import io
 import os
@@ -11,7 +11,7 @@ import sys
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
                               line_buffering=True)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 assert os.environ.get("BOARD_HOST") and os.environ.get("BOARD_PASS"), \
     "BOARD_HOST/BOARD_PASS must be injected via env"

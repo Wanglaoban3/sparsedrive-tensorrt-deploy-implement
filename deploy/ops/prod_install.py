@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """M-PROD Phase A 安装/卸载: systemd 单元 + /etc/sp env + tmpfiles + logrotate.
-用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python _prod_install.py [inst] [--uninstall] [--no-start]
+用法: set BOARD_HOST=..&& set BOARD_PASS=..&& python prod_install.py [inst] [--uninstall] [--no-start]
   默认      : 部署 + enable --now + 健康断言(75s 内信箱 NOMINAL)
   --no-start: 只部署文件, 不启动 (FT 脚本用)
   --uninstall: stop/disable + 删部署文件 (日志/输出数据保留), 全程可逆
@@ -22,7 +22,7 @@ for a in sys.argv[1:]:
     else:
         INST = a
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SD = os.path.join(ROOT, "deploy", "systemd")
 
 FILES = [  # (本地, 远端)
