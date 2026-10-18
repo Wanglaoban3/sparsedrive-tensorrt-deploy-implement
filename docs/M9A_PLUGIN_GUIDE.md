@@ -137,7 +137,7 @@ THR 种子值来自 ad-data-engine v0（GT 离线分布），上车感知输入�
 1. 观察模式：`SP_TRIG_OBSERVE=1` 跑 ≥3min，`observe.jsonl` 拿原始统计量
    分布（自己的统计量可临时加打点）；
 2. 分位数定阈（物理量纲阈值除外，给观测证据即可）；
-3. 门槛校准：`python deploy\_m9a_thr_calib.py 3`（现成 4 条已校准）；
+3. 门槛校准：`python deploy\m9a_thr_calib.py 3`（现成 4 条已校准）；
 4. 合成序列自测（对照 `test_rule_load.cpp` 用例 5 的形状）。
 
 ## 6. 事件流与仲裁
@@ -148,7 +148,7 @@ THR 种子值来自 ad-data-engine v0（GT 离线分布），上车感知输入�
   可调）；被吞事件只进 stderr 计数，不落盘。
 - ctx-dump 模式（`SP_TRIG_CTX_DUMP=1`）另落逐帧二进制夹具 +
   `events_raw.jsonl`（免配额），用于 §7.5 一致性比对（numpy 镜像 =
-  `deploy/_m9a_replay.py`）。
+  `deploy/ops/m9a_replay.py`）。
 
 ## 7. 常见死法（已踩实）
 

@@ -235,7 +235,7 @@ mAP/EPA。离线链（mpref）与节点闭环（m6fix）同源对拍 f0 plan 差
 motion/plan/最终轨迹 append）→ `sp_resultmon`（读取解码打印）。
 
 ```bash
-# 板端典型运行 (deploy/_m5_rerun.py legacy|split|mp 是全流程驱动)
+# 板端典型运行 (deploy/ops/m5_rerun.py legacy|split|mp 是全流程驱动)
 /usr/local/bin/sp_filesrc m3 1600 900 5 /opt/m0/trt-dev/nv12_r0/manifest.jsonl \
   /opt/m0/trt-dev/nv12_r0 --fresh --wait-cons 1
 /usr/local/bin/sp_modelnode m3 /opt/m0/trt-dev/models/e_bb2.engine \
@@ -249,7 +249,7 @@ motion/plan/最终轨迹 append）→ `sp_resultmon`（读取解码打印）。
 要点：bb2(k) 无状态产 col_feats [1,89760,256] f16 46MB D2D → e_hd 吃 8 递归
 状态（dev[0]=dev[1] 单缓冲，场景首帧 k=0/40 用模板 D2D 复位）→ 9 感知张量
 别名喂 e_mp + 9 MP 状态同约定。节点无运行时 cmd 源 → `--cmd` 默认 2 直行，
-信箱携带完整 plan_cls/reg 供下游重选。门禁三件套（`_m5_rerun.py` /
+信箱携带完整 plan_cls/reg 供下游重选。门禁三件套（`m5_rerun.py` /
 `_m6_ref.py` + `_m6_cmp.py` / `_m6b_gate.py`）：闭环 mAP/EPA 不劣化 +
 离线参考同源 A/B + 信箱解码 12/12 逐位一致。
 
@@ -283,7 +283,7 @@ RingMeta v2 双向 guard 生效——--dma 节点遇未注册池正确拒绝）�
 
 ```bash
 # 安装（unit×2 + env + tmpfiles + logrotate, 全程可逆 --uninstall）
-set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\_prod_install.py m3
+set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\prod_install.py m3
 # 单元: sp-filesrc@m3 (发布) + sp-modelnode@m3 (三级链), Restart=on-failure
 # SP_NODE_ARGS=--warmup 2 --graph --selftest --loop --frames 1000000 --no-dump
 # SP_PLUGIN=/usr/local/lib/libdfaplug_v11.so (2026-10-06 起; 回退改 v8)
@@ -293,13 +293,13 @@ set BOARD_HOST=..&& set BOARD_PASS=..&& python deploy\_prod_install.py m3
   FATAL code=13 不清理即退 → systemd 1s 拉起（热恢复实测 6.1-6.4s）；
 - **开机自检**：`--selftest` 帧0金标容差+引擎/插件 md5 指纹（金标
   /opt/m0/trt-dev/golden/m3，0444）。**换引擎/插件必须重标**：
-  `python deploy\_prod_golden.py gen --runs 10 --plugin <so 路径>`，旧
+  `python deploy\prod_golden.py gen --runs 10 --plugin <so 路径>`，旧
   金标自检走 FATAL 15 → StartLimit 熔断，重标后先 `reset-failed` 再
   start；
 - **遥测 (C1)**：`/var/lib/sp/m3/telemetry.jsonl` 1Hz（env+分段
   p50/p99+温度时钟）；`frame_log.tsv` 每帧 14 列（尾部 3 列温度/时钟）；
   `/usr/local/bin/sp_status m3 [--csv]` 一行全景（ring/信箱/双进程
-  RSS/uptime/温度），浸泡采样器 `_prod_soak.py` 即吃 --csv；
+  RSS/uptime/温度），浸泡采样器 `prod_soak.py` 即吃 --csv；
 - **权限 (D)**：环/信箱 shm 0640、/run/sp 0750、UMask=0027、日志
   100M×5 轮转 + 启动 >100MB 截断；只管新建文件（升级现场旧文件保持
   旧权限直到重建）；

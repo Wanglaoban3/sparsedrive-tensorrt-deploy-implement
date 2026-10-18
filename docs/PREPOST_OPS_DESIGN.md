@@ -275,7 +275,7 @@ v1.0-mini 元数据。回放源吃 **manifest json**(每帧:6 路 NV12 路径 +
       (基线 0.4160/0.4729/0.7481);legacy 0.4210/0.4740。
       过程抓出并修复 mat4_inv 双坑(M2 潜伏的 MESA 转录错 → 闭环
       -10pt,见 OPTIMIZATION_SUMMARY 第十二轮);复测驱动
-      deploy/_m5_rerun.py,dump 留档 mini_m3fix_81/mini_m5fix_81 |
+      deploy/ops/m5_rerun.py,dump 留档 mini_m3fix_81/mini_m5fix_81 |
 | M6a ✔ **完成**(2026-10-04) | MP 接入:e_mp 同进程第三级;9 感知张量自 hd 输出直供(名字映射
       **全等匹配**)+ 9 张历史状态外旋 D2D + **场景首帧全清零**
       (cudaMemsetAsync 同流);逐帧 dump。补齐状态输入缓冲分配
