@@ -27,7 +27,7 @@ Verification (no GPU, no custom-op build needed):
     pass); structural parity is covered by the two checks above.
 
 Usage:
-  python deploy/qdq_onnx_rewrite.py IN.onnx [OUT.onnx]
+  python deploy/engine/qdq_onnx_rewrite.py IN.onnx [OUT.onnx]
 
 OUT defaults to IN (validated before overwrite; the original is kept beside it
 as <name>_pre_rewrite.onnx). Writes <out>_rewrite_report.json and a summary.

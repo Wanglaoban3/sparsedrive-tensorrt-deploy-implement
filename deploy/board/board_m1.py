@@ -12,8 +12,8 @@ Stages (run all, or pick with --stage):
   crash     kill -9 sub mid-hold; pub must force-recycle after lease; sub rejoins
 
 Usage:
-  python deploy/board_m1.py --stage build,data,run
-  python deploy/board_m1.py --stage crash --nframes 12
+  python deploy/board/board_m1.py --stage build,data,run
+  python deploy/board/board_m1.py --stage crash --nframes 12
 """
 import argparse
 import io

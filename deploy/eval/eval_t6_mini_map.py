@@ -3,7 +3,7 @@
 mini, standalone: no mmcv / mmdet / nuscenes-devkit needed.
 
 Pipeline:
-  1. GT   - MapExtractor (deploy/map_gt.py) rebuilds per-token vectorized
+  1. GT   - MapExtractor (deploy/eval/map_gt.py) rebuilds per-token vectorized
             map ground truth from the nuScenes map-expansion jsons
             (classes 0/1/2 = ped_crossing/divider/boundary, lidar frame,
             VectorizeMap(simplify=True)-equivalent sampling).
@@ -16,7 +16,7 @@ Pipeline:
             (loaded by path; its package-relative import is rewritten).
 
 Usage (from the repo root):
-    python deploy/eval_t6_mini_map.py [--score-floor 0.0]
+    python deploy/eval/eval_t6_mini_map.py [--score-floor 0.0]
 Requires: data/infos/mini/nuscenes_infos_val.pkl, the map-expansion jsons
 under evaldata/map_expansion/, and engine dumps under
 work_dirs/sparsedrive_small_stage2/evaldata/mini_eng_v8/.

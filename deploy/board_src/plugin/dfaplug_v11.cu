@@ -3,7 +3,7 @@
 // 语义与 v8 完全一致 (logits 入 / 内联 softmax / loc 有效性 / eps-skip /
 // 双线性角点), 引擎按 名字/版本/命名空间 绑定, .so 热交换不重编引擎。
 //
-// 相对 v8 (deploy/dfaplug_v8.cu) 的两个结构变化 (P3 第六轮的剩余空间收尾):
+// 相对 v8 (deploy/board_src/plugin/dfaplug_v8.cu) 的两个结构变化 (P3 第六轮的剩余空间收尾):
 //  K1 plan  pass2 每 (anchor,c,s,p) 至多写 **一条** per-anchor 条目 (v8 按
 //    (anchor,group) 复制 G=8 份 32B 条目): EntryA 48B = {int off[4] 四角绝对
 //    元素偏移, half wt[8] 组权重(wt<eps 记 0, 与"不参与聚合"数值等价:

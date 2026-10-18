@@ -13,7 +13,7 @@ the next group).  Fresh calibration per variant keeps amax consistent with
 the FP group being present.
 
 Usage (from project root):
-    python deploy/group_sensitivity.py
+    python deploy/engine/group_sensitivity.py
 """
 
 import argparse

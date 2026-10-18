@@ -4,11 +4,11 @@ Sentinel on mini (81 frames, catches gross quantization failures) and the
 real acceptance run on trainval val (6019 frames) once the data is present.
 
 Usage (from project root):
-    python deploy/eval_nuscenes.py --mode fp32 --checkpoint ckpt/sparsedrive_stage2.pth --tag fp32
-    python deploy/eval_nuscenes.py --mode quant --checkpoint ckpt/sparsedrive_stage2_qat.pth \
+    python deploy/eval/eval_nuscenes.py --mode fp32 --checkpoint ckpt/sparsedrive_stage2.pth --tag fp32
+    python deploy/eval/eval_nuscenes.py --mode quant --checkpoint ckpt/sparsedrive_stage2_qat.pth \
         --skip-json deploy/artifacts/sparsedrive_ptq_sensitivity.json --skip-k 28 --tag int8qat
     # full val:
-    python deploy/eval_nuscenes.py --mode quant ... --version v1.0-trainval \
+    python deploy/eval/eval_nuscenes.py --mode quant ... --version v1.0-trainval \
         --ann-file data/infos/nuscenes_infos_val.pkl --max-samples 0
 """
 

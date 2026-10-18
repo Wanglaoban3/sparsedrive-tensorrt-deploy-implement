@@ -2,7 +2,7 @@
 human-readable Markdown report next to it.
 
 Run from project root:
-    python deploy/render_ptq_report.py
+    python deploy/engine/render_ptq_report.py
 """
 
 import json
@@ -111,9 +111,9 @@ w("")
 w("## 5. 复现")
 w("")
 w("```bash")
-w("python deploy/ptq_sensitivity.py --calib-samples 16 --eval-samples 16 "
+w("python deploy/engine/ptq_sensitivity.py --calib-samples 16 --eval-samples 16 "
   "--topk-curve 8")
-w("python deploy/render_ptq_report.py")
+w("python deploy/engine/render_ptq_report.py")
 w("```")
 w("")
 

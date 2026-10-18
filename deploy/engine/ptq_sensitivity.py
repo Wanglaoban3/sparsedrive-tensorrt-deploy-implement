@@ -13,7 +13,7 @@ history inputs, real calibration images from nuScenes-mini):
   5. artifacts: JSON + Markdown report with recommended skip list
 
 Usage (from project root, env with torch+mmcv+modelopt):
-    python deploy/ptq_sensitivity.py \
+    python deploy/engine/ptq_sensitivity.py \
         --config projects/configs/sparsedrive_small_stage2.py \
         --checkpoint ckpt/sparsedrive_stage2.pth \
         --calib-samples 16 --eval-samples 16

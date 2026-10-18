@@ -8,7 +8,7 @@ previous variant runs in a background thread (the actual parallelism
 available on a single-GPU box).
 
 Usage (from project root):
-    python deploy/task_sentinel.py --ks 0,14,28,56 \
+    python deploy/engine/task_sentinel.py --ks 0,14,28,56 \
         --qat-ckpt ckpt/sparsedrive_stage2_qat.pth \
         --skip-json deploy/artifacts/sparsedrive_ptq_sensitivity.json
 """

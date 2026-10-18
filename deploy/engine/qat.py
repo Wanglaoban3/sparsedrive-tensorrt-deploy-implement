@@ -10,7 +10,7 @@ Flow:
   4. save QAT checkpoint + before/after drift report
 
 Usage (from project root):
-    python deploy/qat.py --config projects/configs/sparsedrive_small_stage2.py \
+    python deploy/engine/qat.py --config projects/configs/sparsedrive_small_stage2.py \
         --checkpoint ckpt/sparsedrive_stage2.pth --iters 200 --lr 2e-5 \
         [--skip-json deploy/artifacts/sparsedrive_ptq_sensitivity.json]
 """

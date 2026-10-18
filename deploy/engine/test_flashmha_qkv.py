@@ -2,7 +2,7 @@
 q/k/v Linears must agree bit-exactly.
 
 Run from project root:
-    python deploy/test_flashmha_qkv.py
+    python deploy/engine/test_flashmha_qkv.py
 """
 
 import os

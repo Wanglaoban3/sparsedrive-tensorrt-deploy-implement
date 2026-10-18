@@ -8,7 +8,7 @@ Softmax is jointly over (cams*levels*pts) per (a, g) — identical math to the
 in-graph softmax, moved into the plugin.
 
 Usage:
-  python deploy/export_v5.py --checkpoint ckpt/sparsedrive_stage2.pth \
+  python deploy/engine/export_v5.py --checkpoint ckpt/sparsedrive_stage2.pth \
       --protect-groups det_head_output --attn-fp16 \
       --with-ref work_dirs/sparsedrive_small_stage2/mtq_v5_ref.npz \
       --out work_dirs/sparsedrive_small_stage2/sparsedrive_int8_v5.onnx

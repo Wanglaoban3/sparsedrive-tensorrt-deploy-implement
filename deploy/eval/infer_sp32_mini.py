@@ -9,7 +9,7 @@ Feeding contract mirrors tools/test_trt.py: scene-boundary reset
 first-frame zero history + dt = 0.5.
 
 Run with the sparsedrive_deploy env python (torch cu118 + mmcv 1.x):
-    H:/miniconda3/envs/sparsedrive_deploy/python.exe deploy/infer_sp32_mini.py
+    H:/miniconda3/envs/sparsedrive_deploy/python.exe deploy/eval/infer_sp32_mini.py
 """
 import copy
 import os

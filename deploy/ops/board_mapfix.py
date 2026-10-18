@@ -14,7 +14,7 @@ Plus trtexec profile of e_T6m for the speed cost, then fetch both dumps.
 Stages: push,tool,chainr,engine,chainm,prof,fetch  (default runs in order)
 
 Usage (credentials runtime-injected only, never stored):
-  set BOARD_HOST=...&& set BOARD_PASS=...&& python deploy/board_mapfix.py --stage push,tool
+  set BOARD_HOST=...&& set BOARD_PASS=...&& python deploy/ops/board_mapfix.py --stage push,tool
 """
 import argparse
 import io

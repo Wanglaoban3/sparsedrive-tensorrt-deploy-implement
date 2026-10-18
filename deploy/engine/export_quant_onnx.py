@@ -4,13 +4,13 @@ Reuses SparseDriveONNXWrapper so the graph matches the deployment contract
 (inputs/outputs, SparseDrive::DeformableAggregation custom node). Fake-quant
 modules export as standard QuantizeLinear/DequantizeLinear pairs (opset 13).
 
-After export, run deploy/qdq_onnx_rewrite.py (copied from the SparseDriveV2
+After export, run deploy/engine/qdq_onnx_rewrite.py (copied from the SparseDriveV2
 deploy toolchain) to normalize the QDQ structure: per-site weight Q folded to
 int8 initializers feeding DequantizeLinear, Constant-node scale/zp moved to
 shared initializers - the "standard ORT-style" QDQ layout.
 
 Usage (from project root):
-    python deploy/export_quant_onnx.py --checkpoint ckpt/sparsedrive_stage2_qat.pth \
+    python deploy/engine/export_quant_onnx.py --checkpoint ckpt/sparsedrive_stage2_qat.pth \
         --out work_dirs/sparsedrive_small_stage2/sparsedrive_int8.onnx
 """
 

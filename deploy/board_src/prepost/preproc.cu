@@ -1,5 +1,5 @@
 // preproc.cu — M2 CUDA 前处理 (模块级编译纪律: nvcc -arch=sm_87 -c)
-// 数值口径 = deploy/preproc_ref.py (Pillow 12.3 Resample.c 8bpc 定点移植,
+// 数值口径 = deploy/ops/preproc_ref.py (Pillow 12.3 Resample.c 8bpc 定点移植,
 // 本地 selftest 已对 1600x900→704x396 位级对齐 diff px=0).
 #include "preproc.h"
 
@@ -27,7 +27,7 @@ __host__ int ctrunc(double v) { return (int)v; }  // C 截断 (向零)
 
 }  // namespace
 
-// ---- host: 造表 (与 deploy/preproc_ref.py pil_coeffs_int 逐位一致) ----
+// ---- host: 造表 (与 deploy/ops/preproc_ref.py pil_coeffs_int 逐位一致) ----
 
 bool build_axis_lut(int in_size, int out_size, AxisLUT* lut) {
   const double scale = (double)in_size / out_size;

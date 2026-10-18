@@ -3,7 +3,7 @@
 frames, dumped in the ENGINE dump format so the standalone map/det evals
 consume it exactly like a board dump.
 
-Quantization provenance mirrors deploy/export_v5.py line by line (same
+Quantization provenance mirrors deploy/engine/export_v5.py line by line (same
 checkpoint, seeds, 16-sample train-pipeline calibration, det_head_output
 protection).  On top of that it adds the two engine-side graph surgeries:
 
@@ -23,7 +23,7 @@ Output: work_dirs/sparsedrive_small_stage2/evaldata/mini_b2/
         out_XX/{map_cls,map_pts,det_cls,det_bbox,det_quality}.bin + tokens
 
 Run (from repo root, sparsedrive_deploy env):
-    H:/miniconda3/envs/sparsedrive_deploy/python.exe deploy/infer_b2_int8fp16_mini.py
+    H:/miniconda3/envs/sparsedrive_deploy/python.exe deploy/eval/infer_b2_int8fp16_mini.py
 """
 import functools
 import os
