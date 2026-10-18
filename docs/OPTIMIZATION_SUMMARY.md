@@ -1,5 +1,24 @@
 # SparseDrive TensorRT 板端部署优化总结
 
+## 路径迁移表（2026-10-18 重整）
+
+正文各轮次中的旧路径**保持原样**（历史叙事，git 历史可查）；按本表折算
+到当前布局。仓库根另有 AGENTS.md 实时口径。
+
+| 旧位置（≤2026-10-17） | 新位置 |
+|---|---|
+| `deploy/prepost/**` | `deploy/board_src/prepost/**`（文件名不变） |
+| `deploy/board_m1.py` | `deploy/board/board_m1.py` |
+| `deploy/dfaplug_v3.cu`、`dfaplug_v8.cu`、`dfaplug_v11.cu`、`test_dfa_v11.cu` | `deploy/board_src/plugin/` |
+| `deploy/run_engine.cpp`、`run_engine2.cpp`、`run_engines.cpp`、`onnx2engine.cpp` | `deploy/board_src/runner/` |
+| 导出/量化链（`export_*.py`、`qdq_onnx_rewrite.py`、`split_*.py`、`requant_fpn.py`、`prep_mini_inputs.py` 等） | `deploy/engine/` |
+| 评估/对拍（`eval_t6_mini*.py`、`eval_mp_mini.py`、`map_gt.py`、`infer_*.py`、`compare_m2.py / compare_m3.py` 等） | `deploy/eval/` |
+| 分析/取证（`_cmp_*.py`、`_probe_dumpmeta.py`、`_probe_decode_check.py`、`_probe_m4_report.py`、`_inv_verify.py`、`_fa_part.cu`、`selftest_fa*.cu`） | `deploy/analysis/`（保留原名） |
+| 其余活跃运维驱动（`_prod_*.py`、`_m10_*.py`、`_m9a_*.py`、`_mprod_*.py`、`_pd_step*.py`、`_m5_rerun`、`board_mapfix.py`、`v11_*.py`、`preproc_ref/`、`ref_check.py`） | `deploy/ops/` |
+| `deploy/_*.py`（ops/eval 落点） | **去 `_` 前缀**：`ops/prod_install.py` 等；`analysis/` 与 `engine/_gen_f32_names.py` 保留原名 |
+
+统一入口 `python deploy/spdeploy.py <verb>`；薄壳 `scripts/sp-*.sh`。
+
 ## 交付版本（2026-10-04 定稿：拆分链 bb2+hd）
 
 **感知模块最终交付 = 两引擎链**（第十一轮终审后用户拍板；原单引擎组合

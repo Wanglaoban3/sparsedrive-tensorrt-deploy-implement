@@ -3,7 +3,7 @@
 > 定稿 2026-10-03。本文是从训练权重到板端闭环节点的**端到端复刻手册**：
 > 量化与敏感层分析的完整故事（含 head 量化为何放弃）、每阶段命令、
 > 关键指标、坑索引。深度细节见各专篇：
-> 量化策略 [`deploy/ONNX_QUANT_STRATEGY.md`](../deploy/ONNX_QUANT_STRATEGY.md)；
+> 量化策略 [`deploy/engine/ONNX_QUANT_STRATEGY.md`](../deploy/engine/ONNX_QUANT_STRATEGY.md)；
 > 优化历程与坑 [`OPTIMIZATION_SUMMARY.md`](OPTIMIZATION_SUMMARY.md)；
 > 前后处理节点设计 [`PREPOST_OPS_DESIGN.md`](PREPOST_OPS_DESIGN.md)；
 > 板子环境 [`BOARD_ENV.md`](BOARD_ENV.md)；日常速查仓库根 `AGENTS.md`（本地文件，不入库）。
@@ -66,14 +66,14 @@ INT8 QAT skip28 0.4081 / 0.5200（量化代价 −0.53 / −0.26 点）。
   GPU Tesla P100-16GB，只做量化/导出/对拍，不编引擎）。系统默认 `python`
   (3.11) 跑无 mmcv 依赖的 eval/map 脚本。
 - **板子（智己 Orin X）**：SSH `root@192.168.2.104` 密码 `nvidia`，paramiko 驱动
-  （`deploy/board_m1.py` 的 `launch()`）。TRT 8.6.1.2 / JetPack / sm_87。
+  （`deploy/board/board_m1.py` 的 `launch()`）。TRT 8.6.1.2 / JetPack / sm_87。
   **不动板子环境**；产物只放 `/usr/local/{bin,lib}`；`/opt/m0` noexec（脚本
   `bash x.sh` 调起）；板载只有 python2.7/3.8，对拍解析全在本地做。
 - **数据**：mini val 81 帧来自 `data/infos/mini/nuscenes_infos_val.pkl`；
   引擎格式输入向量在 `work_dirs/board_vectors`（推板后= `/opt/m0/trt-dev/vec/mini`，
   每帧 `in_XX/` 目录 + `manifest.tsv`）；量化校准 16 样本在 `work_dirs/board_vectors_mtq`；
   节点模拟图像源 `work_dirs/nv12_r0`（`tools/make_nv12_manifest.py` 生成 manifest）。
-- 板端引擎构建器 `/usr/local/bin/onnx2engine2`（源码 `deploy/onnx2engine.cpp`），
+- 板端引擎构建器 `/usr/local/bin/onnx2engine2`（源码 `deploy/board_src/runner/onnx2engine.cpp`），
   关键开关：`--f32-names list.txt`（按 ONNX 节点名精确保 FP32 层）、
   `--f32-substr a,b,c`（按名字子串）、`--f32-notq`（Q/DQ 邻接区外全 FP32）、
   `--plugins libdfaplug_v8.so`。
@@ -144,14 +144,14 @@ ORT 重放逐位相等；DFA 12 个节点输入边全 FP 收尾（报告
 
 ```bash
 # 复刻命令 (sparsedrive_deploy 环境)
-python deploy/ptq_sensitivity.py --calib-samples 16 --eval-samples 16
-python deploy/render_ptq_report.py
-python deploy/group_sensitivity.py            # 组级 mAP/NDS 留组法
-python deploy/task_sentinel.py                # 81 帧配对任务哨兵
-python deploy/export_quant_onnx.py --checkpoint ckpt/sparsedrive_stage2.pth \
+python deploy/engine/ptq_sensitivity.py --calib-samples 16 --eval-samples 16
+python deploy/engine/render_ptq_report.py
+python deploy/engine/group_sensitivity.py            # 组级 mAP/NDS 留组法
+python deploy/engine/task_sentinel.py                # 81 帧配对任务哨兵
+python deploy/engine/export_quant_onnx.py --checkpoint ckpt/sparsedrive_stage2.pth \
     --protect-groups det_head_output --attn-fp16 \
     --out work_dirs/sparsedrive_small_stage2/sparsedrive_int8_dho.onnx
-python deploy/qdq_onnx_rewrite.py work_dirs/.../sparsedrive_int8.onnx
+python deploy/engine/qdq_onnx_rewrite.py work_dirs/.../sparsedrive_int8.onnx
 ```
 
 ## 5. 阶段 3 —— 拆分图手术与 MP 导出（本地）
@@ -160,10 +160,10 @@ python deploy/qdq_onnx_rewrite.py work_dirs/.../sparsedrive_int8.onnx
 |---|---|---|
 | `sparsedrive_fp32.onnx` (283MB) | 时序图导出（instance_t_matrix/time_interval 进图，静态 shape, opset13） | — |
 | `sparsedrive_int8_v3_fold5.onnx` (173MB) | PTQ+QDQ 折叠（§4） | e_T6 |
-| `sp_backbone2.onnx` (26MB) | `deploy/split_engine.py`（拆分）+ `requant_fpn.py`（FPN 再量化口径） | e_bb2 |
-| `sp_head.onnx` (93MB) | `deploy/split_engine.py`：特征图+prev/metas → 19 输出 | e_hd |
-| `sp_head_det/rest.onnx` | `deploy/split_head.py`（二段拆分，P4 实验留档，无收益） | （留档） |
-| `v5_mp.onnx` (47MB) | `deploy/export_mp_onnx.py`：MotionPlanningHead `forward_onnx` 纯函数化（Roll→cat-shift 见 diff 注释） | e_mp |
+| `sp_backbone2.onnx` (26MB) | `deploy/engine/split_engine.py`（拆分）+ `requant_fpn.py`（FPN 再量化口径） | e_bb2 |
+| `sp_head.onnx` (93MB) | `deploy/engine/split_engine.py`：特征图+prev/metas → 19 输出 | e_hd |
+| `sp_head_det/rest.onnx` | `deploy/engine/split_head.py`（二段拆分，P4 实验留档，无收益） | （留档） |
+| `v5_mp.onnx` (47MB) | `deploy/engine/export_mp_onnx.py`：MotionPlanningHead `forward_onnx` 纯函数化（Roll→cat-shift 见 diff 注释） | e_mp |
 
 保层清单：`map_f32_names.txt` / `seg_f32_names.txt`（`_gen_f32_names.py` 生成），
 构建 e_T6/e_hd 时 `--f32-names` 传入——时序 bank/TopK 等对半精度敏感层强制 FP32。
@@ -177,7 +177,7 @@ python deploy/qdq_onnx_rewrite.py work_dirs/.../sparsedrive_int8.onnx
 ```bash
 # 板端编译 (缺 -lnvinfer 时 trtexec 加载报 undefined symbol: getPluginRegistry)
 nvcc -O3 -arch=sm_87 -shared -Xcompiler -fPIC \
-  -o /usr/local/lib/libdfaplug_v8.so deploy/dfaplug_v8.cu -lnvinfer
+  -o /usr/local/lib/libdfaplug_v8.so deploy/board_src/plugin/dfaplug_v8.cu -lnvinfer
 ```
 
 同名/同命名空间多版本 .so 并存安全（按路径显式 dlopen；TRT registry
@@ -229,7 +229,7 @@ mAP/EPA。离线链（mpref）与节点闭环（m6fix）同源对拍 f0 plan 差
 
 ## 9. 阶段 7 —— 闭环节点（交付运行形态）
 
-源码 `deploy/prepost/`：`sp_filesrc`（NV12 图像源/模拟器）→ 共享内存总线
+源码 `deploy/board_src/prepost/`：`sp_filesrc`（NV12 图像源/模拟器）→ 共享内存总线
 （seqlock + 槽位回收锁+fence，M1.5 纪律）→ `sp_modelnode`（前处理 preproc.cu
 + 三级引擎 + 状态递归 + 结果发布）→ `sp_result` v2 信箱（det+map CRC、
 motion/plan/最终轨迹 append）→ `sp_resultmon`（读取解码打印）。
@@ -272,7 +272,7 @@ flags=0 与 lazy 均试）；(c) NvBufSurface 运行库/头文件不在本镜像
 （sp_dmapool.h/.cpp、sp_bus v2 RingMeta dma 尾字段、claim_of/commit_dma）
 留档为真实相机迁移点：JetPack 多媒体镜像上仅需把消费端 handle 类型
 OpaqueFd→DmaBufFd（cudaExternalMemoryImportFd），池/fence/节点机制复用。
-证据链：`deploy/prepost/probe_vmm.cu` / `probe_vmm2.cu`（板端
+证据链：`deploy/board_src/prepost/probe_vmm.cu` / `probe_vmm2.cu`（板端
 `nvcc -O2 -arch=sm_87 ... -lcuda`，驱动 `deploy/_m8_probe.py`）；
 门禁 `_m8_gate.py`（base 模式 81 帧、pre p50=1.45ms、信箱 81 写全过；
 RingMeta v2 双向 guard 生效——--dma 节点遇未注册池正确拒绝）。

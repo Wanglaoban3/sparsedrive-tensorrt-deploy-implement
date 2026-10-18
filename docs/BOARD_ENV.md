@@ -53,9 +53,9 @@
 ### 系统级工具
 
 ```
-/usr/local/bin/onnx2engine2   # ONNX→TRT 编译工具 (自研 C++, 源码 deploy/onnx2engine.cpp)
-/usr/local/bin/run_engine     # 单引擎推理运行器 (deploy/run_engine.cpp)
-/usr/local/bin/run_engines    # N 引擎链式 runner (deploy/run_engines.cpp)
+/usr/local/bin/onnx2engine2   # ONNX→TRT 编译工具 (自研 C++, 源码 deploy/board_src/runner/onnx2engine.cpp)
+/usr/local/bin/run_engine     # 单引擎推理运行器 (deploy/board_src/runner/run_engine.cpp)
+/usr/local/bin/run_engines    # N 引擎链式 runner (deploy/board_src/runner/run_engines.cpp)
 /usr/local/lib/libdfaplug_v8.so  # 交付 DFA 插件
 /usr/src/tensorrt/bin/trtexec # TRT 自带 profiling 工具
 ```
@@ -101,7 +101,7 @@ manifest 格式: `name\tdtype\tshape\tfile`
 bash repro/mini_pipeline_v8.sh   # 约 3-4 分钟
 
 # 2. 输出拉回本地，运行 mAP 评估
-python deploy/eval_t6_mini_v8.py
+python deploy/eval/eval_t6_mini_v8.py
 ```
 
 ## 已知限制
@@ -128,8 +128,8 @@ python deploy/eval_t6_mini_v8.py
    （prev_* 全部清零，time_interval 设 0.5，instance_t_matrix 设单位
    矩阵）。引擎图内的 dt 防护无效，必须在宿主侧处理。
 
-2. **mini 验证数据准备**：用 `deploy/prep_mini_inputs.py` 生成
+2. **mini 验证数据准备**：用 `deploy/eval/prep_mini_inputs.py` 生成
    81 帧引擎输入。场景边界帧（帧 40）会自动写零状态。
 
-3. **mini 评估**：用 `deploy/eval_t6_mini_v8.py` 在本地解码+评估，
+3. **mini 评估**：用 `deploy/eval/eval_t6_mini_v8.py` 在本地解码+评估，
    需要 nuScenes mini 数据集 + deploy/artifacts 下的输出。

@@ -178,8 +178,8 @@ v1.0-mini 元数据。回放源吃 **manifest json**(每帧:6 路 NV12 路径 +
       成功;崩溃注入 5 次 claim 超时(5s 租约)后 forced=1 回收,重加入
       consumer id=1 零错误,传输延迟 p50=3.4ms。本地(WSL)先验证:100fps
       精确节奏、背压、崩溃恢复、重加入、全平面图案校验。文件:
-      deploy/prepost/{sp_bus,image_source,file_source,sp_filesrc}+
-      {sp_pub,sp_sub,sp_inspect};驱动 deploy/board_m1.py(build/data/run/
+      deploy/board_src/prepost/{sp_bus,image_source,file_source,sp_filesrc}+
+      {sp_pub,sp_sub,sp_inspect};驱动 deploy/board/board_m1.py(build/data/run/
       crash 四阶段);R0 数据 tools/make_nv12_manifest.py→work_dirs/nv12_r0
       (81 帧×6 路 BT.601 full-range,场景边界 k=40 复核,往返 MAE 0.1) |
 | M1.5 ✅ **完成**(2026-10-03) | fence 回收(cudaEvent 记账,引用释放挂事件后)+ CUDA stream 纪律 | 回收正确性
@@ -191,7 +191,7 @@ v1.0-mini 元数据。回放源吃 **manifest json**(每帧:6 路 NV12 路径 +
       `cudaHostGetDevicePointer` 后 GPU 直读 registered shm 带宽实测
       **12.96 GB/s**(12.9MB/1ms);**Default 注册 + host 指针解引用 =
       illegal memory access**(GPU 页表无该映射),必须走 Mapped+设备指针。
-      文件:deploy/prepost/sp_kernels.{h,cu} + sp_sub --fence/--race +
+      文件:deploy/board_src/prepost/sp_kernels.{h,cu} + sp_sub --fence/--race +
       board_m1.py fence 阶段 |
 | M2 ✅ **完成**(2026-10-04) | P0 LUT(轴分离定点重采样表;**Pillow 12.3
       Resample.c 定点公式逐位复刻**: kint=round-half-away(w·2^22),
@@ -229,7 +229,7 @@ v1.0-mini 元数据。回放源吃 **manifest json**(每帧:6 路 NV12 路径 +
       forced=0 零回收, GR3D 稳态 p50=99%。口径注意: 事件链 gpu_ms 含
       队列等待(饱和时 ≈2×单帧服务), 延迟(节拍跑)与吞吐(不限速跑)分开测。
       文件: sp_modelnode.cpp(重写) + board_m1.py m3(--graph/--serial/
-      --fps/--fetch log/--loop) + deploy/_probe_m4_report.py |
+      --fps/--fetch log/--loop) + deploy/analysis/_probe_m4_report.py |
 | 算子库收尾 ✅ **完成**(2026-10-04) | Q1 det decode + Q2 阈值参数化 +
       Q3 map decode(postproc.h; **口径逐位对齐离线评测脚本**
       eval_t6_mini_v8 / eval_t6_mini_map: sigmoid → 摊平 9000 稳定
@@ -249,7 +249,7 @@ v1.0-mini 元数据。回放源吃 **manifest json**(每帧:6 路 NV12 路径 +
       JSON 旁路仅验证跑(+5.9ms); flags=127(source_ok+6 路 cam_ok)
       端到端可见。文件: postproc.h + sp_result.h + sp_resultmon.cpp +
       sp_modelnode.cpp(--det-thr/--map-thr/--det-topk/--mailbox) +
-      deploy/_probe_decode_check.py |
+      deploy/analysis/_probe_decode_check.py |
 | DLA 实验 ✅ **完成**(2026-10-04; 用户批准的一次全量构建尝试) |
       结论: **本模型/本栈 DLA 离载不可行, 该优化杠杆关闭**。三级证据:
       (1) 全图 e_T6 trtexec --useDLACore=0 --allowGPUFallback:
