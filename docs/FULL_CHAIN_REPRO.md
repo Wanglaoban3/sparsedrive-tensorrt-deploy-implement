@@ -65,7 +65,8 @@ INT8 QAT skip28 0.4081 / 0.5200（量化代价 −0.53 / −0.26 点）。
   （3.10, torch 2.0.1+cu118, mmcv 1.x, nuscenes devkit, ModelOpt 0.11；
   GPU Tesla P100-16GB，只做量化/导出/对拍，不编引擎）。系统默认 `python`
   (3.11) 跑无 mmcv 依赖的 eval/map 脚本。
-- **板子（智己 Orin X）**：SSH `root@192.168.2.104` 密码 `nvidia`，paramiko 驱动
+- **板子（NVIDIA Orin X）**：SSH `root@<BOARD_IP>`，密码经环境变量
+  `BOARD_PASS` 注入，paramiko 驱动
   （`deploy/board/board_m1.py` 的 `launch()`）。TRT 8.6.1.2 / JetPack / sm_87。
   **不动板子环境**；产物只放 `/usr/local/{bin,lib}`；`/opt/m0` noexec（脚本
   `bash x.sh` 调起）；板载只有 python2.7/3.8，对拍解析全在本地做。

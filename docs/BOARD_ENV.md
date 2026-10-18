@@ -2,7 +2,7 @@
 
 ## 硬件
 
-- 设备：智己 IM Orin X 域控制器
+- 设备：NVIDIA Orin X 车规域控开发板
 - SSH: `root@<BOARD_IP>`（密码经环境变量 `BOARD_PASS` 注入，
   板子地址经 `BOARD_HOST`，见 `deploy/board_*.py` 驱动脚本）
 - SoC: NVIDIA Orin-X (sm_87)
