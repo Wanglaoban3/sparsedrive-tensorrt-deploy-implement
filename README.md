@@ -1,254 +1,134 @@
-[中文版](README_CN.md) | English
+# SparseDrive TensorRT 车端部署（智己 Orin X）
 
-# SparseDrive TensorRT Deployment and Acceleration Guide
+English: see docs/ — end-to-end SparseDrive on NVIDIA Orin X, 82.6→39.1 ms closed-loop with production hardening.
 
-## 📖 Introduction
+基于上游 [SparseDrive](https://github.com/swc-17/SparseDrive)（CVPR 2024），
+把端到端自动驾驶模型（检测 + 在线建图 + 运动预测 + 规划）完整部署到
+车规域控芯片 **NVIDIA Orin X**，并完成量产化硬化。**所有精度结论都是
+闭环口径**——三引擎链在板上按帧递推跑完 nuScenes mini 81 帧，任何改动
+过端到端 decode 门禁才算数。
 
-Based on the official [SparseDrive](https://github.com/swc-17/SparseDrive.git)
-source code, this project deploys the end-to-end SparseDrive model to
-TensorRT on **two targets**:
+## ✨ 亮点
 
-1. **Workstation GPU (RTX 3090)** — FP16 multi-engine pipeline
-   (~7.4× throughput, planning metrics aligned with PyTorch, see below).
-2. **Automotive SoC (NVIDIA Orin X domain controller)** — production-style
-   delivery: a single engine with **INT8 backbone/neck + FP16 head**, a
-   custom **plan+gather dual-kernel DFA plugin**, and an eight-round
-   optimization journal — **82.6 ms → 38.99 ms (2.12×)** with perception
-   accuracy at parity.
+- **闭环三引擎链 39.11 ms/帧**（INT8 时代起点 82.6 ms，**2.11×**）：
+  `e_bb2`（backbone/neck INT8）→ D2D 零拷贝边界张量 → `e_hd`（head FP16
+  + v11 DFA gather 向量化 CUDA 插件）→ `e_mp`（motion/planning FP16 时序图）
+- **精度与 FP32 基线打平**：det mAP **0.4157** / NDS **0.4724** /
+  map mAP **0.7462**（FP32 PyTorch 0.7512）；量化数学本身只伤
+  **-0.4 pt**（PTQ MTQ + 敏感层保护，量化损伤与编译损伤已分离定案）
+- **量产硬化全套**：节点内 watchdog 分级弃帧、systemd 熔断拉起、
+  开机自检（金标容差 + 四 md5 指纹）、1Hz 遥测、shm 权限收紧、
+  8h 满负荷浸泡 4/4 PASS
+- **14 规则事件触发器**：CPU 10Hz 第三类进程，**零关键链改动**，
+  parity 951 tick 事件集合全等；规则以 .so 插件热接入（ABI v1）
+- **21 轮优化日志**：正负结果同权重留档，每轮含归因证据链
+  （FP32 基线一键复现、门禁数据、探针取证）
 
-Everything here targets Linux (JetPack 5.1.5 / TensorRT 8.6.1.2 / CUDA 11.4 /
-sm_87 on the board side; CUDA 11.6 build host for export). Accuracy gates are
-closed-loop: every accepted change re-runs nuScenes evaluation.
+## 📊 指标总表
 
-## 🚗 Jetson Orin Delivery (headline result)
-
-| Item | Value |
-|---|---|
-| Engine | single `e_T6.engine` (INT8 backbone+neck QDQ, FP16 head, FP16 DFA weights) |
-| Plugin | `libdfaplug_v8.so` — DeformableAggregation plan+gather dual kernel (self-allocating workspace, v3 fallback inside) |
-| Latency | **38.99 ms / 25.6 FPS** (100-iter mean; INT8-era baseline 82.6 ms / 12.1 FPS) |
-| Accuracy | mini mAP **0.4203** / NDS **0.4738** (FP32 engine baseline 0.4178 — parity) |
-
-### Optimization journal (8 rounds)
-
-| Round | Change | Δ latency |
+| 指标 | 值 | 口径 |
 |---|---|---|
-| 1 | kps 6-D broadcast MatMul → 3-D GEMM rewrite | **−19.6 ms** |
-| 2 | DFA plugin `__half2` + FP16 IO | **−7.5 ms** |
-| 3 | softmax folded into DFA (raw-logits export) | **−4.7 ms** |
-| 4 | head full-FP16 graph (P1) | neutral — TRT 8.6 degraded-region wall |
-| 5 | 7 graph/kernel experiments (QKV merge, int8 DFA input, …) | no gain (documented) |
-| 6 | DFA **plan+gather dual kernel** (v8) | **−6.3 ms** |
-| 7 | engine splitting bb/head/det/rest (P4) | **negative** — split tax > fusion gain |
-| 8 | FlashAttention plugin for det attention (P5) | **negative** — TRT's fused chains run at ~5 TFLOPS, hand-written wmma ~1.6 TFLOPS |
+| 闭环链延迟 | **39.11 ms**（起点 82.6 ms，2.11×） | bb2+hd 拆分链 + v11 插件，v8 口径 39.86 |
+| det mAP / NDS | **0.4157 / 0.4724** | mini 81 帧闭环，v8 对照 0.4160/0.4729 |
+| map mAP | **0.7462** | FP32 PyTorch 0.7512 |
+| 量化损伤 | map **-0.4 pt**（B2a 0.7473） | 量化数学 vs 引擎编译损伤已分离定案 |
+| EPA(car/ped) / L2 / col | 0.6039/0.5080 / 0.7398 / 0.161% | M-PROD Phase A 闭环（规划侧） |
+| 事件触发器 | 14 规则 .so，CPU 10Hz，零关键链改动 | M9a parity 951 tick 集合全等 |
+| 优化日志 | 21 轮，负结果同权重留档 | [docs/OPTIMIZATION_SUMMARY.md](docs/OPTIMIZATION_SUMMARY.md) |
 
-Negative results are documented with the same rigor as the wins (measured
-ceilings, probe/replay numerics methodology, root causes) — see
-[docs/OPTIMIZATION_SUMMARY.md](docs/OPTIMIZATION_SUMMARY.md), which doubles
-as a pitfall log for TRT 8.6 deployment on this class of hardware.
+单引擎回退组合（`e_T6` + v8 插件，38.99 ms / det 0.4203 / NDS 0.4738 /
+map 0.6471）完整保留，随时可切。
 
-### Deploy on the board
+## 🏗 架构
 
-Prerequisites: JetPack 5.1.5, TensorRT 8.6.1.2, CUDA 11.4 (sm_87).
+三引擎闭环数据流（板上每帧递推，状态跨帧外旋）：
+
+```
+6×camera ──► e_bb2 (INT8 backbone/neck)
+                │  边界张量 /Reshape_9_output_0  col_feats [1,89760,256]
+                ▼  D2D 零拷贝（run_engine2）
+            e_hd (FP16 head + libdfaplug_v11.so DFA gather 向量化)
+                │  感知输出：det (900×10) / map / instance 状态 (递归反馈)
+                ▼
+            e_mp (FP16 motion/planning，吃感知输出 + 9 张外旋历史状态；
+                  场景首帧零状态复位)
+                │  motion_cls/reg + plan_cls/reg + final_plan
+                ▼
+        sp_result_m3 信箱（seqlock 单写多读）──► sp_trigger（10Hz 规则评估）
+                                            ──► sp_resultmon / 下游
+```
+
+常驻拓扑 = 三个 systemd 单元：`sp-filesrc@m3`（帧发布源）→
+`sp-modelnode@m3`（三引擎闭环节点，watchdog/selftest/遥测内建）→
+`sp-trigger@m3`（事件触发器，只读信箱）。模型结构见
+`resources/overview.png`（上游图）。
+
+## 🚀 快速上手
 
 ```bash
-# 1. Export the delivery ONNX graph (INT8 QDQ + FP16 head + logits-DFA)
-python deploy/export_v5.py --checkpoint ckpt/sparsedrive_stage2.pth \
-    --protect-groups det_head_output --attn-fp16 \
-    --with-ref work_dirs/sparsedrive_small_stage2/mtq_v5_ref.npz \
-    --out work_dirs/sparsedrive_small_stage2/v5_P1h.onnx
+git clone <this-repo>
+cd sparsedrive-tensorrt-deploy-implement
+pip install -r requirement.txt          # 上游 SparseDrive 环境（导出/评估用）
 
-# 2. Build the board-side engine compiler and compile (INT8 needs a calibration cache)
-g++ -O2 -o onnx2engine2 deploy/onnx2engine.cpp -I $TRT_INCLUDE_DIR \
-    -L $CUDA_LIB -lnvinfer -lnvonnxparser -lcudart -ldl
-./onnx2engine2 v5_P1h.onnx e_T6.engine --int8 --fp16 --ws-mb 2048 \
-    --plugins libdfaplug_v8.so
-
-# 3. Build the plugin (nvcc, sm_87)
-nvcc -O3 -shared -Xcompiler -fPIC -o libdfaplug_v8.so deploy/dfaplug_v8.cu \
-    -I $TRT_INCLUDE_DIR -lnvinfer
-
-# 4. Run (single engine; or chain engines D2D with run_engines)
-g++ -O2 -o run_engine deploy/run_engine.cpp -I $TRT_INCLUDE_DIR \
-    -L $CUDA_LIB -lnvinfer -lcudart -ldl
-./run_engine e_T6.engine libdfaplug_v8.so <inputs_dir> [--iters 100 --warmup 10]
+# 板端凭据只运行时注入，不落盘不入库：
+BOARD_HOST=<board-ip> BOARD_PASS=<pass> scripts/sp-install.sh   # 安装+健康断言
+BOARD_HOST=<board-ip> BOARD_PASS=<pass> scripts/sp-status.sh    # 只读全景
+BOARD_HOST=<board-ip> BOARD_PASS=<pass> scripts/sp-gate.sh      # 精度门禁
 ```
 
-Board environment (directories, boot behavior, known firmware limitations,
-mini 81-frame closed-loop accuracy gate via
-`repro/mini_pipeline_v8.sh` + `deploy/eval_t6_mini_v8.py`):
-[docs/BOARD_ENV.md](docs/BOARD_ENV.md).
+统一入口 `python deploy/spdeploy.py <verb>`（13 个 verb，`--help` 看全表）；
+`scripts/sp-*.sh` 是带凭据断言的薄壳。引擎构建、量化、数据准备的完整
+复刻步骤见 [docs/FULL_CHAIN_REPRO.md](docs/FULL_CHAIN_REPRO.md)。
 
-> Engines bind plugins by **name/version/namespace** at deserialize time, so
-> the `.so` can be hot-swapped without rebuilding the engine (rounds 6-8 were
-> developed entirely this way, module-level, per the no-full-rebuild rule).
+## 📦 交付物清单（板上 /usr/local/{bin,lib}）
 
-## 🖥️ Workstation Pipeline (RTX 3090, FP16 multi-engine)
+| 交付物 | 指纹（板上 md5） |
+|---|---|
+| `e_bb2.engine`（INT8 backbone/neck） | `f375467e…` |
+| `e_hd.engine`（FP16 head + DFA） | `8c3a6257…` |
+| `e_mp.engine`（FP16 motion/planning，26.57 MB） | `5e4a48ab…` |
+| `libdfaplug_v11.so`（gate build `f46f5bf7…`） | nvcc 时间戳致每次编译 md5 不同，以功能/自检为准 |
+| `libdfaplug_v8.so`（回退） | `55df31bc…` |
+| `run_engine2`（D2D 零拷贝链 runner） | `60dff83b…` |
+| `run_engines`（N 引擎泛化 runner） | `0b4da654…` |
+| `sp_modelnode`（闭环节点）+ `sp_filesrc` + `sp_trigger` + 14 规则 .so | 自检四指纹核对（`--selftest`） |
 
-### 1. Environment Setup & Plugin Compilation
+回退单引擎 `e_T6.engine`（`7fbcdac1…`）完整保留。插件与引擎按
+名字/版本/命名空间运行时绑定——**换 .so 不用重编引擎**。
 
-#### Set up a new virtual environment
-```bash
-conda create -n sparsedrive python=3.8 -y
-conda activate sparsedrive
-```
+## 🗺 仓库地图
 
-#### Install dependency packages
-```bash
-sparsedrive_path="path/to/sparsedrive"
-cd ${sparsedrive_path}
-pip3 install --upgrade pip
-pip3 install torch==1.13.0+cu116 torchvision==0.14.0+cu116 torchaudio==0.13.0 --extra-index-url https://download.pytorch.org/whl/cu116
-pip3 install -r requirement.txt
-```
+| 目录 | 职责 |
+|---|---|
+| `scripts/` | 上游训练壳 5 个 + `sp-*.sh` 部署薄壳 12 个 |
+| `repro/` | 板端链脚本（`mini_pipeline*.sh` 等逐帧状态旋转） |
+| `deploy/` | 全部部署工程（七层地图见 [deploy/README.md](deploy/README.md)） |
+| `tools/`, `projects/` | 上游 SparseDrive 原样 |
+| `docs/` | 项目文档（见下） |
 
-#### Compile the deformable_aggregation CUDA op
-```bash
-cd projects/mmdet3d_plugin/ops
-python3 setup.py develop
-cd ../../../
-```
+## 📚 文档地图
 
-#### Prepare the data
-Download the [NuScenes dataset](https://www.nuscenes.org/nuscenes#download) and CAN bus expansion, put CAN bus expansion in /path/to/nuscenes, create symbolic links.
-```bash
-cd ${sparsedrive_path}
-mkdir data
-ln -s path/to/nuscenes ./data/nuscenes
-```
+| 文档 | 内容 |
+|---|---|
+| [docs/OPTIMIZATION_SUMMARY.md](docs/OPTIMIZATION_SUMMARY.md) | **先读**：21 轮优化日志，含主要坑与负结果归档 |
+| [docs/FULL_CHAIN_REPRO.md](docs/FULL_CHAIN_REPRO.md) | 全链路复刻手册（量化+敏感层分析+阶段命令+坑索引） |
+| [docs/BOARD_ENV.md](docs/BOARD_ENV.md) | 板子环境速查 |
+| [docs/M9A_PLUGIN_GUIDE.md](docs/M9A_PLUGIN_GUIDE.md) | trigger 规则插件开发指南（ABI v1） |
+| [docs/PREPOST_OPS_DESIGN.md](docs/PREPOST_OPS_DESIGN.md) | 前后处理/节点/信箱设计 |
+| [docs/onnx_export_surgery.md](docs/onnx_export_surgery.md) | ONNX 导出手术（静态图化与算子级优化） |
+| [docs/quick_start.md](docs/quick_start.md) | 上游 SparseDrive 快速开始 |
 
-Pack the meta-information and labels of the dataset, and generate the required pkl files to data/infos. Note that `map_annos` is also generated in data_converter, with a roi_size of (30, 60) as default; if you want a different range, you can modify roi_size in tools/data_converter/nuscenes_converter.py.
-```bash
-sh scripts/create_data.sh
-```
+## 🔒 板子环境与约束
 
-#### Download trained weights
-Download the official model weights, create a `ckpt` directory, and place the weights inside.
-* Weight download link: [sparsedrive_stage2.pth](https://github.com/swc-17/SparseDrive/releases/download/v1.0/sparsedrive_stage2.pth)
+- 智己 Orin X：JetPack 5.1.5 / TensorRT 8.6.1.2 / CUDA 11.4 / sm_87
+- `/opt/m0` 挂载 **noexec**：脚本用 `bash x.sh` 调起，二进制放 `/usr/local/bin`
+- **不要动板子环境**（TRT/CUDA/JetPack/系统/python 包）；允许的动作 =
+  编译部署产物到 `/usr/local/{bin,lib}`
+- `BOARD_HOST`/`BOARD_PASS` 只运行时注入，注册表/历史/仓库里都没有，
+  也不要落任何文件
 
-**[Important] Compile TensorRT Custom Plugins:**
-Since the model contains custom operators like `Deformable Aggregation`, you must compile the C++ plugins beforehand:
-```bash
-cd projects/trt_plugin
-mkdir build && cd build
-cmake ..
-make -j8
-# After successful compilation, libSparseDrivePlugin.so will be generated in the current directory.
-```
+## 🙏 致谢
 
-### 2. Export ONNX Models
-Considering that in real-world autonomous driving systems, the **perception module** and the **planning/control module** often run at different frequencies, the perception head and the motion & planning head are decoupled at the engineering level and exported as independent engines.
-Additionally, since the temporal model has different graph structures for the initial frame (without historical features) and subsequent frames (with historical features), they are exported separately.
-
-**Export Perception Module (Det & Map):**
-```bash
-# This will export both the initial frame (sparsedrive_multihead_first.onnx) and subsequent frames (sparsedrive_multihead.onnx)
-python tools/export_onnx_det_map.py \
-    --config projects/configs/sparsedrive_small_stage2.py \
-    --checkpoint ckpt/sparsedrive_stage2.pth \
-    --out work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.onnx
-```
-
-**Export Planning & Control Module (Motion & Planning):**
-```bash
-# This will export both the initial frame and subsequent frames of the Motion & Plan model.
-python tools/export_onnx_motion.py \
-    --config projects/configs/sparsedrive_small_stage2.py \
-    --checkpoint ckpt/sparsedrive_stage2.pth \
-    --out work_dirs/sparsedrive_small_stage2/motion_plan_engine.onnx
-```
-
-### 3. Compile TensorRT Engine (ONNX -> TRT)
-*Note: Please ensure that your `onnx2trt.py` script correctly loads `libSparseDrivePlugin.so` internally.*
-
-```bash
-# Compile Perception Module
-python onnx2trt.py --onnx work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.onnx --save work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.engine
-
-python onnx2trt.py --onnx work_dirs/sparsedrive_small_stage2/sparsedrive_multihead_first.onnx --save work_dirs/sparsedrive_small_stage2/sparsedrive_multihead_first.engine
-
-# Compile Planning & Control Module
-python onnx2trt.py --onnx work_dirs/sparsedrive_small_stage2/motion_plan_engine.onnx --save work_dirs/sparsedrive_small_stage2/motion_plan_engine.engine
-
-python onnx2trt.py --onnx work_dirs/sparsedrive_small_stage2/motion_plan_engine_first.onnx --save work_dirs/sparsedrive_small_stage2/motion_plan_engine_first.engine
-```
-
-### 4. Evaluation
-Run the following command for end-to-end closed-loop testing:
-```bash
-python test_trt.py projects/configs/sparsedrive_small_stage2.py ckpt/sparsedrive_stage2.pth \
-    --engine_perc_init work_dirs/sparsedrive_small_stage2/sparsedrive_multihead_first.engine \
-    --engine_perc_temp work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.engine \
-    --engine_mo_init work_dirs/sparsedrive_small_stage2/motion_plan_engine_first.engine \
-    --engine_mo_temp work_dirs/sparsedrive_small_stage2/motion_plan_engine.engine
-```
-
-**📊 Performance Comparison Report (NVIDIA RTX 3090)**
-
-#### End-to-End Performance
-| Method | NDS | AMOTA | minADE (m)* | L2 (m) Avg | Col. (%) Avg | FPS |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **SparseDrive-S (Official Pytorch)** | **0.525** | **0.386** | **0.620** | **0.610** | 0.100 | 4.8 |
-| **SparseDrive-S (TRT FP16)** | 0.520 | 0.370 | 0.648 | 0.612 | **0.092** | **35.7** |
-
-> **Note:** `minADE` uses the metrics for the Car category. Under the premise of highly aligning core perception and planning metrics (L2 error difference is only 0.002m), the TRT engine achieved even better performance in **Average Collision Rate (Col. Avg)**. Meanwhile, inference throughput (FPS) achieved a massive leap of **~7.4x**.
-
-#### Detailed Planning Metrics
-| Method | L2 1s | L2 2s | L2 3s | L2 Avg | Col. 1s | Col. 2s | Col. 3s | Col. Avg |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Official (Official Pytorch)** | 0.300 | **0.580** | **0.950** | **0.610** | **0.010%** | **0.050%** | 0.230% | 0.100% |
-| **TRT FP16** | **0.299** | 0.581 | 0.957 | 0.612 | **0.010%** | 0.054% | **0.212%** | **0.092%** |
-
-### 5. Inference Speed Test (Latency Profiling)
-You can use the Python script for macroscopic FPS testing:
-```bash
-python fps.py projects/configs/sparsedrive_small_stage2.py ckpt/sparsedrive_stage2.pth --mode trt
-```
-
-To analyze the microscopic latency of each operator, it is recommended to use `trtexec` to generate a Profiling report:
-```bash
-# Test Perception Module (Det & Map)
-trtexec --loadEngine=work_dirs/sparsedrive_small_stage2/sparsedrive_multihead.engine \
-        --plugins=projects/trt_plugin/build/libSparseDrivePlugin.so \
-        --dumpProfile --iterations=100 > map_det_inference.log
-
-# Test Planning & Control Module (Motion & Plan)
-trtexec --loadEngine=work_dirs/sparsedrive_small_stage2/motion_plan_engine.engine \
-        --plugins=projects/trt_plugin/build/libSparseDrivePlugin.so \
-        --dumpProfile --iterations=100 > motion_inference.log
-```
-
-## 🗂️ Repository Layout
-
-```
-deploy/                       deployment & optimization toolchain (see deploy/README.md)
-  export_v5.py                  INT8+FP16 delivery graph export (logits-DFA)
-  make_v5_p2h.py / split_*.py   graph surgery (P1 head-FP16, P4 engine split)
-  dfaplug_v8.cu                 delivery DFA plugin (plan+gather dual kernel)
-  dfaplug_v3.cu                 fallback kernel (same semantics, ulp-equal)
-  run_engine.cpp / run_engines.cpp / onnx2engine.cpp   board-side C++ tools
-  ssa_surgery2.py / _fa_part.cu / selftest_fa*.cu       P5 FlashAttention (negative result, kept for the record)
-  board_*.py                    paramiko board drivers (env: BOARD_HOST / BOARD_PASS)
-  eval_t6_mini_v8.py            mini 81-frame closed-loop accuracy gate
-docs/
-  OPTIMIZATION_SUMMARY.md     ★ the full 8-round journal + pitfall log (read this first)
-  BOARD_ENV.md                  board environment, toolchain, known limitations
-  quick_start.md                condensed workstation quick start
-repro/                         board-side mini pipeline scripts (bash)
-projects/ tools/ scripts/      SparseDrive upstream + export modifications
-```
-
-## 📍 Roadmap
-
-- [x] INT8 PTQ pipeline for backbone/neck on automotive SoC (this repo, Orin delivery)
-- [ ] Frame-level pipelining (backbone of frame N overlapped with decoder of frame N−1; ~1.7× throughput, no engine change)
-- [ ] TensorRT upgrade validation — the ~12 ms Myelin degraded-fusion regions and the det-attention materialization chain are both version-limited and expected to collapse on TRT 9/10
-- [ ] Pure C++ ultra-fast inference deployment pipeline
-- [ ] ROS2 integration
-
-## 📚 Technical Details & Pitfall Avoidance Guide
-
-- [TECH_DETAILS.md](TECH_DETAILS.md) — workstation-era deep dive: matrix-refactoring of temporal alignment, ONNX control-flow elimination, CUDA op squeezing.
-- [docs/OPTIMIZATION_SUMMARY.md](docs/OPTIMIZATION_SUMMARY.md) — Orin-era journal: every accepted and rejected optimization, with measurements, methodology (probe/replay numerics, hot-swap plugin binding) and the pitfall log (NVRTC JIT breakage, workspace baked into plan, plugin version pairing, …).
-
-Discussions and exchanges are highly welcome!
+- [SparseDrive](https://github.com/swc-17/SparseDrive)（CVPR 2024）——
+  上游模型与训练框架
+- [nuScenes](https://www.nuscenes.org/)——评估数据集

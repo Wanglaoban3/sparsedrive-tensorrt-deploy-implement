@@ -1,70 +1,67 @@
-# `deploy/` — Deployment & Optimization Toolchain
+# `deploy/` — 部署工程（七层地图）
 
-Everything that turned the upstream SparseDrive checkpoint into the
-delivered TensorRT artifact lives here:
+上游 SparseDrive checkpoint 变成板上交付物的全部工程都在这层。
+完整故事（21 轮优化、归因、坑）见
+[docs/OPTIMIZATION_SUMMARY.md](../docs/OPTIMIZATION_SUMMARY.md)；
+全链路复刻步骤见 [docs/FULL_CHAIN_REPRO.md](../docs/FULL_CHAIN_REPRO.md)。
+
+## 目录树
 
 ```
-export_v5.py  →  v5_P1h.onnx  →  onnx2engine2  →  e_T6.engine
-                                      +
-                     dfaplug_v8.cu  →  libdfaplug_v8.so
-                                      +
-              run_engine / run_engines  +  eval_t6_mini_v8.py (accuracy gate)
+deploy/
+├── spdeploy.py         # 统一 CLI：python deploy/spdeploy.py <verb> [args...]
+├── board/              # board_m1.py — paramiko 板端驱动库（launch/push/fetch，
+│                       #   括号孤儿启动、绝对路径 marker；ops 全家按路径调用）
+├── board_src/          # 推到板上编译的源码单元（板上编译，产物进 /usr/local）
+│   ├── prepost/        #   节点/环/信箱/规则/触发器/测试（39 文件，文件名是文档锚）
+│   ├── plugin/         #   dfaplug_v3/v8/v11.cu + test_dfa_v11.cu（回退链+v11 配套）
+│   └── runner/         #   run_engine.cpp / run_engine2.cpp / run_engines.cpp /
+│                       #   onnx2engine.cpp
+├── engine/             # 导出与量化链：export_*.py、qat/ptq/flashmha/
+│                       #   group_sensitivity、ssa_surgery2.py、_gen_f32_names.py、
+│                       #   ONNX_QUANT_STRATEGY.md
+├── eval/               # 评估：eval_t6_mini{,_v8,_map}.py、eval_mp_mini.py、
+│                       #   eval_nuscenes.py、map_gt.py、infer_*.py、
+│                       #   compare_m2/m3.py、run_eval_*_val.bat
+├── ops/                # 量产运维（spdeploy verb 的落点）：prod_install/golden/
+│                       #   ft_*/soak、m10_*、m9a_*、mprod_gate/mkeval/mkmap、
+│                       #   pd_step1-4、m5_rerun、board_mapfix、v11_gate/bench/
+│                       #   reginfo、preproc_ref、ref_check
+├── analysis/           # 文档点名留档的分析/取证工具（_cmp_*、_probe_*、
+│                       #   _inv_verify、_fa_part.cu、selftest_fa*.cu）
+├── systemd/            # systemd 单元模板（sp-filesrc@/sp-modelnode@/sp-trigger@）
+└── artifacts/          # 评估/剖面证据 JSON + PTQ_SENSITIVITY_REPORT.md
 ```
 
-The full story — every accepted and rejected optimization, measurements,
-methodology and pitfalls — is [docs/OPTIMIZATION_SUMMARY.md](../docs/OPTIMIZATION_SUMMARY.md).
+## spdeploy verb 表（13 个）
 
-## Key files
+| verb | 落点 | 说明 |
+|---|---|---|
+| `install` | ops/prod_install.py | 安装/健康断言（systemd 单元+规则编译） |
+| `uninstall` | ops/prod_install.py | 卸载（--uninstall） |
+| `status` | （内置 paramiko 只读） | 信箱全景 + 三单元 active 态 |
+| `gate` | ops/mprod_gate.py | 精度门禁（det/map/EPA/L2/col） |
+| `eval` | ops/m10_eval_run.py | 一键评估 run |
+| `golden` | ops/prod_golden.py | 自检金标重标 |
+| `ft` | ops/prod_ft_m9a.py | 故障注入（`--suite a\|b\|m9a\|m10` 选路） |
+| `soak` | ops/prod_soak.py | 8h 浸泡验收 |
+| `calib` | ops/m9a_thr_calib.py | trigger THR 分位数标定 |
+| `parity` | ops/m9a_parity.py | trigger 规则 parity 对拍 |
+| `boardtest` | ops/m9a_boardtest.py | 板上板测（`--m10` 切 m10 版） |
+| `run` | ops/m5_rerun.py | 闭环复测 legacy\|split [fetch]（仅 CLI，无薄壳） |
+| `build-plugin` | ops/board_mapfix.py | 插件/引擎工具链（默认 tool 段） |
 
-### Delivery chain (the files that produce/verify the artifact)
+薄壳：`scripts/sp-<verb>.sh`（12 个，`sp-selftest.sh`→golden；
+`BOARD_HOST=... BOARD_PASS=...` 前缀注入，壳内断言缺失即拒）。
 
-| File | Role |
-|---|---|
-| `export_v5.py` | INT8+FP16 delivery ONNX export (logits-DFA: softmax moved into the plugin) |
-| `dfaplug_v8.cu` | **delivery DFA plugin** — plan+gather dual kernel, self-allocating workspace, v3 fallback |
-| `dfaplug_v3.cu` | single-kernel DFA (fallback path; logits semantics identical, ulp-equal) |
-| `onnx2engine.cpp` / `onnx2engine3.cpp` | board-side ONNX→TRT compiler (`--int8 --fp16 --ws-mb`, per-layer precision overrides) |
-| `run_engine.cpp` / `run_engine2.cpp` | single-engine runner (manifest input dirs, `--dump`, timing) |
-| `run_engines.cpp` | N-engine chained runner, tensor-name D2D wiring (zero-copy on unified memory) |
-| `prep_mini_inputs.py` | 81-frame mini engine-input preparation (scene-boundary state resets) |
-| `repro mini pipelines` | see `../repro/mini_pipeline*.sh` (board side) |
-| `eval_t6_mini_v8.py` (+`eval_t6_mini.py`/`_t12`/`_sp`) | mini closed-loop decoding + nuScenes mAP/NDS gate |
-| `dfaplug_dump.cu` | runtime IO-dump plugin (env-gated) — captures real engine inputs for kernel A/B |
-| `test_dfa_ab.cu` / `test_dfa_real2.cu` / `test_dfa_kernels.cu` | DFA harness: real-IO A/B, phase timing, kernel compare |
-| `sim_dfa_v8.py` | numpy simulator of DFA semantics (variant validation, weight analysis) |
-| `extract_dfa_consts.py` / `trace_dfa_inputs.py` | pull true shape/ssi constants from the source graph; verify logits chain |
+## 加新脚本前先读这个
 
-### Graph surgery (rounds 1-8)
-
-| File | Round |
-|---|---|
-| `export_fp32_onnx.py` / `export_quant_onnx.py` / `make_v5t3.py` / `make_v5p1h.py` / `make_v5_p2h.py` | quantization-state pipeline (head de-quantized → head full-FP16), P1 |
-| `split_engine.py` / `split_head.py` / `requant_fpn.py` / `strip_casts.py` | P4 engine splitting (negative result, kept for the record) |
-| `ssa_surgery2.py` / `probe_fa_io.py` / `_fa_part.cu` / `dfaplug_v10.cu` | P5 FlashAttention plugin (negative result, kept) |
-| `selftest_fa*.cu` | wmma semantics probes (col_major verdict, determinism) |
-| `census_det.py` / `analyze_spans.py` / `profile_buckets.py` | trtexec profile attribution |
-
-### Board drivers (`board_*.py`, `push_*.py`)
-
-One-shot paramiko drivers used during the optimization sessions: push a
-source file, compile module-level on the board, run/re-profile, poll a DONE
-marker, pull logs. They are the working record of rounds 1-8 (naming:
-`board_<topic><n>.py` and `board_<topic><n>_poll.py` pairs). All of them read
-two environment variables — `BOARD_HOST` and `BOARD_PASS` — and never embed
-credentials. New board automation should follow the same pattern (see
-`board_ssa4.py` for the canonical shape).
-
-> Board scripts are pushed to a Linux board: keep them LF-only (see
-> `.gitattributes`); CRLF silently breaks bash on the board.
-
-### Session analysis (`_*.py`)
-
-Scratch numerics/profiling checks kept as the audit trail of each round
-(`_replay_check.py` = probe/replay numerics gate, `_diff_det.py` = A/B
-diff, `_prof_dist3.py` = profile bucketing). Read them as documentation of
-how each conclusion was reached; they are not part of the delivery chain.
-
-### `artifacts/`
-
-Pulled evaluation/profile evidence (mini mAP/NDS summaries per engine
-variant, profile logs). Large blobs (pkl, results json) are gitignored.
+1. **一次性脚本不入库**：探针/对拍/排查脚本用完即删；结论写进
+   docs（OPTIMIZATION_SUMMARY 对应轮次）。历史上 246 个临时脚本
+   已清洗过一次，别再攒。
+2. **运维脚本必须可被 spdeploy 调**：进 `ops/` 的脚本要么挂进
+   `spdeploy.py` 的 VERBS 表，要么是某 verb 的子步骤（pd_step* 形态）；
+   去掉 `_` 前缀，名字即文档名。
+3. **文档引用必须过 ref_check**：任何 docs/AGENTS 点名的文件名必须
+   真实存在（`python deploy/ops/ref_check.py` 零悬空）；删文件前先把
+   叙事点名的名字加进 ref_check 的 ALLOW（历史叙事白名单）。
