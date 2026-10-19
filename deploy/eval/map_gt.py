@@ -31,9 +31,9 @@ from shapely.strtree import STRtree
 # only, so it is importable here without the mmcv/mmdet stack.
 import importlib.util as _ilu
 
-_UTILS = os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "projects", "mmdet3d_plugin", "datasets",
-    "map_utils", "utils.py")
+_UTILS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "projects", "mmdet3d_plugin", "datasets",
+    "map_utils", "utils.py")  # 本文件在 deploy/eval/, projects/ 在仓库根
 _spec = _ilu.spec_from_file_location("sd_map_utils", _UTILS)
 _sd_utils = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_sd_utils)

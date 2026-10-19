@@ -60,6 +60,7 @@
 #include "preproc.h"
 #include "sp_bus.h"
 #include "sp_dmapool.h"
+#include "sp_postproc.h"
 #include "sp_result.h"
 #include "sp_safety.h"
 #include "sp_watch.h"
@@ -411,6 +412,7 @@ int main(int argc, char** argv) {
             "[--warmup W] [--dump-img N] [--img-from P] [--serial] [--graph] "
             "[--dual] [--loop] [--no-dump] [--det-thr F] [--map-thr F] "
             "[--det-topk N] [--mailbox NAME] [--cmd N] [--dma] "
+            "[--postproc-cpu] [--parity] "
             "[--selftest] [--selftest-dump DIR] [--golden DIR]\n",
             argv[0]);
     return 2;
@@ -438,6 +440,8 @@ int main(int argc, char** argv) {
   bool skip_lag = false;  // M10: 生产跳序 (seq gap/环重置 → 跳到最新, 不 FATAL 12)
   bool dual = false;  // M7a: bb2 独立流与 hd+mp 重叠
   bool use_dma = false;  // M8: 采集源走设备池 (fd 导入), 绕开 mapped-shm 读
+  bool pp_cpu = false;    // Step2: 后处理回退 CPU (默认 GPU, CUB sort 进 graph)
+  bool pp_parity = false;  // Step2 门禁: 每帧 GPU/CPU 双跑对拍, 打 PPAR 行
   float det_thr = 0.0f, map_thr = 0.0f;  // Q2: 默认=离线评测口径(全保留)
   int det_topk = 300;
   int plan_cmd = 2;  // M6b: final_plan 便捷解码的 cmd (2=直行; 真 cmd 车辆给)
@@ -457,6 +461,8 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--serial")) serial = true;
     else if (!strcmp(argv[i], "--dual")) dual = true;
     else if (!strcmp(argv[i], "--dma")) use_dma = true;
+    else if (!strcmp(argv[i], "--postproc-cpu")) pp_cpu = true;
+    else if (!strcmp(argv[i], "--parity")) pp_parity = true;
     else if (!strcmp(argv[i], "--graph")) use_graph = true;
     else if (!strcmp(argv[i], "--loop")) loop = true;
     else if (!strcmp(argv[i], "--no-dump")) no_dump = true;
@@ -972,11 +978,34 @@ int main(int argc, char** argv) {
   } else {
     printf("modelnode: decode tensors missing, mailbox/json disabled\n");
   }
+  // ---- Step2: GPU 后处理 (默认 on; --postproc-cpu 回退 CPU; --parity 每
+  //      帧同输入 CPU 复算对拍打 PPAR 行, 门禁用). decode 核只依赖 hd 输出,
+  //      捕进 gH/gB graph 尾部; 失败自动退 CPU, 精度语义不变.
+  pp::PPWs ppw;  // ppw 不叫 pp: main 尾部出口统计有 lambda pp() 撞名
+  bool pp_gpu = false;
+  static_assert(pp::kTopkCap >= res::kDetCap, "pp det cap < mailbox det cap");
+  static_assert(pp::kMapCap == res::kMapCap, "pp/map capacity mismatch");
+  if (can_decode && !pp_cpu) {
+    char perr[256] = {0};
+    if (pp::pp_init(&ppw, perr, sizeof(perr))) {
+      pp_gpu = true;
+      printf("modelnode: postproc GPU on (CUB radix sort)%s\n",
+             pp_parity ? " +parity" : "");
+    } else {
+      printf("modelnode: postproc GPU init failed (%s), decode on CPU\n",
+             perr);
+    }
+  }
+  if (pp_parity && !pp_gpu) {
+    printf("modelnode: --parity 需要 GPU 后处理, 忽略\n");
+    pp_parity = false;
+  }
   const uint64_t cfg_hash = fnv1a(
       std::string(engine_path) + "|" + (hd_path ? hd_path : "") + "|" +
       (mp_path ? mp_path : "") + "|" + plugin_so + "|det_thr=" +
       std::to_string(det_thr) + "|map_thr=" + std::to_string(map_thr) +
-      "|topk=" + std::to_string(det_topk));
+      "|topk=" + std::to_string(det_topk) +
+      "|pp=" + (pp_gpu ? "gpu" : "cpu"));
 
   // dump 目录预建 (落盘移出关键路径); out_dir 本身无论是否 dump 都要建
   {
@@ -1328,6 +1357,15 @@ int main(int argc, char** argv) {
         for (auto& st : states)
           cudaMemcpyAsync(st.in->dev[0], st.out->dev[p], st.in->bytes,
                           cudaMemcpyDeviceToDevice, sB);
+      // Step2: 单引擎模式 decode 捕进 gB 尾部 (源/输出地址按 parity 固定)
+      if (ok && !use_hd && pp_gpu)
+        pp::pp_decode(ppw, p, (const float*)b_det_cls->dev[p],
+                      (const float*)b_det_q->dev[p],
+                      (const float*)b_det_bbox->dev[p],
+                      (const int32_t*)b_det_id->dev[p],
+                      (const float*)b_map_cls->dev[p],
+                      (const float*)b_map_pts->dev[p], det_topk, det_thr,
+                      map_thr, sB);
       cudaGraph_t g = nullptr;
       if (cudaStreamEndCapture(sB, &g) != cudaSuccess || !ok) {
         printf("modelnode: graph capture FAILED (p=%d), fallback non-graph\n",
@@ -1354,6 +1392,15 @@ int main(int argc, char** argv) {
           for (auto& st : states)
             cudaMemcpyAsync(st.in->dev[0], st.out->dev[p], st.in->bytes,
                             cudaMemcpyDeviceToDevice, eng_stream);
+        // Step2: decode 只依赖 hd 输出, 捕进 gH 尾部 (不必等 mp)
+        if (ok && pp_gpu)
+          pp::pp_decode(ppw, p, (const float*)b_det_cls->dev[p],
+                        (const float*)b_det_q->dev[p],
+                        (const float*)b_det_bbox->dev[p],
+                        (const int32_t*)b_det_id->dev[p],
+                        (const float*)b_map_cls->dev[p],
+                        (const float*)b_map_pts->dev[p], det_topk, det_thr,
+                        map_thr, eng_stream);
         g = nullptr;
         if (cudaStreamEndCapture(eng_stream, &g) != cudaSuccess || !ok) {
           printf("modelnode: hd graph capture FAILED (p=%d)\n", p);
@@ -1503,8 +1550,7 @@ int main(int argc, char** argv) {
     watch_maybe_hang(kWsPost, j);
     int64_t wpost0 = watch_now_ms();
     int p = (int)(j & 1);
-    if (!no_dump) cudaEventSynchronize(ev_post[p]);
-    else cudaEventSynchronize(ev_inf1[p]);
+    cudaEventSynchronize(ev_post[p]);  // 每帧必记 (生产也搬 decode 源+mp 输出)
     float pre_ms = 0, inf_ms = 0, post_ms = 0, gpu_ms = 0;
     float b2_ms = 0, hd_ms = 0, mp_ms = 0;
     cudaEventElapsedTime(&pre_ms, ev_preA[p], ev_preB[p]);
@@ -1512,9 +1558,8 @@ int main(int argc, char** argv) {
     cudaEventElapsedTime(&b2_ms, ev_inf0[p], ev_b2[p]);
     cudaEventElapsedTime(&hd_ms, ev_b2[p], ev_hd[p]);
     cudaEventElapsedTime(&mp_ms, ev_hd[p], ev_inf1[p]);
-    if (!no_dump) cudaEventElapsedTime(&post_ms, ev_inf1[p], ev_post[p]);
-    if (!no_dump) cudaEventElapsedTime(&gpu_ms, ev_preA[p], ev_post[p]);
-    else cudaEventElapsedTime(&gpu_ms, ev_preA[p], ev_inf1[p]);
+    cudaEventElapsedTime(&post_ms, ev_inf1[p], ev_post[p]);
+    cudaEventElapsedTime(&gpu_ms, ev_preA[p], ev_post[p]);
     // 设防段只盖 GPU 同步等待 (hang 在这里现形); 落盘/解码/发布是 IO
     watch_record(kWsPost, (double)(watch_now_ms() - wpost0));
     // Phase C 遥测: 事件链实测的分段耗时喂同一份 512 帧窗 (也让 watchdog
@@ -1539,19 +1584,80 @@ int main(int argc, char** argv) {
     if (!t_first_ready) t_first_ready = ready;
     t_last_ready = ready;
     if (!no_dump) dump_frame(j, p);
-    // ---- Q1-Q3: decode → 信箱发布 → JSON 旁路 (纯 CPU, 从 pinned host 读) ----
+    // ---- Q1-Q3: decode → 信箱发布 → JSON 旁路 (host 侧, 数据源二选一) ----
     if (can_decode) {
       double t_d0 = now_ns();
-      static post::DetOut dets[res::kDetCap];
-      static post::MapOut maps[res::kMapCap];
-      int nd = post::det_decode((const float*)b_det_cls->host[p],
-                                (const float*)b_det_q->host[p],
-                                (const float*)b_det_bbox->host[p],
-                                (const int32_t*)b_det_id->host[p],
-                                det_topk, det_thr, dets);
-      int nm = post::map_decode((const float*)b_map_cls->host[p],
-                                (const float*)b_map_pts->host[p],
-                                map_thr, maps);
+      static post::DetOut dets_buf[res::kDetCap];
+      static post::MapOut maps_buf[res::kMapCap];
+      static post::DetOut dets_cpu[res::kDetCap];   // --parity 对拍侧
+      static post::MapOut maps_cpu[res::kMapCap];
+      static int32_t nout_cpu[res::kDetCap];
+      post::DetOut* dets = dets_buf;
+      post::MapOut* maps = maps_buf;
+      int nd = 0, nm = 0;
+      if (pp_gpu) {
+        // GPU decode 结果 (post_stream 已搬完: ev_post 同步在上方)
+        nd = ppw.h_cnt[p][0];
+        nm = ppw.h_cnt[p][1];
+        dets = ppw.h_det[p];
+        maps = ppw.h_map[p];
+      } else {
+        nd = post::det_decode((const float*)b_det_cls->host[p],
+                              (const float*)b_det_q->host[p],
+                              (const float*)b_det_bbox->host[p],
+                              (const int32_t*)b_det_id->host[p],
+                              det_topk, det_thr, dets_buf);
+        nm = post::map_decode((const float*)b_map_cls->host[p],
+                              (const float*)b_map_pts->host[p],
+                              map_thr, maps_buf);
+      }
+      if (pp_parity) {
+        // Step2 门禁: 同帧 CPU 复算 vs GPU. det 序可因 sigmoid/expf ULP 差
+        // 在近分 tie 处互换 → 按 n 配对; map 序确定性 (类别优先) 逐槽比.
+        int cd = post::det_decode((const float*)b_det_cls->host[p],
+                                  (const float*)b_det_q->host[p],
+                                  (const float*)b_det_bbox->host[p],
+                                  (const int32_t*)b_det_id->host[p],
+                                  det_topk, det_thr, dets_cpu, nout_cpu);
+        int cm = post::map_decode((const float*)b_map_cls->host[p],
+                                  (const float*)b_map_pts->host[p],
+                                  map_thr, maps_cpu);
+        double ws = 0, wg = 0;
+        const char* bad = nullptr;
+        if (nd != cd || nm != cm) bad = "CNT";
+        for (int i = 0; i < nd && !bad; ++i) {
+          int jc = i;
+          if (ppw.h_nout[p][i] != nout_cpu[i]) {
+            for (jc = 0; jc < cd; ++jc)
+              if (nout_cpu[jc] == ppw.h_nout[p][i]) break;
+            if (jc >= cd) { bad = "DET_SET"; break; }
+          }
+          const post::DetOut& a = dets[i];
+          const post::DetOut& b = dets_cpu[jc];
+          if (a.label != b.label || a.id != b.id) { bad = "DET_LBL"; break; }
+          ws = std::max(ws, (double)std::fabs(a.score - b.score));
+          const float ga[9] = {a.x, a.y, a.z, a.w, a.l, a.h, a.yaw, a.vx, a.vy};
+          const float gb[9] = {b.x, b.y, b.z, b.w, b.l, b.h, b.yaw, b.vx, b.vy};
+          for (int q2 = 0; q2 < 9; ++q2)
+            wg = std::max(wg, (double)std::fabs(ga[q2] - gb[q2]));
+        }
+        for (int i = 0; i < nm && !bad; ++i) {
+          const post::MapOut& a = maps[i];
+          const post::MapOut& b = maps_cpu[i];
+          if (a.label != b.label) { bad = "MAP_LBL"; break; }
+          ws = std::max(ws, (double)std::fabs(a.score - b.score));
+          for (int q2 = 0; q2 < post::kMapPts * 2; ++q2) {
+            const float* ap = &a.pts[0][0];
+            const float* bp = &b.pts[0][0];
+            wg = std::max(wg, (double)std::fabs(ap[q2] - bp[q2]));
+          }
+        }
+        printf("modelnode: PPAR k=%ld det %d/%d map %d/%d "
+               "worst_s=%.2e worst_g=%.2e %s\n",
+               j, nd, cd, nm, cm, ws, wg,
+               bad ? bad
+                   : (ws <= 2e-6 && wg <= 1e-5 ? "OK" : "TOL"));
+      }
       res::ResultMsg msg;
       memset(&msg, 0, sizeof(msg));
       msg.magic = res::kMagic;
@@ -1619,14 +1725,19 @@ int main(int argc, char** argv) {
       int hits = 0;
       if (saf_cfg.en) {
         if (can_decode) {
-          hits |= saf::scan_nonfinite((const float*)b_det_cls->host[p],
-                                      b_det_cls->bytes / 4);
-          hits |= saf::scan_nonfinite((const float*)b_det_bbox->host[p],
-                                      b_det_bbox->bytes / 4);
+          // 原始张量扫描只在 host 有数据时可行 (GPU 后处理 + no_dump 时源
+          // 不落地); NaN 经 decode 传导到 score, 由 DetOut 有限性检查兜住
+          if (!pp_gpu || !no_dump) {
+            hits |= saf::scan_nonfinite((const float*)b_det_cls->host[p],
+                                        b_det_cls->bytes / 4);
+            hits |= saf::scan_nonfinite((const float*)b_det_bbox->host[p],
+                                        b_det_bbox->bytes / 4);
+          }
           // 检出合理性 (DetOut 是 struct 数组, 不能按平铺 float 扫)
           for (int i = 0; i < nd && !(hits & (saf::kHitRange | saf::kHitNan));
                ++i) {
-            if (!std::isfinite(dets[i].x) || !std::isfinite(dets[i].y) ||
+            if (!std::isfinite(dets[i].score) || !std::isfinite(dets[i].x) ||
+                !std::isfinite(dets[i].y) ||
                 !std::isfinite(dets[i].w) || !std::isfinite(dets[i].l) ||
                 !std::isfinite(dets[i].h)) {
               hits |= saf::kHitNan;
@@ -1912,8 +2023,11 @@ int main(int argc, char** argv) {
     }
     // M10 终审 I3: 参考系折算与引擎状态推进点对齐 — A 点弃帧时引擎状态
     // 停 k-1 (hd 未提交), 折算须回滚; B/C/D 点 hd 已提交, 状态到 k, 保持
-    // 折算 (save_* 只服务 A 点回滚)
-    float save_l2g[16];
+    // 折算 (save_* 只服务 A 点回滚).
+    // 修: save 原为 float[16] — 保存把 double 位模式按 float 截断成垃圾,
+    // 恢复(2015)还从 64B 数组越界读 128B (fortify 警告) → A 点弃帧回滚后
+    // prev_l2g 全错、下一帧 tmat 毒化. 改 double[16] 位级原样存取.
+    double save_l2g[16];
     memcpy(save_l2g, prev_l2g, sizeof(save_l2g));
     double save_ts = prev_ts;
     bool save_hp = have_prev;
@@ -2051,6 +2165,14 @@ int main(int argc, char** argv) {
             for (auto& st : states)
               cudaMemcpyAsync(st.in->dev[0], st.out->dev[p], st.in->bytes,
                               cudaMemcpyDeviceToDevice, eng_stream);
+          if (ok && pp_gpu)
+            pp::pp_decode(ppw, p, (const float*)b_det_cls->dev[p],
+                          (const float*)b_det_q->dev[p],
+                          (const float*)b_det_bbox->dev[p],
+                          (const int32_t*)b_det_id->dev[p],
+                          (const float*)b_map_cls->dev[p],
+                          (const float*)b_map_pts->dev[p], det_topk, det_thr,
+                          map_thr, eng_stream);
         }
       }
     } else {
@@ -2062,6 +2184,14 @@ int main(int argc, char** argv) {
           for (auto& st : states)
             cudaMemcpyAsync(st.in->dev[0], st.out->dev[p], st.in->bytes,
                             cudaMemcpyDeviceToDevice, eng_stream);
+        if (ok && pp_gpu)
+          pp::pp_decode(ppw, p, (const float*)b_det_cls->dev[p],
+                        (const float*)b_det_q->dev[p],
+                        (const float*)b_det_bbox->dev[p],
+                        (const int32_t*)b_det_id->dev[p],
+                        (const float*)b_map_cls->dev[p],
+                        (const float*)b_map_pts->dev[p], det_topk, det_thr,
+                        map_thr, eng_stream);
       }
       cudaEventRecord(ev_b2[p], eng_stream);  // 单引擎: b2 段记 0, 段时在 hd
     }
@@ -2155,19 +2285,50 @@ int main(int argc, char** argv) {
     }
     cudaEventRecord(ev_inf1[p], eng_stream);
 
-    // ---- post submit (异步): 19 路 D2H → pinned host[p] ----
+    // ---- post submit (异步) ----
+    // D2H 分层: GPU 后处理时只搬解码结果 (~64KB: det 300 + map 300 + 计数),
+    // 否则 decode 源(6)+mp 输出(5) 每帧必搬 —— 生产 --no-dump 的信箱发布
+    // 依赖它们 (此前全量 D2H 包在 !no_dump 里, 生产 decode 读的是从未写入
+    // 的 pinned 缓冲, 信箱 det/map/motion/plan 内容恒零); dump-only 张量
+    // 只在落盘模式搬. --parity 时 6 张源也要 (CPU 复算对拍).
     watch_touch(kWsPost);
-    if (!no_dump) {
-      cudaStreamWaitEvent(post_stream, ev_inf1[p], 0);
+    cudaStreamWaitEvent(post_stream, ev_inf1[p], 0);
+    if (pp_gpu) {
+      cudaMemcpyAsync(ppw.h_det[p], ppw.d_det[p],
+                      pp::kTopkCap * sizeof(post::DetOut),
+                      cudaMemcpyDeviceToHost, post_stream);
+      cudaMemcpyAsync(ppw.h_map[p], ppw.d_map[p],
+                      pp::kMapCap * sizeof(post::MapOut),
+                      cudaMemcpyDeviceToHost, post_stream);
+      cudaMemcpyAsync(ppw.h_cnt[p], ppw.d_cnt[p], 8, cudaMemcpyDeviceToHost,
+                      post_stream);
+      if (pp_parity)
+        cudaMemcpyAsync(ppw.h_nout[p], ppw.d_nout[p], pp::kTopkCap * 4,
+                        cudaMemcpyDeviceToHost, post_stream);
+    }
+    if (can_decode && (pp_parity || (!pp_gpu && no_dump))) {
+      cudaMemcpyAsync(b_det_cls->host[p], b_det_cls->dev[p],
+                      b_det_cls->bytes, cudaMemcpyDeviceToHost, post_stream);
+      cudaMemcpyAsync(b_det_q->host[p], b_det_q->dev[p],
+                      b_det_q->bytes, cudaMemcpyDeviceToHost, post_stream);
+      cudaMemcpyAsync(b_det_bbox->host[p], b_det_bbox->dev[p],
+                      b_det_bbox->bytes, cudaMemcpyDeviceToHost, post_stream);
+      cudaMemcpyAsync(b_det_id->host[p], b_det_id->dev[p],
+                      b_det_id->bytes, cudaMemcpyDeviceToHost, post_stream);
+      cudaMemcpyAsync(b_map_cls->host[p], b_map_cls->dev[p],
+                      b_map_cls->bytes, cudaMemcpyDeviceToHost, post_stream);
+      cudaMemcpyAsync(b_map_pts->host[p], b_map_pts->dev[p],
+                      b_map_pts->bytes, cudaMemcpyDeviceToHost, post_stream);
+    }
+    if (use_mp)
+      for (auto* b : outs_mp)
+        cudaMemcpyAsync(b->host[p], b->dev[p], b->bytes,
+                        cudaMemcpyDeviceToHost, post_stream);
+    if (!no_dump)
       for (auto* b : outs)
         cudaMemcpyAsync(b->host[p], b->dev[p], b->bytes,
                         cudaMemcpyDeviceToHost, post_stream);
-      if (use_mp)
-        for (auto* b : outs_mp)
-          cudaMemcpyAsync(b->host[p], b->dev[p], b->bytes,
-                          cudaMemcpyDeviceToHost, post_stream);
-      cudaEventRecord(ev_post[p], post_stream);
-    }
+    cudaEventRecord(ev_post[p], post_stream);
 
     submitted = k + 1;
     if (serial) {

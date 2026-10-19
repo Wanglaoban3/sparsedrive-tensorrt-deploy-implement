@@ -42,7 +42,8 @@ SRCS = ["sp_bus.h", "sp_bus.cpp", "image_source.h", "file_source.h",
         "file_source.cpp", "sp_pub.cpp", "sp_sub.cpp", "sp_inspect.cpp",
         "sp_filesrc.cpp", "sp_kernels.h", "sp_kernels.cu",
         "preproc.h", "preproc.cu", "sp_preproc_test.cpp",
-        "postproc.h", "sp_result.h", "sp_resultmon.cpp",
+        "postproc.h", "sp_postproc.h", "sp_postproc.cu", "sp_result.h",
+        "sp_resultmon.cpp",
         "sp_dmapool.h", "sp_dmapool.cpp", "sp_watch.h", "sp_safety.h",
         "sp_safety.cu", "sp_status.cpp", "sp_modelnode.cpp"]
 
@@ -98,6 +99,7 @@ g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_inspect.cpp sp_bus.o -o sp_inspect 
 nvcc -O3 -arch=sm_87 -c sp_kernels.cu -o sp_kernels.o
 nvcc -O3 -arch=sm_87 -c preproc.cu -o preproc.o
 nvcc -O3 -arch=sm_87 -c sp_safety.cu -o sp_safety.o
+nvcc -O3 -arch=sm_87 -c sp_postproc.cu -o sp_postproc.o
 if [ -f /usr/local/cuda/include/cuda_runtime.h ]; then
   g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_sub.cpp sp_bus.o sp_kernels.o \
       -o sp_sub -lrt -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lcudart
@@ -116,8 +118,8 @@ g++ -O2 -std=c++14 sp_preproc_test.cpp preproc.o \
 g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_resultmon.cpp sp_bus.o \
     -o sp_resultmon -lrt
 g++ -O2 -std=c++14 -Wall -Wextra -pthread sp_status.cpp sp_bus.o -o sp_status -lrt
-g++ -O2 -std=c++14 sp_modelnode.cpp preproc.o sp_safety.o sp_bus.o \
-    sp_dmapool.o \
+g++ -O2 -std=c++14 sp_modelnode.cpp preproc.o sp_safety.o sp_postproc.o \
+    sp_bus.o sp_dmapool.o \
     -o sp_modelnode -I/usr/local/cuda/include -I/usr/local/cuda/include \
     -L/usr/local/cuda/lib64 -lcudart -lcuda -lnvinfer -ldl -lrt -lpthread
 cp -f sp_pub sp_sub sp_inspect sp_filesrc sp_preproc_test sp_modelnode \
@@ -127,7 +129,14 @@ echo BUILD_DONE
     rc, o, e = run(cli, build, t=600)
     print(o[-800:])
     if e.strip():
-        print("stderr:", e[-800:])
+        # 尾 800 字符常被 warning 占满把 error 挤出窗口 (Step2 实测):
+        # error 行单独提取, 不然链接失败只见 warning 像"静默死"
+        errs = [ln for ln in e.splitlines() if "error" in ln.lower()]
+        if errs:
+            print("stderr error lines:")
+            for ln in errs[-15:]:
+                print("  " + ln)
+        print("stderr tail:", e[-600:])
     assert "BUILD_DONE" in o, "board build failed"
 
 

@@ -1601,3 +1601,105 @@ events.jsonl（10MB×5 轮转）。SDD 六任务（plan c9463b5，TDD RED→GREE
 门禁复跑：parity PASS + unwrap check PASS + install 端到端 + trigger 重启
 14 规则 + NOMINAL（lage 284ms）。修复轮 commit 见 git log "m9a: review
 fix round"。
+
+## 第二十二轮：GPU 后处理进 CUDA graph + no_dump 零内容缺陷/save_l2g 修复（2026-10-19 交付，parity 86/86 + 全指标门禁带内）
+
+用户需求："后处理改成用 CUDA 做，并且进 CUDA graph"。盘点数据流时发现
+两个存量 bug（详见下），定两步走：Step1 修 bug + 独立门禁，Step2 GPU
+解码核 + graph 捕获 + parity 门禁。
+
+### Step1：两个存量 bug（修 bug 本身就是本次最大收益）
+
+- **no_dump 零内容缺陷（潜伏自 Q1-Q3 信箱上线）**：19+5 路输出 D2H 全包
+  在 `if (!no_dump)` 里 → 生产 `--no-dump` 形态下 decode 读的是**从未
+  写入的 pinned 缓冲**，信箱 det/map/motion/plan **内容恒零**（seq/ts/
+  status 真）。从未暴露的原因：sp_trigger/resultmon 只读 seq/age/status，
+  所有 mAP 门禁从 dump 文件离线 decode——**信箱内容本身没有任何门禁看
+  过**。修 = decode 源 6 张量 + outs_mp 5 张量每帧必搬，dump-only 张量
+  才留 `!no_dump`。Gate A（no_dump+mon）5/5 帧 det=300(map=300)、
+  snapshot 全内容有限非零；Gate B（dump）节点 decode vs numpy 复算
+  worst 6.18e-07（≤2e-5）。
+- **save_l2g 类型 bug（潜伏自 M10 watchdog 分级）**：A 点弃帧回滚把
+  `double prev_l2g[16]` 按声明的 `float save_l2g[16]` 存取——保存时位
+  模式截断成垃圾，恢复时从 64B 数组越界读 128B（fortify 警告暴露）→
+  A 点弃帧后下一帧 tmat 毒化。mprode/f 零 SKIP、FT2 只断言 skip 行数，
+  所以门禁从未抓到。修 = `double save_l2g[16]` 位级原样存取。
+
+### Step2：GPU 解码核（sp_postproc.cu/.h）捕进 graph
+
+设计（sm_87 单 block 动态 smem ~99KB 装不下 9000×8B bitonic，放弃单块）：
+
+- **det 双轮 CUB DeviceRadixSort**（u64 键，全局内存 temp 预分配+固定
+  地址）：第一轮键 `(~bits(s))<<32 | n`（s∈(0,1) 恒正 → 升序 ≡ 分数
+  降序 + 平坦下标 tie 升序 = numpy stable argsort）；取前 topk 后第
+  二轮键 `(~bits(fused))<<32 | 第一轮rank`（tie=第一轮序）；单线程
+  定序压缩做阈值过滤 + exp/atan2 几何变换（300 次 ~15flop，µs 级）。
+- **map 单 block 前缀和压缩**：类别优先序（c 外层 a 内层）smem 计数 +
+  前缀和，输出序 == CPU 遍历序。
+- **捕进 graph**：decode 只依赖 hd 输出（不必等 mp），插在 gH 捕获尾部
+  （单引擎模式进 gB）；eager 路径同位插入（捕获失败自动退 eager，功能
+  不变）。源/输出地址按 parity 固定 = 捕获前提。
+- **解码结果小 D2H**：det 300×44B + map 300×168B + cnt + (parity 时)
+  nout ≈ 64KB，替代原 6 张量 ~1MB；原始输出张量不再回主机（dump 模式
+  除外）。
+- **`--postproc-cpu` 回退**（Step1 路径原样保留）/ **`--parity`** 每
+  帧 GPU/CPU 双跑按 n 配对对拍打 `PPAR k=.. worst_s=.. worst_g=.. OK`
+  行；**safety 门控**：raw det_cls/bbox host 扫描只在数据落地时做
+  （`!pp_gpu || !no_dump`），DetOut 有限性检查补 score 字段（NaN 经
+  sigmoid 进 fused 后在 GPU 路径由结果侧兜住）；cfg_hash 加 `|pp=gpu/cpu`。
+
+### 门禁（全绿）
+
+| 门禁 | 结果 |
+|---|---|
+| C1 dump+graph+parity 5 帧 | PPAR 5/5 OK，worst_s 5.96e-08 / worst_g 4.77e-07；graphH[0/1] captured 无 FAILED |
+| C2 no_dump+graph（生产形态） | 信箱 mon 5/5 全 300/300 + snapshot 全内容有限；**dec p50 1.52→0.52ms** |
+| C3 `--postproc-cpu` 回退 | 3/3 帧 300/300（Step1 路径完好） |
+| LOOP81 dump+parity 81 帧闭环 | rc=0，**PPAR 81/81 全 OK**（worst_s 1.19e-07 / worst_g 9.54e-07） |
+| det 官方评估（pp2gpu81） | **mAP 0.4163 / NDS 0.4727**（mprodf 带 0.4164-0.4174/0.4725-0.4734，v11 0.4157/0.4724） |
+| map mAP | **0.7461**（带 0.7462-0.7485） |
+| mp EPA/L2/col | car/ped EPA **0.6059/0.5033**、L2 **0.7424**、obj_box_col **0.161%**（全带内） |
+| 生产恢复 | 三单元 active，SELFTEST PASS（指纹不含节点二进制，免重标金标），postproc GPU on，信箱 NOMINAL |
+
+### 延迟账本（诚实口径）
+
+- host 侧 dec p50 **1.52→0.52ms**（9000 元素 stable_sort 出关键路径）；
+- GPU 侧 hd+fb 18.43→19.08ms（**+0.65ms** = CUB 双轮排序进流内），
+  e2e 46.16→46.88ms（+1.6%）——**饱和 iGPU 上 GPU 时间就是吞吐天花板**，
+  CPU 省的时间本来就在流水线重叠里。**5fps 量产形态零影响**（GPU 200ms
+  窗有 ~150ms 空闲）；23fps 满负荷吞吐约 -1.5%。交付价值在：①bug 修复
+  配套的结构性收益（生产信箱从"恒零内容"变真内容 + 原始张量不出 GPU
+  的数据生命周期收口）②架构叙事/能力展示；不主张吞吐收益。
+- --parity 模式 dec p50 1.47（含 CPU 复算）是门禁形态，非生产口径。
+
+### 坑（本 round 新增）
+
+- **sm_87 单 block 动态 smem ~99KB 上限**：9000×8B 单块 bitonic 直接
+  不可行；CUB 全局内存排序 temp 预分配可捕获，但必须留捕获失败退 eager
+  的兜底。
+- **CUB SortKeys 两连签名坑**（CUDA 11.4）：①`end_bit` 形参是 int，
+  传 `sizeof(KeyT)*8`（size_t）模板匹配失败；②`temp_storage_bytes` 是
+  `size_t&` 出入参，**const 结构体成员绑不上**（`f(const PPWs&)` 里传
+  `w.tmp_bytes` no match）——取局部副本。
+- **板上编译"静默死"= 局部名撞 shadow + stderr 尾窗被 warning 占满**：
+  新变量 `pp` 遮蔽 main 尾部出口统计的 `auto pp = [](...)` lambda →
+  "no match for call to (PPWs)" 全在 stderr 前段，board_m1 只打尾 800
+  字符只见 warning。修：改名 ppw；stage_build 加 stderr error 行单独
+  提取。教训：**新标识符先 grep 同名**。
+- **sp_resultmon `--json` 是"最新帧快照"**（每消息 fopen "wb" 截断重
+  写）非逐帧日志；**`--quiet` 压掉 v1+v2 行**（v3/JSON 不受影响）——
+  gate 逐帧证据必须解析控制台 v1 行且不能加 --quiet（Step-1 gate 假
+  失败一晚的根因）；mon 要先于节点起（全速 5 帧 ~0.5s 跑完）。
+- **map_gt.py importlib 路径锚点重整漏网**：搬进 deploy/eval/ 后
+  dirname 少一层 → `deploy/projects/...` FileNotFoundError（重整后首次
+  跑 map eval 才暴露）；importlib spec 拼路径既非 sys.path 兄弟导入
+  （豁免类）也没被 ANCHORS_OK 扫到。
+- 板子 DHCP 换址 192.168.2.104→**192.168.2.101**（known_hosts 两 IP
+  同主机密钥可确认同板）。
+
+产物：`deploy/board_src/prepost/sp_postproc.{h,cu}`（新增）、
+`sp_modelnode.cpp`（八处接入）、`postproc.h`（sigmoidf 双端化 +
+det_decode n_out 参数）、`board_m1.py`（SRCS+编译行+error 行提取）、
+`README.md`（数据生命周期口径）。门禁数据 `work_dirs/preproc_ref/
+pp2gpu81` + `deploy/artifacts/eval_m10_pp2gpu81_map.json`。常驻态：
+生产默认 GPU 后处理，SELFTEST PASS，`--postproc-cpu` 为回退门。

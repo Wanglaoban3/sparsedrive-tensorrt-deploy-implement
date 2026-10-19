@@ -41,15 +41,24 @@ struct MapOut {   // map[]{score,label,pts[20][2]}
   float pts[kMapPts][2];
 };
 
-inline float sigmoidf(float x) {
+// GPU 后处理核 (sp_postproc.cu) 与 CPU 口径共用本文件: sigmoidf 需要双端.
+// expf 在 host 侧来自 <cmath>, 设备侧由 nvcc 解析为 CUDA 内建.
+#ifdef __CUDACC__
+#define SP_PP_FN __inline__ __host__ __device__
+#else
+#define SP_PP_FN inline
+#endif
+SP_PP_FN float sigmoidf(float x) {
   return 1.0f / (1.0f + expf(-x));
 }
 
 // Q1+Q2: det decode. cls[900*10] q[900*2] bbox[900*11] inst_id[900] 均为 f32/i32
 // host 数据 (post D2H 之后). 返回写入 out 的条数 (<= topk).
+// n_out 非空时逐条回填候选平坦下标 n=anchor*kDetCls+cls_id (GPU parity
+// 对拍用; GPU 侧键编码同源, 见 sp_postproc.h).
 inline int det_decode(const float* cls, const float* q, const float* bbox,
                       const int32_t* inst_id, int topk, float thr,
-                      DetOut* out) {
+                      DetOut* out, int32_t* n_out = nullptr) {
   struct Cand {
     int anchor, cls_id;
     float score;  // 融合前 (与 ref 的 cls_scores_origin 一致语义)
@@ -92,6 +101,7 @@ inline int det_decode(const float* cls, const float* q, const float* bbox,
     o.yaw = atan2f(b[6], b[7]);
     o.vx = b[8]; o.vy = b[9];  // b[10]=vz 留在张量侧, 结果消息不带
     o.id = inst_id[cd.anchor];
+    if (n_out) n_out[m - 1] = cd.anchor * kDetCls + cd.cls_id;
   }
   return m;
 }

@@ -125,7 +125,8 @@ map 0.6471）完整保留，随时可切。
    │    帧零拷贝映射 ─► GPU 直读（无 H2D）─► CUDA 前处理 ─► 三引擎推理
    │      （bb2 ─D2D 零拷贝─► hd ─► mp，CUDA graph + 双缓冲）
    │      ─► 时序状态驻留 GPU（next_* 回灌 prev_*，跨帧外旋不落主机）
-   │      ─► 输出一次 D2H ─► 解码 ─► seqlock 结果信箱发布
+   │      ─► CUDA 后处理（topk 解码核捕进 graph，原始张量不出 GPU）
+   │      ─► 解码结果小 D2H ─► seqlock 结果信箱发布
    │    进程拓扑：sp-filesrc ── shm 环形总线 ──► sp-modelnode ──► sp-trigger（10Hz 规则）
    ▼
 【运维】分级 watchdog · systemd 熔断拉起 · 开机自检（金标+指纹）· 1Hz 遥测
@@ -158,7 +159,8 @@ map 0.6471）完整保留，随时可切。
 
 节点内单帧数据**全程驻留 GPU**：帧以映射内存零拷贝到达（GPU 直读，无
 H2D 拷贝）→ CUDA 前处理核 → 三引擎推理（引擎间 D2D 零拷贝）→ 时序状态
-跨帧外旋不出 GPU → 输出一次 D2H 后解码、经信箱发布。
+跨帧外旋不出 GPU → CUDA 后处理（topk/map 解码核随推理捕进 CUDA graph，
+原始输出张量不再回主机）→ 仅解码结果（~64KB）一次 D2H，经信箱发布。
 
 ## 🧩 模块化与迁移
 
